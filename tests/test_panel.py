@@ -9,8 +9,9 @@ def _ohlcv(n, start="2015-01-01", seed=0):
     dates = pd.bdate_range(start, periods=n)
     rng = np.random.default_rng(seed)
     c = pd.Series(100 + np.cumsum(rng.normal(size=n)), index=dates)
+    v = rng.integers(1_000_000, 5_000_000, size=n).astype(float)
     return pd.DataFrame(
-        {"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": 1e6},
+        {"open": c, "high": c + 1, "low": c - 1, "close": c, "volume": v},
         index=dates,
     )
 
