@@ -20,11 +20,14 @@ class VectorQuantizerEMA(nn.Module):
         self.register_buffer("embed_avg", embed.clone())
 
     def forward(self, z_e: torch.Tensor) -> dict:
+        # Clone the codebook: the EMA update mutates self.embed in place, which
+        # would corrupt the autograd graph that saved it for the distance matmul.
+        codebook = self.embed.clone()
         d = (z_e.pow(2).sum(1, keepdim=True)
-             - 2 * z_e @ self.embed.t()
-             + self.embed.pow(2).sum(1))          # [B, K]
+             - 2 * z_e @ codebook.t()
+             + codebook.pow(2).sum(1))            # [B, K]
         ids = d.argmin(1)                          # [B]
-        z_q = self.embed[ids]                      # [B, H]
+        z_q = codebook[ids]                        # [B, H]
 
         probs = F.softmax(-d, dim=1)
         mean_probs = probs.mean(0)
