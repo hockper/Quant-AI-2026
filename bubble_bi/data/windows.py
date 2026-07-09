@@ -32,3 +32,47 @@ class Standardizer:
     def load_state_dict(self, d: dict) -> None:
         self.mean = d["mean"]
         self.std = d["std"]
+
+
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+
+class WindowDataset(Dataset):
+    def __init__(self, std_features: np.ndarray, mask: np.ndarray, p: int, day_range):
+        self.X = std_features
+        self.p = p
+        lo, hi = day_range
+        index = []
+        for t in range(max(lo, p - 1), hi):
+            for j in range(mask.shape[1]):
+                if mask[t - p + 1:t + 1, j].all():
+                    index.append((t, j))
+        self.index = index
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, i: int) -> torch.Tensor:
+        t, j = self.index[i]
+        w = self.X[t - self.p + 1:t + 1, j, :]
+        return torch.from_numpy(np.ascontiguousarray(w)).float()
+
+
+def build_loaders(panel, cfg):
+    T = len(panel.dates)
+    tr, va, te = chronological_split(T, cfg.data.train_frac, cfg.data.val_frac)
+    std = Standardizer().fit(panel.features, panel.mask, tr)
+    Xs = std.transform(panel.features)
+    p = cfg.model.p
+    bs = cfg.train.batch_size
+    nw = cfg.train.num_workers
+    loaders = {
+        "train": DataLoader(WindowDataset(Xs, panel.mask, p, tr), batch_size=bs,
+                            shuffle=True, num_workers=nw, drop_last=True),
+        "val": DataLoader(WindowDataset(Xs, panel.mask, p, va), batch_size=bs,
+                          shuffle=False, num_workers=nw),
+        "test": DataLoader(WindowDataset(Xs, panel.mask, p, te), batch_size=bs,
+                           shuffle=False, num_workers=nw),
+    }
+    return loaders, std
