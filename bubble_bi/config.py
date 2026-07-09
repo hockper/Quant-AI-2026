@@ -13,6 +13,8 @@ class DataConfig:
     raw_dir: str = "artifacts/raw"
     cache_dir: str = "artifacts/cache"
     min_history: int = 252
+    train_frac: float = 0.7
+    val_frac: float = 0.15
 
 
 @dataclass
@@ -32,10 +34,43 @@ class SplitConfig:
 
 
 @dataclass
+class ModelConfig:
+    p: int = 4
+    d_model: int = 128
+    codebook_size: int = 512
+    enc_layers: int = 3
+    dec_layers: int = 2
+    heads: int = 4
+    ff: int = 256
+    dropout: float = 0.1
+    beta_commit: float = 0.25
+    lambda_div: float = 0.1
+    lambda_ortho: float = 0.1
+    ema_decay: float = 0.99
+    dead_code_reinit_every: int = 250
+
+
+@dataclass
+class TrainConfig:
+    lr: float = 1e-4
+    weight_decay: float = 0.05
+    grad_clip: float = 1.0
+    batch_size: int = 256
+    max_steps: int = 2000
+    val_every: int = 200
+    ckpt_every: int = 200
+    device: str = "auto"
+    amp: bool = True
+    num_workers: int = 0
+
+
+@dataclass
 class Config:
     data: DataConfig
     features: FeatureConfig = field(default_factory=FeatureConfig)
     splits: SplitConfig = field(default_factory=SplitConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
     seed: int = 42
 
 
@@ -45,4 +80,9 @@ def load_config(path: str) -> Config:
     data = DataConfig(**raw.get("data", {"tickers": []}))
     features = FeatureConfig(**raw.get("features", {}))
     splits = SplitConfig(**raw.get("splits", {}))
-    return Config(data=data, features=features, splits=splits, seed=raw.get("seed", 42))
+    model = ModelConfig(**raw.get("model", {}))
+    train = TrainConfig(**raw.get("train", {}))
+    return Config(
+        data=data, features=features, splits=splits,
+        model=model, train=train, seed=raw.get("seed", 42),
+    )
