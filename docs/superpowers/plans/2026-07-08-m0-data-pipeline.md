@@ -1288,7 +1288,7 @@ Expected: prints the number of walk-forward splits and a RankIC / RankICIR. A sm
 
 - [ ] **Step 4: Record the baseline number**
 
-Append the observed RankIC/RankICIR and the config used to the M0 section of the design spec (`/home/hockper/.claude/plans/lets-begin-a-deep-glistening-starlight.md`) so M1 has a documented floor to beat. Commit:
+Append the observed RankIC/RankICIR and the config used to the M0 section of the design spec (`docs/superpowers/specs/2026-07-08-storm-trading-design.md`) so M1 has a documented floor to beat. Commit:
 ```bash
 git add -A && git commit -m "docs: record M0 ridge baseline RankIC floor"
 ```
