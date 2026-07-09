@@ -42,8 +42,9 @@ predictor with hybrid heads; training/eval/checkpointing; walk-forward metrics.
 portfolio management, live/paper trading.
 
 **Non-goals:** matching the paper's exact numbers; full S&P 500 scale on the
-first pass; the paper's Factor module / prior-posterior / linear return head
-(intentionally replaced by the Transformer).
+first pass; the paper's prior-posterior / linear return head (intentionally
+replaced by the Transformer). Note: the Factor module's *cross-attention feature
+fusion* IS included (added in M2); only its prediction head is replaced.
 
 ## Architecture
 
@@ -118,7 +119,10 @@ yfinance (daily OHLCV, auto_adjust)
   78.5, 53% of 512 codes used; 39 tests passing. Plan:
   `docs/superpowers/plans/2026-07-09-m1-ts-vqvae.md`.
 - **M2 — Add CS module → full Dual VQ-VAE tokenizer;** ablation switches
-  (w/o-TS, w/o-CS). **Freeze** the tokenizer.
+  (w/o-TS, w/o-CS). **Freeze** the tokenizer. Concretized: per-day cross-sectional
+  encoder (stock-ID embeddings, masked) + **cross-attention fusion before
+  quantization** + joint training. Design:
+  `docs/superpowers/specs/2026-07-09-m2-dual-vqvae-design.md`.
 - **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
   regression MSE. Eval: token accuracy/perplexity, RankIC on regressed return,
   multi-step generative-rollout sanity check.
