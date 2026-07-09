@@ -11,6 +11,10 @@ from bubble_bi.data.panel import Panel, build_panel, load_panel, save_panel
 from bubble_bi.data.splits import walk_forward_splits
 from bubble_bi.data.universe import load_universe
 from bubble_bi.baselines.ridge import evaluate_baseline
+from bubble_bi.data.windows import build_loaders
+from bubble_bi.eval.tokenizer_eval import evaluate_tokenizer
+from bubble_bi.models.ts_vqvae import TSVQVAE
+from bubble_bi.train.trainer import Trainer, resolve_device, set_seed
 
 
 def run_ingest(cfg: Config) -> dict[str, str]:
@@ -44,9 +48,47 @@ def run_baseline(cfg: Config) -> dict:
     return result
 
 
+def _load_or_build_panel(cfg: Config) -> Panel:
+    cache = Path(cfg.data.cache_dir) / "panel.npz"
+    return load_panel(str(cache)) if cache.exists() else build_panel_from_raw(cfg)
+
+
+def train_tokenizer(cfg: Config) -> dict:
+    set_seed(cfg.seed)
+    panel = _load_or_build_panel(cfg)
+    loaders, std = build_loaders(panel, cfg)
+    model = TSVQVAE(cfg.model, d_in=panel.features.shape[2])
+    ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints"
+    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std)
+    metrics = trainer.train()
+    print(f"trained {metrics['step']} steps | recon {metrics['recon']:.4f} "
+          f"| val_mse {metrics['val_mse']:.4f} | ppl {metrics['perplexity']:.1f}")
+    return metrics
+
+
+def eval_tokenizer(cfg: Config) -> dict:
+    set_seed(cfg.seed)
+    panel = _load_or_build_panel(cfg)
+    loaders, std = build_loaders(panel, cfg)
+    device = resolve_device(cfg.train.device)
+    model = TSVQVAE(cfg.model, d_in=panel.features.shape[2]).to(device)
+    ckpt = Path(cfg.data.cache_dir) / "checkpoints" / "last.pt"
+    if ckpt.exists():
+        import torch
+
+        state = torch.load(str(ckpt), map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+    result = evaluate_tokenizer(model, loaders["test"], device)
+    print(f"test recon_mse {result['recon_mse']:.4f} "
+          f"(baseline {result['mean_baseline_mse']:.4f}) | "
+          f"ppl {result['perplexity']:.1f} | codes {result['codes_used_frac']:.2%}")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bubble_bi")
-    parser.add_argument("command", choices=["ingest", "build-panel", "baseline"])
+    parser.add_argument("command", choices=["ingest", "build-panel", "baseline",
+                                            "train-tokenizer", "eval-tokenizer"])
     parser.add_argument("--config", default="configs/m0.yaml")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -58,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"panel: {panel.features.shape} dates={len(panel.dates)}")
     elif args.command == "baseline":
         run_baseline(cfg)
+    elif args.command == "train-tokenizer":
+        train_tokenizer(cfg)
+    elif args.command == "eval-tokenizer":
+        eval_tokenizer(cfg)
     return 0
 
 

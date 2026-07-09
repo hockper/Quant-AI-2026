@@ -114,6 +114,9 @@ yfinance (daily OHLCV, auto_adjust)
   Concretized: sliding p=4-day window → small Transformer encoder (CLS) → EMA
   codebook → decoder reconstructs the window; one token per day. Design:
   `docs/superpowers/specs/2026-07-09-m1-ts-vqvae-design.md`.
+  **DONE (2026-07-09):** held-out recon MSE 1.46 vs mean-baseline 3.81, perplexity
+  78.5, 53% of 512 codes used; 39 tests passing. Plan:
+  `docs/superpowers/plans/2026-07-09-m1-ts-vqvae.md`.
 - **M2 — Add CS module → full Dual VQ-VAE tokenizer;** ablation switches
   (w/o-TS, w/o-CS). **Freeze** the tokenizer.
 - **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
