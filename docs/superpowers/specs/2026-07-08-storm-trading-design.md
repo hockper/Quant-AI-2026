@@ -111,6 +111,9 @@ yfinance (daily OHLCV, auto_adjust)
   Plan: `docs/superpowers/plans/2026-07-08-m0-data-pipeline.md`.
 - **M1 — TS-only VQ-VAE:** reconstruction + VQ losses; monitor codebook
   perplexity. Proves the tokenizer + training loop + checkpoint/resume + eval.
+  Concretized: sliding p=4-day window → small Transformer encoder (CLS) → EMA
+  codebook → decoder reconstructs the window; one token per day. Design:
+  `docs/superpowers/specs/2026-07-09-m1-ts-vqvae-design.md`.
 - **M2 — Add CS module → full Dual VQ-VAE tokenizer;** ablation switches
   (w/o-TS, w/o-CS). **Freeze** the tokenizer.
 - **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
