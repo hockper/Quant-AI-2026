@@ -11,9 +11,10 @@ from bubble_bi.data.panel import Panel, build_panel, load_panel, save_panel
 from bubble_bi.data.splits import walk_forward_splits
 from bubble_bi.data.universe import load_universe
 from bubble_bi.baselines.ridge import evaluate_baseline
-from bubble_bi.data.windows import build_loaders
-from bubble_bi.eval.tokenizer_eval import evaluate_tokenizer
+from bubble_bi.data.windows import build_loaders, build_day_loaders
+from bubble_bi.eval.tokenizer_eval import evaluate_tokenizer, evaluate_dual
 from bubble_bi.models.ts_vqvae import TSVQVAE
+from bubble_bi.models.dual_vqvae import DualVQVAE
 from bubble_bi.train.trainer import Trainer, resolve_device, set_seed
 
 
@@ -85,10 +86,45 @@ def eval_tokenizer(cfg: Config) -> dict:
     return result
 
 
+def train_dual(cfg: Config) -> dict:
+    set_seed(cfg.seed)
+    panel = _load_or_build_panel(cfg)
+    loaders, std = build_day_loaders(panel, cfg)
+    model = DualVQVAE(cfg.model, d_in=panel.features.shape[2], n_stocks=len(panel.tickers))
+    ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints"
+    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std)
+    metrics = trainer.train()
+    print(f"trained {metrics['step']} steps | recon {metrics['recon']:.4f} "
+          f"| val_mse {metrics['val_mse']:.4f} | ppl {metrics['perplexity']:.1f}")
+    return metrics
+
+
+def eval_dual(cfg: Config) -> dict:
+    set_seed(cfg.seed)
+    panel = _load_or_build_panel(cfg)
+    loaders, std = build_day_loaders(panel, cfg)
+    device = resolve_device(cfg.train.device)
+    model = DualVQVAE(cfg.model, d_in=panel.features.shape[2],
+                      n_stocks=len(panel.tickers)).to(device)
+    ckpt = Path(cfg.data.cache_dir) / "checkpoints" / "last.pt"
+    if ckpt.exists():
+        import torch
+
+        state = torch.load(str(ckpt), map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+    result = evaluate_dual(model, loaders["test"], device)
+    for mod in model.active:
+        print(f"[{mod}] recon {result[f'{mod}_recon_mse']:.4f} "
+              f"(baseline {result[f'{mod}_baseline_mse']:.4f}) | "
+              f"ppl {result[f'{mod}_perplexity']:.1f} | codes {result[f'{mod}_codes_used']:.2%}")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bubble_bi")
     parser.add_argument("command", choices=["ingest", "build-panel", "baseline",
-                                            "train-tokenizer", "eval-tokenizer"])
+                                            "train-tokenizer", "eval-tokenizer",
+                                            "train-dual", "eval-dual"])
     parser.add_argument("--config", default="configs/m0.yaml")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -104,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
         train_tokenizer(cfg)
     elif args.command == "eval-tokenizer":
         eval_tokenizer(cfg)
+    elif args.command == "train-dual":
+        train_dual(cfg)
+    elif args.command == "eval-dual":
+        eval_dual(cfg)
     return 0
 
 
