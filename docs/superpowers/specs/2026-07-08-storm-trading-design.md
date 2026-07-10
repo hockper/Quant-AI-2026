@@ -123,6 +123,9 @@ yfinance (daily OHLCV, auto_adjust)
   encoder (stock-ID embeddings, masked) + **cross-attention fusion before
   quantization** + joint training. Design:
   `docs/superpowers/specs/2026-07-09-m2-dual-vqvae-design.md`.
+  **DONE (2026-07-09):** joint dual trained; TS recon 1.67 vs baseline 3.81 (strong),
+  CS recon 3.51 vs 3.82 (weak — hard single-token bottleneck); ablation switches
+  work; 57 tests passing. Plan: `docs/superpowers/plans/2026-07-09-m2-dual-vqvae.md`.
 - **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
   regression MSE. Eval: token accuracy/perplexity, RankIC on regressed return,
   multi-step generative-rollout sanity check.

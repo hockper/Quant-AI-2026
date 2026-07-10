@@ -154,3 +154,35 @@ tests/  test_cross_sectional.py test_fusion.py test_dual_vqvae.py test_day_datas
    decrease; both perplexities healthy; checkpoint written.
 3. `eval-dual` → held-out TS and CS recon below their mean baselines; report the
    two ablations to show TS, CS, and fusion each contribute.
+
+---
+
+## M2 Results (recorded 2026-07-09)
+
+Config: `configs/m2.yaml` — 30 tickers, `p=4`, `d_model=128`, `K_ts=K_cs=512`,
+`fusion_layers=2`, joint TS+CS+fusion, 500 steps on CPU (~8 min).
+
+| Module | Held-out recon MSE | Mean baseline | Perplexity | Codes used |
+|---|---|---|---|---|
+| **TS** | **1.669** | 3.807 | 142.5 | 70.9% |
+| **CS** | **3.507** | 3.819 | 15.6 | 12.9% |
+
+- **TS is the workhorse** — recon at 0.44× baseline with rich codebook usage
+  (comparable to M1's standalone 1.46; fusion + shared joint capacity cost a little).
+- **CS is a weak signal** — recon only marginally below baseline (0.92×) with low
+  perplexity. Expected: compressing 30 stocks × 10 features into *one* discrete
+  token per day is a hard bottleneck, and standardized data has a low mean
+  baseline. The CS token captures modest market-level/dispersion structure; its
+  real value (as market context for M3) is to be judged by M3 ablations.
+- **Ablation switches** (`active_modules=[ts]` / `[cs]`) confirmed to train and
+  evaluate end-to-end. A quick 150-step check leaves both in VQ cold-start
+  (under-trained, not comparable to the 500-step run): TS-only still beat baseline
+  (2.99 vs 3.81); CS-only collapsed (perplexity 1.0) — it needs the full step
+  budget (and TS/fusion context helps CS avoid collapse in the joint run).
+
+57 tests passing. The trained `last.pt` (full dual) is the frozen tokenizer M3
+consumes via `DualVQVAE.encode(batch) → (ts_tokens [B,N], cs_tokens [B])`.
+
+**Open follow-up for M3:** CS codebook under-use suggests trying a smaller CS
+codebook, a lighter CS reconstruction target, or longer training — revisit if M3
+finds the CS tokens uninformative.
