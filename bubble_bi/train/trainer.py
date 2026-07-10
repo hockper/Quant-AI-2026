@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from bubble_bi.train.metrics_logger import MetricsLogger
 
 
 def set_seed(seed: int) -> None:
@@ -38,8 +39,18 @@ def _batch_size(batch) -> int:
     return batch.shape[0]
 
 
+def _scalars(out: dict) -> dict:
+    result = {}
+    for k, v in out.items():
+        if isinstance(v, (int, float)):
+            result[k] = float(v)
+        elif torch.is_tensor(v) and v.ndim == 0:
+            result[k] = float(v.detach())
+    return result
+
+
 class Trainer:
-    def __init__(self, model, loaders, cfg, ckpt_dir, standardizer=None, device=None):
+    def __init__(self, model, loaders, cfg, ckpt_dir, standardizer=None, device=None, run_dir=None):
         self.cfg = cfg
         self.device = torch.device(device) if device else resolve_device(cfg.device)
         self.model = model.to(self.device)
@@ -53,16 +64,12 @@ class Trainer:
         self.best_val = float("inf")
         self.ckpt_dir = Path(ckpt_dir)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_path = self.ckpt_dir / "metrics.jsonl"
-
-    def _log(self, record: dict) -> None:
-        with open(self.metrics_path, "a") as fh:
-            fh.write(json.dumps(record) + "\n")
+        self.logger = MetricsLogger(run_dir if run_dir is not None else ckpt_dir)
 
     def train(self) -> dict:
         cfg = self.cfg
         model = self.model
-        last: dict = {}
+        summary: dict = {}
         model.train()
         while self.global_step < cfg.max_steps:
             for xb in self.loaders["train"]:
@@ -86,22 +93,25 @@ class Trainer:
                     else:
                         model.vq.reset_dead_codes(out["z_e"].detach())
 
-                last = {"step": self.global_step,
-                        "loss": out["loss"].detach().item(),
-                        "recon": out["recon_loss"].detach().item(),
-                        "perplexity": out["perplexity"].detach().item()}
+                scal = _scalars(out)
+                summary = {"step": self.global_step,
+                           "recon": scal.get("recon_loss", scal.get("loss", float("nan"))),
+                           "perplexity": scal.get("perplexity", float("nan"))}
+                if self.global_step % cfg.log_every == 0:
+                    self.logger.log({"phase": "train", "step": self.global_step, **scal})
                 if self.global_step % cfg.val_every == 0:
                     val = self.evaluate("val")
-                    last["val_mse"] = val
                     self.best_val = min(self.best_val, val)
-                    self._log(last)
+                    summary["val_mse"] = val
+                    self.logger.log({"phase": "val", "step": self.global_step, "val_mse": val})
                     model.train()
                 if self.global_step % cfg.ckpt_every == 0:
                     self.save_checkpoint(str(self.ckpt_dir / "last.pt"))
-        if "val_mse" not in last:
-            last["val_mse"] = self.evaluate("val")
+        if "val_mse" not in summary:
+            summary["val_mse"] = self.evaluate("val")
         self.save_checkpoint(str(self.ckpt_dir / "last.pt"))
-        return last
+        self.logger.to_csv()
+        return summary
 
     @torch.no_grad()
     def evaluate(self, split: str = "val") -> float:
