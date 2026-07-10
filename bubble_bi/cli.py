@@ -16,6 +16,7 @@ from bubble_bi.eval.tokenizer_eval import evaluate_tokenizer, evaluate_dual
 from bubble_bi.models.ts_vqvae import TSVQVAE
 from bubble_bi.models.dual_vqvae import DualVQVAE
 from bubble_bi.train.trainer import Trainer, resolve_device, set_seed
+from bubble_bi.viz.plots import plot_run, plot_compare
 
 
 def run_ingest(cfg: Config) -> dict[str, str]:
@@ -54,20 +55,44 @@ def _load_or_build_panel(cfg: Config) -> Panel:
     return load_panel(str(cache)) if cache.exists() else build_panel_from_raw(cfg)
 
 
-def train_tokenizer(cfg: Config) -> dict:
+def _run_dir(cfg: Config, run_name: str) -> Path:
+    return Path(cfg.data.cache_dir) / "runs" / run_name
+
+
+def _default_dual_run(cfg: Config) -> str:
+    return f"dual_{'-'.join(cfg.model.active_modules)}_{cfg.train.max_steps}"
+
+
+def _write_eval_json(cfg: Config, run_name: str, result: dict) -> None:
+    import json
+
+    rd = _run_dir(cfg, run_name)
+    rd.mkdir(parents=True, exist_ok=True)
+    with open(rd / "eval.json", "w") as fh:
+        json.dump(result, fh, indent=2)
+
+
+def train_tokenizer(cfg: Config, run_name: str | None = None) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_loaders(panel, cfg)
     model = TSVQVAE(cfg.model, d_in=panel.features.shape[2])
+    run_name = run_name or f"tsvqvae_{cfg.train.max_steps}"
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints"
-    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std)
+    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std,
+                      run_dir=str(_run_dir(cfg, run_name)))
     metrics = trainer.train()
+    trainer.logger.write_meta({"model": "tsvqvae", "d_model": cfg.model.d_model,
+                               "codebook_size": cfg.model.codebook_size,
+                               "n_features": int(panel.features.shape[2]),
+                               "max_steps": cfg.train.max_steps,
+                               "log_every": cfg.train.log_every, "final": metrics})
     print(f"trained {metrics['step']} steps | recon {metrics['recon']:.4f} "
           f"| val_mse {metrics['val_mse']:.4f} | ppl {metrics['perplexity']:.1f}")
     return metrics
 
 
-def eval_tokenizer(cfg: Config) -> dict:
+def eval_tokenizer(cfg: Config, run_name: str | None = None) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_loaders(panel, cfg)
@@ -83,23 +108,34 @@ def eval_tokenizer(cfg: Config) -> dict:
     print(f"test recon_mse {result['recon_mse']:.4f} "
           f"(baseline {result['mean_baseline_mse']:.4f}) | "
           f"ppl {result['perplexity']:.1f} | codes {result['codes_used_frac']:.2%}")
+    if run_name:
+        _write_eval_json(cfg, run_name, result)
     return result
 
 
-def train_dual(cfg: Config) -> dict:
+def train_dual(cfg: Config, run_name: str | None = None) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_day_loaders(panel, cfg)
     model = DualVQVAE(cfg.model, d_in=panel.features.shape[2], n_stocks=len(panel.tickers))
+    run_name = run_name or _default_dual_run(cfg)
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints"
-    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std)
+    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std,
+                      run_dir=str(_run_dir(cfg, run_name)))
     metrics = trainer.train()
+    trainer.logger.write_meta({
+        "model": "dual", "active_modules": cfg.model.active_modules,
+        "d_model": cfg.model.d_model, "codebook_size": cfg.model.codebook_size,
+        "cs_codebook_size": cfg.model.cs_codebook_size, "fusion_layers": cfg.model.fusion_layers,
+        "n_features": int(panel.features.shape[2]), "n_stocks": len(panel.tickers),
+        "max_steps": cfg.train.max_steps, "log_every": cfg.train.log_every, "final": metrics,
+    })
     print(f"trained {metrics['step']} steps | recon {metrics['recon']:.4f} "
           f"| val_mse {metrics['val_mse']:.4f} | ppl {metrics['perplexity']:.1f}")
     return metrics
 
 
-def eval_dual(cfg: Config) -> dict:
+def eval_dual(cfg: Config, run_name: str | None = None) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_day_loaders(panel, cfg)
@@ -117,17 +153,33 @@ def eval_dual(cfg: Config) -> dict:
         print(f"[{mod}] recon {result[f'{mod}_recon_mse']:.4f} "
               f"(baseline {result[f'{mod}_baseline_mse']:.4f}) | "
               f"ppl {result[f'{mod}_perplexity']:.1f} | codes {result[f'{mod}_codes_used']:.2%}")
+    if run_name:
+        _write_eval_json(cfg, run_name, result)
     return result
+
+
+def plot_metrics(cfg: Config, run_names: list[str]) -> list[str]:
+    dirs = [str(_run_dir(cfg, n)) for n in run_names]
+    if len(dirs) == 1:
+        paths = plot_run(dirs[0])
+    else:
+        paths = plot_compare(dirs, str(Path(dirs[0]) / "plots"))
+    print("wrote plots:")
+    for p in paths:
+        print(f"  {p}")
+    return paths
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bubble_bi")
     parser.add_argument("command", choices=["ingest", "build-panel", "baseline",
                                             "train-tokenizer", "eval-tokenizer",
-                                            "train-dual", "eval-dual"])
+                                            "train-dual", "eval-dual", "plot-metrics"])
     parser.add_argument("--config", default="configs/m0.yaml")
+    parser.add_argument("--run-name", nargs="+", default=None)
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    run_name = args.run_name[0] if args.run_name else None
     if args.command == "ingest":
         paths = run_ingest(cfg)
         print(f"ingested {len(paths)} tickers into {cfg.data.raw_dir}")
@@ -137,13 +189,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "baseline":
         run_baseline(cfg)
     elif args.command == "train-tokenizer":
-        train_tokenizer(cfg)
+        train_tokenizer(cfg, run_name=run_name)
     elif args.command == "eval-tokenizer":
-        eval_tokenizer(cfg)
+        eval_tokenizer(cfg, run_name=run_name)
     elif args.command == "train-dual":
-        train_dual(cfg)
+        train_dual(cfg, run_name=run_name)
     elif args.command == "eval-dual":
-        eval_dual(cfg)
+        eval_dual(cfg, run_name=run_name)
+    elif args.command == "plot-metrics":
+        plot_metrics(cfg, args.run_name or [_default_dual_run(cfg)])
     return 0
 
 
