@@ -65,3 +65,11 @@ def test_reinit_dead_codes_runs_for_both():
     model = DualVQVAE(_cfg(), d_in=6, n_stocks=5)
     out = model(_batch())
     model.reinit_dead_codes(out)             # must not raise
+
+
+def test_forward_exposes_per_module_commit_diversity():
+    model = DualVQVAE(_cfg(), d_in=6, n_stocks=5)
+    out = model(_batch())
+    for k in ["ts_commit", "ts_diversity", "cs_commit", "cs_diversity"]:
+        assert k in out
+        assert out[k].ndim == 0

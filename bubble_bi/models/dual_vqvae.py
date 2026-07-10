@@ -60,6 +60,7 @@ class DualVQVAE(nn.Module):
             ts_recon = _masked_mse(recon, windows, valid)
             loss = loss + ts_recon + q["commit"] + self.lambda_div * q["diversity"]
             out.update(ts_recon=ts_recon, ts_perplexity=q["perplexity"],
+                       ts_commit=q["commit"], ts_diversity=q["diversity"],
                        ts_z_e=z_ts.reshape(B * N, -1).detach())
         if "cs" in self.active:
             cs_target = windows[:, :, -1, :]
@@ -68,6 +69,7 @@ class DualVQVAE(nn.Module):
             cs_recon = _masked_mse(recon, cs_target, valid)
             loss = loss + cs_recon + q["commit"] + self.lambda_div * q["diversity"]
             out.update(cs_recon=cs_recon, cs_perplexity=q["perplexity"],
+                       cs_commit=q["commit"], cs_diversity=q["diversity"],
                        cs_z_e=z_cs.detach())
         out["loss"] = loss
         out["recon_loss"] = out.get("ts_recon", out.get("cs_recon"))
