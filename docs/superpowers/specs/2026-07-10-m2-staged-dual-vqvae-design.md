@@ -172,6 +172,26 @@ joint decoder) is the world-model tokenizer. M3 calls `FusionVQVAE.encode(batch)
 ids [B,N]` to build the per-stock token sequences, drops the joint decoder, and
 trains the predictor Transformer on them.
 
+## Phase 2 results (recorded 2026-07-10)
+
+Config `configs/m2_cs.yaml` — 30 tickers, `cs_p=5`, `d_model=128`, `K_cs=512`,
+500 steps CPU (~10.5 min).
+
+| Metric | Value |
+|---|---|
+| Held-out CS field recon MSE | **3.55** |
+| Mean baseline | 3.80 |
+| Perplexity (held-out) | 9.0 (train ~24) |
+| Codes used | 7.6% |
+
+The windowed CS is a **weak reconstructor** (0.93× baseline) — compressing a
+`30×5×10` market field into one token per day is a hard bottleneck, on par with
+M2's single-day CS. Phase 2's purpose is met (the CS encoder trains standalone and
+beats the baseline), and Phase 3 consumes the **continuous** encoder output (not
+the quantized token), so the codebook's low utilisation here is not fatal. The
+open question — does the market context actually help — is answered at Phase 3
+(fusion, `use_fusion` ablation) and M3. 65 tests passing.
+
 ## Defaults
 
 | Setting | Default |
