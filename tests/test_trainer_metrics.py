@@ -2,11 +2,27 @@ import json
 
 import pytest
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from bubble_bi.config import ModelConfig, TrainConfig
-from bubble_bi.models.dual_vqvae import DualVQVAE
+from bubble_bi.config import TrainConfig
 from bubble_bi.train.trainer import Trainer, set_seed, _scalars
+
+
+class _DictModel(nn.Module):
+    def __init__(self, d=6):
+        super().__init__()
+        self.lin = nn.Linear(d, d)
+        self.dead_code_reinit_every = 10 ** 9
+
+    def forward(self, batch):
+        x = batch["windows"]
+        mse = ((self.lin(x) - x) ** 2).mean()
+        return {"loss": mse, "recon_loss": mse, "perplexity": torch.tensor(1.0),
+                "ts_recon": mse, "cs_recon": mse}
+
+    def reinit_dead_codes(self, out):
+        pass
 
 
 class _DayDS(Dataset):
@@ -26,12 +42,6 @@ def _loaders():
     return {"train": ld, "val": ld, "test": ld}
 
 
-def _model():
-    return DualVQVAE(ModelConfig(p=4, d_model=16, codebook_size=16, cs_codebook_size=16,
-                                 enc_layers=1, dec_layers=1, fusion_layers=1, heads=2,
-                                 ff=32, dropout=0.0), d_in=6, n_stocks=5)
-
-
 def test_scalars_skips_non_scalar_tensors():
     out = {"loss": torch.tensor(1.5), "ts_recon": torch.tensor(0.3),
            "ts_z_e": torch.randn(4, 16), "ids": torch.zeros(4, dtype=torch.long)}
@@ -45,13 +55,13 @@ def test_trainer_writes_dense_history(tmp_path):
     set_seed(0)
     cfg = TrainConfig(max_steps=25, batch_size=8, val_every=10, ckpt_every=25,
                       log_every=10, device="cpu", amp=False)
-    tr = Trainer(_model(), _loaders(), cfg, str(tmp_path / "ck"),
+    tr = Trainer(_DictModel(), _loaders(), cfg, str(tmp_path / "ck"),
                  run_dir=str(tmp_path / "run"), device="cpu")
     tr.train()
     lines = [json.loads(x) for x in (tmp_path / "run" / "metrics.jsonl").read_text().splitlines()]
     train_recs = [r for r in lines if r["phase"] == "train"]
     val_recs = [r for r in lines if r["phase"] == "val"]
-    assert len(train_recs) >= 2                    # steps 10, 20
+    assert len(train_recs) >= 2
     assert "ts_recon" in train_recs[0] and "cs_recon" in train_recs[0]
     assert len(val_recs) >= 1
     assert (tmp_path / "run" / "metrics.csv").exists()
