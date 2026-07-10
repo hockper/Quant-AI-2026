@@ -79,17 +79,17 @@ def build_loaders(panel, cfg):
 
 
 class DayDataset(Dataset):
-    def __init__(self, std_features: np.ndarray, mask: np.ndarray, p: int,
+    def __init__(self, std_features: np.ndarray, mask: np.ndarray, window_len: int,
                  day_range, min_valid: int = 2):
         self.X = std_features
         self.mask = mask
-        self.p = p
+        self.L = window_len
         self.N = mask.shape[1]
         self.D = std_features.shape[2]
         lo, hi = day_range
         days = []
-        for t in range(max(lo, p - 1), hi):
-            n_valid = sum(mask[t - p + 1:t + 1, j].all() for j in range(self.N))
+        for t in range(max(lo, window_len - 1), hi):
+            n_valid = sum(mask[t - window_len + 1:t + 1, j].all() for j in range(self.N))
             if n_valid >= min_valid:
                 days.append(t)
         self.days = days
@@ -98,32 +98,25 @@ class DayDataset(Dataset):
         return len(self.days)
 
     def __getitem__(self, i: int) -> dict:
-        t = self.days[i]
-        p, N, D = self.p, self.N, self.D
-        windows = np.zeros((N, p, D), dtype=np.float32)
+        t, L, N, D = self.days[i], self.L, self.N, self.D
+        block = np.zeros((N, L, D), dtype=np.float32)
         valid = np.zeros(N, dtype=bool)
         for j in range(N):
-            if self.mask[t - p + 1:t + 1, j].all():
-                windows[j] = self.X[t - p + 1:t + 1, j, :]
+            if self.mask[t - L + 1:t + 1, j].all():
+                block[j] = self.X[t - L + 1:t + 1, j, :]
                 valid[j] = True
-        return {"windows": torch.from_numpy(windows),
-                "valid": torch.from_numpy(valid)}
+        return {"block": torch.from_numpy(block), "valid": torch.from_numpy(valid)}
 
 
-def build_day_loaders(panel, cfg):
+def build_day_loaders(panel, cfg, window_len: int):
     T = len(panel.dates)
     tr, va, te = chronological_split(T, cfg.data.train_frac, cfg.data.val_frac)
     std = Standardizer().fit(panel.features, panel.mask, tr)
     Xs = std.transform(panel.features)
-    p = cfg.model.p
-    bs = cfg.train.batch_size
-    nw = cfg.train.num_workers
-    loaders = {
-        "train": DataLoader(DayDataset(Xs, panel.mask, p, tr), batch_size=bs,
-                            shuffle=True, num_workers=nw, drop_last=True),
-        "val": DataLoader(DayDataset(Xs, panel.mask, p, va), batch_size=bs,
-                          shuffle=False, num_workers=nw),
-        "test": DataLoader(DayDataset(Xs, panel.mask, p, te), batch_size=bs,
-                           shuffle=False, num_workers=nw),
-    }
-    return loaders, std
+    bs, nw = cfg.train.batch_size, cfg.train.num_workers
+
+    def mk(rng, shuffle):
+        return DataLoader(DayDataset(Xs, panel.mask, window_len, rng), batch_size=bs,
+                          shuffle=shuffle, num_workers=nw, drop_last=shuffle)
+
+    return {"train": mk(tr, True), "val": mk(va, False), "test": mk(te, False)}, std
