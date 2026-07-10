@@ -5,3 +5,4 @@ pyarrow
 yfinance
 PyYAML
 pytest
+matplotlib

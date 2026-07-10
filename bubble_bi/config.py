@@ -63,6 +63,7 @@ class TrainConfig:
     max_steps: int = 2000
     val_every: int = 200
     ckpt_every: int = 200
+    log_every: int = 10
     device: str = "auto"
     amp: bool = True
     num_workers: int = 0
