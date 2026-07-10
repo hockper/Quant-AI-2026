@@ -26,6 +26,18 @@ def _dead_every(model) -> int:
     return getattr(model, "dead_code_reinit_every", 250)
 
 
+def _to_device(batch, device):
+    if isinstance(batch, dict):
+        return {k: v.to(device) for k, v in batch.items()}
+    return batch.to(device)
+
+
+def _batch_size(batch) -> int:
+    if isinstance(batch, dict):
+        return next(iter(batch.values())).shape[0]
+    return batch.shape[0]
+
+
 class Trainer:
     def __init__(self, model, loaders, cfg, ckpt_dir, standardizer=None, device=None):
         self.cfg = cfg
@@ -56,7 +68,7 @@ class Trainer:
             for xb in self.loaders["train"]:
                 if self.global_step >= cfg.max_steps:
                     break
-                xb = xb.to(self.device)
+                xb = _to_device(xb, self.device)
                 self.opt.zero_grad()
                 with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
                     out = model(xb)
@@ -69,7 +81,10 @@ class Trainer:
                 self.global_step += 1
 
                 if self.global_step % _dead_every(model) == 0:
-                    model.vq.reset_dead_codes(out["z_e"].detach())
+                    if hasattr(model, "reinit_dead_codes"):
+                        model.reinit_dead_codes(out)
+                    else:
+                        model.vq.reset_dead_codes(out["z_e"].detach())
 
                 last = {"step": self.global_step,
                         "loss": out["loss"].detach().item(),
@@ -93,10 +108,11 @@ class Trainer:
         self.model.eval()
         total, n = 0.0, 0
         for xb in self.loaders[split]:
-            xb = xb.to(self.device)
+            xb = _to_device(xb, self.device)
             out = self.model(xb)
-            total += float(out["recon_loss"]) * xb.shape[0]
-            n += xb.shape[0]
+            bs = _batch_size(xb)
+            total += float(out["recon_loss"]) * bs
+            n += bs
         return total / max(n, 1)
 
     def save_checkpoint(self, path: str) -> None:
