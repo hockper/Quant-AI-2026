@@ -131,6 +131,13 @@ yfinance (daily OHLCV, auto_adjust)
   joint whole-market decoder. Redefined design:
   `docs/superpowers/specs/2026-07-10-m2-staged-dual-vqvae-design.md` (supersedes the
   two-token version; that `DualVQVAE`/`train-dual` code is removed).
+  **DONE (2026-07-10):** staged Phases 1-3 built (`train-tokenizer`/`train-cs`/
+  `train-fusion`). Fusion token: held-out recon 1.94 vs baseline 3.81, perplexity
+  86.7, **80% codes used** (healthy — the fused single codebook works far better
+  than the collapsed CS-alone). Frozen `checkpoints_fusion/last.pt` → M3 via
+  `FusionVQVAE.encode → ids[B,N]`. Plans:
+  `docs/superpowers/plans/2026-07-10-m2-phase2-cs-vqvae.md`,
+  `2026-07-10-m2-phase3-fusion.md`.
 - **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
   regression MSE. Eval: token accuracy/perplexity, RankIC on regressed return,
   multi-step generative-rollout sanity check.

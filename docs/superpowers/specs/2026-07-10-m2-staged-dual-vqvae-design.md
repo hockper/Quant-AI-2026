@@ -192,6 +192,29 @@ the quantized token), so the codebook's low utilisation here is not fatal. The
 open question — does the market context actually help — is answered at Phase 3
 (fusion, `use_fusion` ablation) and M3. 65 tests passing.
 
+## Phase 3 results (recorded 2026-07-10)
+
+Staged run: Phase 1 TS (`m1.yaml`) → Phase 2 CS (`m2_cs.yaml`) frozen → Phase 3
+fusion (`m2_fusion.yaml`, 500 steps CPU). Fusion trains only the market→stock
+fusion + `codebook_FUSION` + joint decoder on the frozen continuous encoders.
+
+| Metric | Value |
+|---|---|
+| Held-out whole-market recon MSE | **1.94** |
+| Mean baseline | 3.81 |
+| Fusion perplexity (held-out) | 86.7 (train ~312) |
+| Codes used (of 512) | **79.7%** |
+
+**The single fused token is healthy and well-utilised** — recon at 0.51× baseline
+with 80% codebook usage, in stark contrast to the CS-alone codebook collapse
+(perplexity 9, 7.6%). Folding the market in as continuous context (not a separate
+quantized token) and quantizing once clearly works better. `checkpoints_fusion/
+last.pt` is the frozen tokenizer M3 consumes via `FusionVQVAE.encode → ids [B,N]`.
+
+The `use_fusion` on/off ablation is **deferred to M3**: whether the market context
+improves *predictions* (RankIC) is the meaningful test, and it's cheaper to run
+there than as a second full tokenizer retrain here. **REDEFINED-M2 DONE.**
+
 ## Defaults
 
 | Setting | Default |
