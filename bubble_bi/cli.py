@@ -75,7 +75,14 @@ def _write_eval_json(cfg: Config, run_name: str, result: dict) -> None:
         json.dump(result, fh, indent=2)
 
 
-def train_tokenizer(cfg: Config, run_name: str | None = None) -> dict:
+def _maybe_resume(trainer, ckpt_dir: Path, resume: bool) -> None:
+    ckpt = Path(ckpt_dir) / "last.pt"
+    if resume and ckpt.exists():
+        trainer.load_checkpoint(str(ckpt))
+        print(f"resumed from {ckpt} at step {trainer.global_step}")
+
+
+def train_tokenizer(cfg: Config, run_name: str | None = None, resume: bool = False) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_loaders(panel, cfg)
@@ -84,6 +91,7 @@ def train_tokenizer(cfg: Config, run_name: str | None = None) -> dict:
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints"
     trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std,
                       run_dir=str(_run_dir(cfg, run_name)))
+    _maybe_resume(trainer, ckpt_dir, resume)
     metrics = trainer.train()
     trainer.logger.write_meta({"model": "tsvqvae", "d_model": cfg.model.d_model,
                                "codebook_size": cfg.model.codebook_size,
@@ -116,7 +124,7 @@ def eval_tokenizer(cfg: Config, run_name: str | None = None) -> dict:
     return result
 
 
-def train_cs(cfg: Config, run_name: str | None = None) -> dict:
+def train_cs(cfg: Config, run_name: str | None = None, resume: bool = False) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     loaders, std = build_day_loaders(panel, cfg, window_len=cfg.model.cs_p)
@@ -125,6 +133,7 @@ def train_cs(cfg: Config, run_name: str | None = None) -> dict:
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints_cs"
     trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std,
                       run_dir=str(_run_dir(cfg, run_name)))
+    _maybe_resume(trainer, ckpt_dir, resume)
     metrics = trainer.train()
     trainer.logger.write_meta({"model": "cs", "cs_p": cfg.model.cs_p,
                                "cs_codebook_size": cfg.model.cs_codebook_size,
@@ -157,7 +166,7 @@ def eval_cs(cfg: Config, run_name: str | None = None) -> dict:
     return result
 
 
-def train_fusion(cfg: Config, run_name: str | None = None) -> dict:
+def train_fusion(cfg: Config, run_name: str | None = None, resume: bool = False) -> dict:
     set_seed(cfg.seed)
     panel = _load_or_build_panel(cfg)
     window_len = max(cfg.model.p, cfg.model.cs_p)
@@ -174,6 +183,7 @@ def train_fusion(cfg: Config, run_name: str | None = None) -> dict:
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints_fusion"
     trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir), standardizer=std,
                       run_dir=str(_run_dir(cfg, run_name)))
+    _maybe_resume(trainer, ckpt_dir, resume)
     metrics = trainer.train()
     trainer.logger.write_meta({"model": "fusion", "p": cfg.model.p, "cs_p": cfg.model.cs_p,
                                "fusion_codebook_size": cfg.model.fusion_codebook_size,
@@ -241,7 +251,7 @@ def _load_or_build_token_grid(cfg: Config) -> np.ndarray:
     return tokenize_panel(cfg)
 
 
-def train_predictor(cfg: Config, run_name: str | None = None) -> dict:
+def train_predictor(cfg: Config, run_name: str | None = None, resume: bool = False) -> dict:
     set_seed(cfg.seed)
     grid = _load_or_build_token_grid(cfg)
     loaders = build_token_loaders(grid, cfg)
@@ -250,6 +260,7 @@ def train_predictor(cfg: Config, run_name: str | None = None) -> dict:
     ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints_predictor"
     trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir),
                       run_dir=str(_run_dir(cfg, run_name)))
+    _maybe_resume(trainer, ckpt_dir, resume)
     metrics = trainer.train()
     trainer.logger.write_meta({"model": "predictor", "pred_window": cfg.model.pred_window,
                                "pred_layers": cfg.model.pred_layers,
@@ -304,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
                                             "plot-metrics"])
     parser.add_argument("--config", default="configs/m0.yaml")
     parser.add_argument("--run-name", nargs="+", default=None)
+    parser.add_argument("--resume", action="store_true",
+                        help="continue an interrupted run from its last checkpoint")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     run_name = args.run_name[0] if args.run_name else None
@@ -316,21 +329,21 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "baseline":
         run_baseline(cfg)
     elif args.command == "train-tokenizer":
-        train_tokenizer(cfg, run_name=run_name)
+        train_tokenizer(cfg, run_name=run_name, resume=args.resume)
     elif args.command == "eval-tokenizer":
         eval_tokenizer(cfg, run_name=run_name)
     elif args.command == "train-cs":
-        train_cs(cfg, run_name=run_name)
+        train_cs(cfg, run_name=run_name, resume=args.resume)
     elif args.command == "eval-cs":
         eval_cs(cfg, run_name=run_name)
     elif args.command == "train-fusion":
-        train_fusion(cfg, run_name=run_name)
+        train_fusion(cfg, run_name=run_name, resume=args.resume)
     elif args.command == "eval-fusion":
         eval_fusion(cfg, run_name=run_name)
     elif args.command == "tokenize":
         tokenize_panel(cfg)
     elif args.command == "train-predictor":
-        train_predictor(cfg, run_name=run_name)
+        train_predictor(cfg, run_name=run_name, resume=args.resume)
     elif args.command == "eval-predictor":
         eval_predictor(cfg, run_name=run_name)
     elif args.command == "plot-metrics":
