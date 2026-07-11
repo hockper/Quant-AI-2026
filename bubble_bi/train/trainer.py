@@ -56,8 +56,8 @@ class Trainer:
         self.model = model.to(self.device)
         self.loaders = loaders
         self.standardizer = standardizer
-        self.opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
-                                     weight_decay=cfg.weight_decay)
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        self.opt = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.use_amp = bool(cfg.amp) and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
         self.global_step = 0

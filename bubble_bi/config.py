@@ -49,9 +49,10 @@ class ModelConfig:
     ema_decay: float = 0.99
     dead_code_reinit_every: int = 250
     cs_codebook_size: int = 512
+    cs_p: int = 5
+    fusion_codebook_size: int = 512
     fusion_layers: int = 2
     use_fusion: bool = True
-    active_modules: list[str] = field(default_factory=lambda: ["ts", "cs"])
 
 
 @dataclass

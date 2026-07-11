@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 from bubble_bi.config import Config, DataConfig, FeatureConfig, ModelConfig, TrainConfig
-from bubble_bi.cli import train_tokenizer, eval_tokenizer, plot_metrics
+from bubble_bi.cli import train_cs, eval_cs
 
 
 def _write_raw(raw, n=320, N=6):
@@ -21,23 +21,21 @@ def _cfg(tmp_path):
         data=DataConfig(tickers=[f"T{k}" for k in range(6)], raw_dir=str(tmp_path / "raw"),
                         cache_dir=str(tmp_path / "cache"), min_history=50),
         features=FeatureConfig(),
-        model=ModelConfig(p=4, d_model=16, codebook_size=16, enc_layers=1,
+        model=ModelConfig(p=4, cs_p=3, d_model=16, cs_codebook_size=16, enc_layers=1,
                           dec_layers=1, heads=2, ff=32, dropout=0.0),
         train=TrainConfig(max_steps=8, batch_size=8, val_every=8, ckpt_every=8,
                           log_every=4, device="cpu", amp=False),
     )
 
 
-def test_train_eval_plot_run_folder(tmp_path):
+def test_train_then_eval_cs(tmp_path):
     (tmp_path / "raw").mkdir()
     (tmp_path / "cache").mkdir()
     _write_raw(tmp_path / "raw")
     cfg = _cfg(tmp_path)
-    train_tokenizer(cfg, run_name="r1")
-    run = tmp_path / "cache" / "runs" / "r1"
-    assert (run / "metrics.jsonl").exists()
-    assert (run / "meta.json").exists()
-    eval_tokenizer(cfg, run_name="r1")
-    assert (run / "eval.json").exists()
-    plot_metrics(cfg, ["r1"])
-    assert (run / "plots" / "losses.png").exists()
+    m = train_cs(cfg, run_name="cs")
+    assert m["step"] == 8
+    assert (tmp_path / "cache" / "checkpoints_cs" / "last.pt").exists()
+    ev = eval_cs(cfg, run_name="cs")
+    assert np.isfinite(ev["recon_mse"])
+    assert 0.0 <= ev["codes_used_frac"] <= 1.0
