@@ -32,8 +32,8 @@ def test_feature_columns_match_names():
 
 def test_features_are_causal_truncating_future_does_not_change_past():
     cfg = FeatureConfig()
-    df = _synthetic_ohlcv(n=300)
-    cutoff = 200
+    df = _synthetic_ohlcv(n=600)
+    cutoff = 400
     full = compute_features(df, cfg)
     truncated = compute_features(df.iloc[: cutoff + 1], cfg)
     a = full.iloc[: cutoff + 1].to_numpy()
@@ -46,4 +46,24 @@ def test_features_have_warmup_nans_then_finite():
     cfg = FeatureConfig()
     feats = compute_features(_synthetic_ohlcv(), cfg)
     assert feats.iloc[0].isna().any()
+    assert np.isfinite(feats.iloc[-1].to_numpy()).all()
+
+
+def test_feature_count_is_22():
+    cfg = FeatureConfig()
+    names = FEATURE_NAMES(cfg)
+    assert len(names) == 22
+    assert names[:10] == ["log_return", "sma_ratio_5", "sma_ratio_10", "sma_ratio_20",
+                          "rsi", "macd", "macd_signal", "macd_hist", "realized_vol",
+                          "volume_z"]
+    assert names[10:] == ["parkinson", "garman_klass", "yang_zhang", "atr_frac",
+                          "hurst", "close_frac", "entropy",
+                          "amihud", "roll_spread", "corwin_schultz",
+                          "volume_frac", "obv_frac"]
+
+
+def test_all_22_columns_present_and_finite_at_the_end():
+    cfg = FeatureConfig()
+    feats = compute_features(_synthetic_ohlcv(n=600), cfg)
+    assert list(feats.columns) == FEATURE_NAMES(cfg)
     assert np.isfinite(feats.iloc[-1].to_numpy()).all()
