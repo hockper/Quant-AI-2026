@@ -14,15 +14,66 @@ def _df(close, high=None, low=None, volume=None):
                          "close": close, "volume": volume})
 
 
-def test_obv_accumulates_signed_volume():
+def test_obv_accumulates_sign_times_normalized_volume():
     df = _df([10, 11, 10, 12], volume=[100, 200, 300, 400])
-    # signs: nan->0, +, -, +   => 0, +200, -300, +400 cumulated
-    assert obv(df).tolist() == [0.0, 200.0, -100.0, 300.0]
+    window = 2
+    sign = np.sign(df["close"].diff()).fillna(0.0)
+    norm = df["volume"] / df["volume"].rolling(window).mean()
+    expected = (sign * norm).cumsum()
+    assert np.allclose(obv(df, window).to_numpy(), expected.to_numpy(), equal_nan=True)
 
 
-def test_roll_spread_is_zero_when_serial_cov_is_positive():
-    # a strong trend has POSITIVE serial covariance -> Roll is undefined -> 0
+def test_obv_is_causal():
+    df = _df([10, 11, 10, 12, 13, 11, 12], volume=[100, 200, 300, 400, 250, 150, 500])
+    full = obv(df, 3)
+    trunc = obv(df.iloc[:5], 3)
+    a, b = full.iloc[:5].to_numpy(), trunc.to_numpy()
+    both_nan = np.isnan(a) & np.isnan(b)
+    assert np.allclose(a[~both_nan], b[~both_nan], atol=1e-10)
+
+
+def test_obv_is_scale_free_across_tickers_with_proportional_volume():
+    # This is the whole point of the fix: raw share volume differs by orders
+    # of magnitude across tickers, so a raw cumsum of sign*volume would carry
+    # a per-ticker level term. Normalizing by trailing mean volume removes it
+    # -- two tickers whose volume differs by a constant multiplicative factor
+    # (e.g. a big-cap vs. a small-cap trading the same relative pattern) must
+    # produce IDENTICAL obv.
+    close = [10, 11, 10, 12, 13, 11, 12, 14, 13, 15]
+    base_volume = np.array([100, 200, 300, 400, 250, 150, 500, 600, 300, 800], dtype=float)
+    window = 3
+    small_cap = obv(_df(close, volume=base_volume), window)
+    big_cap = obv(_df(close, volume=base_volume * 1000.0), window)
+    assert np.allclose(small_cap.to_numpy(), big_cap.to_numpy(), equal_nan=True)
+
+
+def test_roll_spread_is_zero_for_flat_zero_serial_covariance():
+    # constant dP -> the TRUE serial covariance is exactly 0 (not positive);
+    # this only exercises the float-noise tolerance path, not the cov > 0 guard.
     df = _df(np.linspace(100, 140, 120))
+    s = roll_spread(df, 21).dropna()
+    assert (s == 0).all()
+
+
+def test_roll_spread_is_zero_when_serial_cov_is_genuinely_positive():
+    # momentum/trend-following path: AR(1) on the price increments with
+    # rho=+0.6 makes consecutive dP genuinely, substantially positively
+    # autocorrelated (verified below) -> Roll's estimator is undefined and
+    # must return 0. This is the test that actually exercises the cov > 0
+    # guard, unlike the flat-price fixture above.
+    rng = np.random.default_rng(0)
+    n = 200
+    dp = np.zeros(n)
+    eps = rng.normal(0, 1.0, n)
+    for i in range(1, n):
+        dp[i] = 0.6 * dp[i - 1] + eps[i]
+    close = 100.0 + np.cumsum(dp)
+    df = _df(close)
+
+    raw_dp = df["close"].diff()
+    cov = raw_dp.rolling(21).cov(raw_dp.shift(1)).dropna()
+    assert (cov > 0).mean() > 0.9  # confirm the fixture is genuinely positive-cov
+
     s = roll_spread(df, 21).dropna()
     assert (s == 0).all()
 
@@ -98,7 +149,7 @@ def test_micro_features_are_causal():
     c = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 300)))
     df = _df(c)
     for fn in (lambda d: amihud(d, 21), lambda d: roll_spread(d, 21),
-               lambda d: corwin_schultz(d, 21), obv):
+               lambda d: corwin_schultz(d, 21), lambda d: obv(d, 21)):
         full = fn(df)
         trunc = fn(df.iloc[:201])
         a, b = full.iloc[:201].to_numpy(), trunc.to_numpy()

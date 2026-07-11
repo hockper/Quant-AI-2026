@@ -6,10 +6,19 @@ import pandas as pd
 _DEN = 3.0 - 2.0 * np.sqrt(2.0)      # Corwin-Schultz denominator
 
 
-def obv(df: pd.DataFrame) -> pd.Series:
-    """On-Balance Volume: cumulative signed volume (non-stationary by construction)."""
+def obv(df: pd.DataFrame, window: int) -> pd.Series:
+    """On-Balance Volume over VOLUME-NORMALISED flow.
+
+    Raw share volume differs by orders of magnitude across tickers, and the
+    truncated FFD weights do not sum to zero -- so a raw cumsum would leave a
+    per-ticker level term that survives into obv_frac and acts as a ticker id.
+    Dividing by the trailing mean volume makes the accumulated flow comparable
+    across tickers.
+    """
     sign = np.sign(df["close"].diff()).fillna(0.0)
-    return (sign * df["volume"]).cumsum()
+    vol = df["volume"].astype(float)
+    norm = vol / vol.rolling(window).mean()
+    return (sign * norm).cumsum()
 
 
 def amihud(df: pd.DataFrame, window: int) -> pd.Series:
@@ -21,7 +30,7 @@ def amihud(df: pd.DataFrame, window: int) -> pd.Series:
 
 
 def roll_spread(df: pd.DataFrame, window: int) -> pd.Series:
-    """Roll (1984) implied spread: 2*sqrt(-Cov(dP_t, dP_{t-1})).
+    """Roll (1984) implied spread, relative (fraction-of-price): 2*sqrt(-Cov(dP_t, dP_{t-1})) / P.
 
     The estimator is UNDEFINED when the serial covariance is positive (common on
     trending daily data); we return 0 there, which is the standard convention.
@@ -31,6 +40,10 @@ def roll_spread(df: pd.DataFrame, window: int) -> pd.Series:
     cancellation error. `tol` is the expected magnitude of that rounding noise
     (machine epsilon scaled by the rolling second moment of dP and window size);
     covariances within it of 0 are treated as non-negative, i.e. spread 0.
+
+    The covariance guard operates on the raw dollar price changes; only the
+    final spread is scaled by price, to keep the estimator comparable across
+    tickers/price levels.
     """
     dp = df["close"].diff()
     cov = dp.rolling(window).cov(dp.shift(1))
@@ -38,7 +51,7 @@ def roll_spread(df: pd.DataFrame, window: int) -> pd.Series:
     tol = np.finfo(float).eps * window * dp.pow(2).rolling(window).mean()
     noise = (neg_cov > 0.0) & (neg_cov <= tol)
     neg_cov = neg_cov.mask(noise, 0.0)
-    return 2.0 * np.sqrt(neg_cov)
+    return 2.0 * np.sqrt(neg_cov) / df["close"]
 
 
 def corwin_schultz(df: pd.DataFrame, window: int) -> pd.Series:

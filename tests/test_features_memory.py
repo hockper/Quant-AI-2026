@@ -1,7 +1,17 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from bubble_bi.data.features_memory import entropy, hurst
+
+
+def test_hurst_raises_for_window_too_small_for_two_scales():
+    # window=15 -> candidate scales {1,3,7,15}, only 15 survives the >=8 filter,
+    # so fewer than 2 scales are usable. Silently returning all-NaN here would
+    # zero out the panel's entire valid mask; it must raise instead.
+    close = pd.Series(100 * np.exp(np.cumsum(np.random.default_rng(0).normal(0, 0.01, 200))))
+    with pytest.raises(ValueError):
+        hurst(close, 15)
 
 
 def test_hurst_near_half_for_random_walk():

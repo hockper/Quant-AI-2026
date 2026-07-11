@@ -42,6 +42,17 @@ def test_rogers_satchell_is_zero_when_open_equals_close_equals_high_equals_low()
     assert np.allclose(rogers_satchell(df).to_numpy(), 0.0)
 
 
+def test_rogers_satchell_matches_hand_computed_value_for_nondegenerate_bar():
+    # O/H/L/C chosen so the two cross terms differ (0.00365 vs 0.00183) -- a
+    # swapped pairing (H/O with L/C, etc.) or a sign flip would both change
+    # the result, unlike the O=H=L=C degenerate test where every term is 0.
+    o, h, l, c = 100.0, 108.0, 97.0, 103.0
+    df = pd.DataFrame({"open": [o], "high": [h], "low": [l], "close": [c], "volume": [1.0]})
+    expected = np.log(h / c) * np.log(h / o) + np.log(l / c) * np.log(l / o)
+    assert np.isclose(rogers_satchell(df).iloc[0], expected)
+    assert np.isclose(expected, 0.005476226668581852)
+
+
 def test_atr_is_causal():
     df = _ohlcv(n=200)
     full = atr(df, 14)

@@ -60,7 +60,7 @@ def compute_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
     out["parkinson"] = parkinson(df, cfg.vol_window)
     out["garman_klass"] = garman_klass(df, cfg.vol_window)
     out["yang_zhang"] = yang_zhang(df, cfg.vol_window)
-    out["atr_frac"] = frac_diff(atr(df, cfg.atr_window), **fd)
+    out["atr_frac"] = frac_diff(atr(df, cfg.atr_window) / close, **fd)
 
     # --- memory ------------------------------------------------------------
     out["hurst"] = hurst(close, cfg.hurst_window)
@@ -74,6 +74,6 @@ def compute_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
 
     # --- flow --------------------------------------------------------------
     out["volume_frac"] = frac_diff(np.log1p(volume), **fd)
-    out["obv_frac"] = frac_diff(obv(df), **fd)
+    out["obv_frac"] = frac_diff(obv(df, cfg.volume_window), **fd)
 
     return out[FEATURE_NAMES(cfg)]

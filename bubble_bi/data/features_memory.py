@@ -32,7 +32,13 @@ def hurst(close: pd.Series, window: int) -> pd.Series:
     r = np.diff(r, prepend=np.nan)                 # log-returns, NaN at index 0
     out = np.full(len(r), np.nan)
     scales = sorted({s for s in (window // 8, window // 4, window // 2, window) if s >= 8})
-    if len(r) < window or len(scales) < 2:
+    if len(scales) < 2:
+        raise ValueError(
+            f"hurst_window={window} yields fewer than 2 usable R/S scales "
+            f"(need window >= 16); a single all-NaN feature column silently "
+            f"zeroes the entire panel's valid mask. Use hurst_window >= 16."
+        )
+    if len(r) < window:
         return pd.Series(out, index=close.index)
 
     views = sliding_window_view(r, window)         # [n_win, window]
