@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from bubble_bi.runtime import (detect_runtime, is_xla, mark_step,  # noqa: F401
+                               optimizer_step, resolve_device, save_state)
 from bubble_bi.train.metrics_logger import MetricsLogger
 
 
@@ -15,12 +18,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def resolve_device(name: str) -> torch.device:
-    if name == "auto":
-        name = "cuda" if torch.cuda.is_available() else "cpu"
-    return torch.device(name)
 
 
 def _dead_every(model) -> int:
@@ -59,7 +56,9 @@ class Trainer:
         trainable = [p for p in model.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
         self.use_amp = bool(cfg.amp) and self.device.type == "cuda"
-        self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+        # Always construct the scaler for "cuda"; disabled off-CUDA so it is a no-op.
+        # (Constructing it with an XLA device type would fail.)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
         self.global_step = 0
         self.best_val = float("inf")
         self.ckpt_dir = Path(ckpt_dir)
@@ -77,14 +76,17 @@ class Trainer:
                     break
                 xb = _to_device(xb, self.device)
                 self.opt.zero_grad()
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                amp_ctx = (torch.autocast(device_type="cuda") if self.use_amp
+                           else contextlib.nullcontext())
+                with amp_ctx:
                     out = model(xb)
                     loss = out["loss"]
                 self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.opt)
+                if self.use_amp:
+                    self.scaler.unscale_(self.opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                self.scaler.step(self.opt)
-                self.scaler.update()
+                optimizer_step(self.opt, self.scaler, self.device)
+                mark_step(self.device)
                 self.global_step += 1
 
                 if self.global_step % _dead_every(model) == 0:
@@ -138,7 +140,7 @@ class Trainer:
         }
         if self.standardizer is not None:
             state["standardizer"] = self.standardizer.state_dict()
-        torch.save(state, path)
+        save_state(state, path, self.device)
 
     def load_checkpoint(self, path: str) -> None:
         state = torch.load(path, map_location=self.device, weights_only=False)
