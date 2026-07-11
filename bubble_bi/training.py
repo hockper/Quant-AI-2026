@@ -141,12 +141,8 @@ def train(
     history = History()
     started = time.time()
 
-    if not quiet:
-        print(f"Training on {str(where).upper()} for {steps:,} steps "
-              f"({len(loaders['learn'].dataset):,} grids to learn from)\n")
-        print(f"{'step':>6}  {'rebuild':>8}  {'vs guessing':>12}  "
-              f"{'perplexity':>11}  {'words used':>11}")
-        print("  " + "─" * 58)
+    progress = _Progress(steps, model.codebook.words, len(loaders["learn"].dataset),
+                         str(where), enabled=not quiet)
 
     revived = 0
     for step in range(1, steps + 1):
@@ -163,6 +159,8 @@ def train(
         if step % revive_every == 0:
             revived += model.codebook.revive_dead_words(out["summary"].detach())
 
+        progress.tick(step, float(out["rebuild_loss"]), float(out["perplexity"]))
+
         if step % check_every == 0 or step == steps:
             scored = evaluate(model, loaders["tune"], where)
             history.add(
@@ -173,16 +171,72 @@ def train(
                 words_used=scored["words_used"],
                 revived=revived,
             )
-            if not quiet:
-                share = scored["rebuild"] / max(scored["guessing"], 1e-9)
-                print(f"{step:>6}  {scored['rebuild']:>8.3f}  {share:>11.0%}  "
-                      f"{scored['perplexity']:>11.1f}  "
-                      f"{scored['words_used']:>5} / {model.codebook.words}")
+            progress.checkpoint(step, scored, model.codebook.words)
 
     history.seconds = time.time() - started
-    if not quiet:
-        print(f"\n  {history.seconds:.0f}s, {revived:,} dead words revived along the way")
+    progress.done(history.seconds, revived)
     return history
+
+
+class _Progress:
+    """A live bar, so a long training run does not look like a hung notebook."""
+
+    REDRAW_EVERY = 0.15          # seconds — smooth to the eye, cheap on the notebook
+
+    def __init__(self, steps: int, words: int, grids: int, where: str, enabled: bool):
+        self.steps, self.words, self.enabled = steps, words, enabled
+        self.started = time.time()
+        self.last_drawn = 0.0
+        self.line = ""
+        if enabled:
+            print(f"Training on {where.upper()} for {steps:,} steps "
+                  f"({grids:,} grids to learn from)")
+            print(f"\n{'step':>7}  {'rebuild':>8}  {'vs guessing':>12}  "
+                  f"{'perplexity':>11}  {'words used':>12}")
+            print("  " + "─" * 60)
+
+    def tick(self, step: int, loss: float, perplexity: float) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        # Throttled by the clock, not the step count: a fast GPU run and a slow CPU
+        # one then both redraw at a readable pace, and neither floods the notebook.
+        if now - self.last_drawn < self.REDRAW_EVERY and step != self.steps:
+            return
+        self.last_drawn = now
+
+        done = step / self.steps
+        filled = int(done * 28)
+        gone = now - self.started
+        left = gone / max(done, 1e-9) - gone
+        bar = "█" * filled + "░" * (28 - filled)
+        self._draw(
+            f"  {bar} {done:>4.0%}  step {step:,}/{self.steps:,}  "
+            f"rebuild {loss:.3f}  perplexity {perplexity:>5.1f}  "
+            f"~{left:>3.0f}s left"
+        )
+
+    def checkpoint(self, step: int, scored: dict, words: int) -> None:
+        if not self.enabled:
+            return
+        self._draw("")                       # wipe the bar, print the real row under it
+        share = scored["rebuild"] / max(scored["guessing"], 1e-9)
+        print(f"{step:>7}  {scored['rebuild']:>8.3f}  {share:>11.0%}  "
+              f"{scored['perplexity']:>11.1f}  {scored['words_used']:>6} / {words}")
+
+    def done(self, seconds: float, revived: int) -> None:
+        if not self.enabled:
+            return
+        self._draw("")
+        print(f"\n  {seconds:.0f}s, {revived:,} dead words revived along the way")
+
+    def _draw(self, text: str) -> None:
+        import sys
+
+        pad = " " * max(0, len(self.line) - len(text))
+        sys.stdout.write("\r" + text + pad + ("\r" if not text else ""))
+        sys.stdout.flush()
+        self.line = text
 
 
 def baseline_rebuild(loader, limit: int = 40) -> float:

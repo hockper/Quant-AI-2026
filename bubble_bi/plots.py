@@ -1,0 +1,196 @@
+"""Looking at what a single word actually remembered.
+
+The tokenizer squeezes several days of a company into ONE word out of 512, then
+rebuilds those days from that word alone. This draws both: the real candles, and
+the candles the word remembered.
+
+It is the most honest demonstration in the project. Nothing here is a summary
+statistic you have to trust — you can simply look at it and see what survived the
+squeeze and what did not.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import torch
+
+from bubble_bi.data.features.candle import rebuild_candles
+
+SHAPE = ["gap", "body", "upper_wick", "lower_wick"]
+
+
+def _draw_candles(ax, candles: pd.DataFrame, title: str) -> None:
+    up, down = "#26a69a", "#ef5350"
+    for i, (_, day) in enumerate(candles.iterrows()):
+        rising = day["close"] >= day["open"]
+        colour = up if rising else down
+        # the wick: the whole range of the day
+        ax.plot([i, i], [day["low"], day["high"]], color=colour, linewidth=1.4, zorder=1)
+        # the body: open to close
+        low, high = sorted((day["open"], day["close"]))
+        ax.add_patch(
+            __import__("matplotlib.patches", fromlist=["Rectangle"]).Rectangle(
+                (i - 0.28, low), 0.56, max(high - low, (high + low) * 1e-4),
+                facecolor=colour, edgecolor=colour, zorder=2,
+            )
+        )
+    ax.set_title(title, fontsize=11, loc="left")
+    ax.set_xticks(range(len(candles)))
+    ax.set_xticklabels([d.strftime("%d %b") for d in candles.index], fontsize=8)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.5)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def remembered(model, batches, prices: pd.DataFrame, settings: dict,
+               company: str | None = None, when: int | None = None):
+    """Draw the real candles beside the ones a single token remembered.
+
+    The model never sees a candle — it sees the candle's SHAPE (gap, body, wicks),
+    which is scale-free. So we take the shape it reconstructed, invert it back into
+    open/high/low/close, and draw it. Given the previous close, that inversion is
+    exact: what you see is precisely what the word remembered, not an impression.
+    """
+    import matplotlib.pyplot as plt
+
+    arrays, scaler = batches.arrays, batches.scaler
+    grids = batches.ts["test"].dataset          # days it was never trained on
+    if len(grids) == 0:
+        raise ValueError("No test grids to show.")
+
+    # Pick an example: a named company if asked, otherwise the most eventful day we
+    # can find, because a flat week teaches the reader nothing.
+    wanted = arrays.tickers.index(company) if company else None
+    choices = np.nonzero(grids.who == wanted)[0] if wanted is not None \
+        else np.arange(len(grids))
+    if when is None:
+        moves = [abs(float(grids[int(i)]["target"])) for i in choices[:400]]
+        when = int(choices[int(np.argmax(moves))])          # the biggest move
+    else:
+        when = int(choices[when % len(choices)])
+
+    item = grids[when]
+    day, who = int(item["day"]), int(item["company"])
+    ticker = arrays.tickers[who]
+    window = model.days
+
+    # What the token remembered.
+    model.eval()
+    where = next(model.parameters()).device
+    with torch.no_grad():
+        batch = {"grid": item["grid"].unsqueeze(0).to(where)}
+        out = model(batch)
+    word = int(out["ids"][0])
+    rebuilt = out["rebuilt"][0, 0].cpu().numpy() if "rebuilt" in out else None
+    if rebuilt is None:
+        with torch.no_grad():
+            rebuilt = model.rebuild(model.codebook(model.summarise(batch["grid"]))
+                                    ["snapped"])[0, 0].cpu().numpy()
+
+    # Undo the normalisation, so we are back in the units the candle lives in.
+    shape_cols = [arrays.names.index(c) for c in SHAPE]
+    real_shape = scaler.apply(arrays.x)[day - window + 1: day + 1, who][:, shape_cols]
+    real_shape = real_shape * scaler.spread[who, shape_cols] + scaler.middle[who, shape_cols]
+    said_shape = rebuilt[:, shape_cols] * scaler.spread[who, shape_cols] \
+        + scaler.middle[who, shape_cols]
+
+    dates = arrays.dates[day - window + 1: day + 1]
+    before = prices.loc[(arrays.dates[day - window], ticker), "close"]
+
+    real = rebuild_candles(pd.DataFrame(real_shape, columns=SHAPE, index=dates), before)
+    said = rebuild_candles(pd.DataFrame(said_shape, columns=SHAPE, index=dates), before)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+    _draw_candles(axes[0], real, f"What actually happened — {ticker}")
+    _draw_candles(axes[1], said, f"What word #{word} remembered")
+
+    span = pd.concat([real, said])
+    pad = (span["high"].max() - span["low"].min()) * 0.12
+    axes[0].set_ylim(span["low"].min() - pad, span["high"].max() + pad)
+    axes[0].set_ylabel("price ($)")
+
+    fig.suptitle(
+        f"{window} days of {ticker}, squeezed into ONE word out of "
+        f"{model.codebook.words} — and rebuilt from it",
+        fontsize=12, y=1.02,
+    )
+    fig.tight_layout()
+    model.train()
+    return fig
+
+
+def kept_and_lost(model, batches, settings: dict, examples: int = 400):
+    """Which of the 26 features survived the squeeze, and which were thrown away.
+
+    A single word cannot carry everything. This says, feature by feature, how much
+    of it came back — and being clear about what was DISCARDED is as informative as
+    what was kept.
+    """
+    import matplotlib.pyplot as plt
+
+    grids = batches.ts["test"].dataset
+    names = batches.arrays.names
+    where = next(model.parameters()).device
+
+    real, said = [], []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, min(examples, len(grids))):
+            item = grids[i]
+            grid = item["grid"].unsqueeze(0).to(where)
+            out = model({"grid": grid})
+            back = model.rebuild(model.codebook(model.summarise(grid))["snapped"])
+            real.append(grid[0, 0].cpu().numpy())
+            said.append(back[0, 0].cpu().numpy())
+    model.train()
+
+    real = np.stack(real)                       # [n, days, features]
+    said = np.stack(said)
+    left_over = ((real - said) ** 2).mean(axis=(0, 1))
+    there_was = (real ** 2).mean(axis=(0, 1))
+    kept = 1 - left_over / np.maximum(there_was, 1e-9)
+
+    order = np.argsort(kept)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    colours = ["#26a69a" if k > 0.5 else "#ffa726" if k > 0.2 else "#ef5350"
+               for k in kept[order]]
+    ax.barh([names[i] for i in order], kept[order] * 100, color=colours)
+    ax.axvline(0, color="#444", linewidth=0.8)
+    ax.set_xlabel("how much of this feature the single word kept (%)")
+    ax.set_title("What survived the squeeze", loc="left", fontsize=12)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.grid(axis="x", alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    return fig
+
+
+def progress(history, title: str = "TS"):
+    """The two numbers that matter, over the course of training."""
+    import matplotlib.pyplot as plt
+
+    frame = history.frame()
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 3.6))
+
+    left.plot(frame.index, frame["rebuild"], color="#1e88e5", marker="o", markersize=3)
+    left.axhline(frame["guessing"].iloc[-1], color="#ef5350", linestyle="--",
+                 linewidth=1, label="just guessing the average")
+    left.set_title(f"{title} — rebuild error", loc="left", fontsize=11)
+    left.set_xlabel("step")
+    left.legend(fontsize=8, frameon=False)
+
+    right.plot(frame.index, frame["perplexity"], color="#26a69a", marker="o",
+               markersize=3)
+    right.axhline(1, color="#ef5350", linestyle="--", linewidth=1,
+                  label="collapsed to one word")
+    right.set_title(f"{title} — words in use (perplexity)", loc="left", fontsize=11)
+    right.set_xlabel("step")
+    right.legend(fontsize=8, frameon=False)
+
+    for ax in (left, right):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.grid(alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    return fig

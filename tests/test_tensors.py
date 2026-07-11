@@ -47,7 +47,7 @@ def table():
 def test_the_table_becomes_a_dense_grid(table):
     data, settings = table
     a = to_arrays(data, settings)
-    assert a.x.shape == (len(a.dates), 3, 22)      # days × companies × features
+    assert a.x.shape == (len(a.dates), 3, len(bb.data.names()))      # days × companies × features
     assert a.y.shape == (len(a.dates), 3)
     assert a.ok.shape == (len(a.dates), 3)
     assert a.ok.any()
@@ -124,10 +124,10 @@ def test_the_later_periods_are_scaled_with_the_learn_numbers_not_their_own(table
 def test_ts_grids_fit_the_ts_model(table):
     data, settings = table
     batches = make_tensors(data, settings)
-    model = bb.models.VQVAE(companies=1, features=22, width=settings["model_size"],
+    model = bb.models.VQVAE(companies=1, features=len(bb.data.names()), width=settings["model_size"],
                             **settings["ts"])
     sample = next(iter(batches.ts["learn"]))
-    assert sample["grid"].shape[1:] == (1, settings["ts"]["days"], 22)
+    assert sample["grid"].shape[1:] == (1, settings["ts"]["days"], len(bb.data.names()))
     out = model(sample)                                    # must simply work
     assert out["ids"].shape == (sample["grid"].shape[0],)
 
@@ -135,10 +135,10 @@ def test_ts_grids_fit_the_ts_model(table):
 def test_cs_grids_fit_the_cs_model(table):
     data, settings = table
     batches = make_tensors(data, settings)
-    model = bb.models.VQVAE(companies=3, features=22, width=settings["model_size"],
+    model = bb.models.VQVAE(companies=3, features=len(bb.data.names()), width=settings["model_size"],
                             **settings["cs"])
     sample = next(iter(batches.cs["learn"]))
-    assert sample["grid"].shape[1:] == (3, settings["cs"]["days"], 22)
+    assert sample["grid"].shape[1:] == (3, settings["cs"]["days"], len(bb.data.names()))
     assert sample["present"].shape[1:] == (3,)
     out = model(sample)
     assert out["ids"].shape == (sample["grid"].shape[0],)
@@ -229,8 +229,8 @@ def test_each_company_is_normalised_against_its_own_history(table):
     batches = make_tensors(data, settings)
     a, days, scaler = batches.arrays, batches.days, batches.scaler
 
-    assert scaler.middle.shape == (3, 22)        # one average PER COMPANY, per feature
-    assert scaler.spread.shape == (3, 22)
+    assert scaler.middle.shape == (3, len(bb.data.names()))        # one average PER COMPANY, per feature
+    assert scaler.spread.shape == (3, len(bb.data.names()))
 
     scaled = scaler.apply(a.x)
     learn_ok = a.ok[days["learn"]]

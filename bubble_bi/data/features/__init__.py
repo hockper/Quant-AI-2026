@@ -1,8 +1,9 @@
-"""The 22 things we measure about a company each day.
+"""The 26 things we measure about a company each day.
 
 Raw prices alone are a poor description of a trading day. These features re-describe
-each day from five angles, so the tokenizer has something rich to compress:
+each day from six angles, so the tokenizer has something rich to compress:
 
+    candle         the shape of TODAY         (gap, body, and the two wicks)
     price          where it is going          (returns, moving averages, RSI, MACD)
     volatility     how violently it moves     (four estimators, from different parts
                                                of the candle)
@@ -20,6 +21,7 @@ from __future__ import annotations
 import pandas as pd
 
 from bubble_bi.data.features import (
+    candle,
     flow,
     memory,
     microstructure,
@@ -27,8 +29,9 @@ from bubble_bi.data.features import (
     volatility,
 )
 
-# The five families, in the order their columns appear.
+# The six families, in the order their columns appear.
 FAMILIES = {
+    "candle": candle,
     "price": price,
     "volatility": volatility,
     "memory": memory,
