@@ -197,17 +197,40 @@ Per-feature valid fraction: `hurst` 97.1% (the floor), the frac-diff family
 (`close_frac`/`volume_frac`/`obv_frac`) 98.4%, `entropy`/`atr_frac` 98.1%,
 everything else ≥ 99.0%.
 
-**New ridge floor — the features carry real signal.** On identical walk-forward
-splits (25 windows):
+**New ridge floor — and a correction worth recording.** A first measurement showed
+RankIC **0.0081** (+31% over the D=10 floor of 0.0062) and it was **an artifact**.
+Three columns (`obv_frac`, `atr_frac`, `roll_spread`) carried a non-scale-free
+*level* term — raw OBV is a cumsum of share volume reaching 1.3e10, and the
+truncated FFD weights sum to **0.108**, not 0, so the level survived
+frac-differencing. 56% of `obv_frac`'s variance was **between-ticker**; the ridge
+was partly exploiting it as a **ticker identifier**. After normalizing
+(volume-normalized OBV; ATR and Roll expressed as fractions of price), the
+between-ticker share fell to 37% / 6% / 3% and the inflated RankIC evaporated.
 
-| | D=10 | **D=22** |
-|---|---|---|
-| RankIC | 0.0062 | **0.0081** (+31%) |
-| RankICIR | 0.0230 | **0.0317** (+38%) |
+**The honest floor is RankIC 0.0056 / RankICIR 0.0219** at D=22 (vs a same-panel
+D=10 control of 0.0064 / 0.0234).
 
-A *linear* model extracts materially more signal from the expanded set — before
-the VQ-VAE sees it. **0.0081 replaces 0.0062 as the floor the neural stack must
-beat.**
+**Ablation by feature group** (identical panel, mask and 25 walk-forward splits):
+
+| feature set | D | RankIC | RankICIR |
+|---|---|---|---|
+| original 10 (control) | 10 | 0.0064 | 0.0234 |
+| + volatility | 14 | 0.0067 | 0.0253 |
+| **+ memory** (`hurst`, `close_frac`, `entropy`) | 13 | **0.0076** | **0.0289** |
+| + microstructure | 13 | 0.0051 | 0.0195 |
+| + flow | 12 | 0.0056 | 0.0206 |
+| ALL 22 | 22 | 0.0056 | 0.0219 |
+
+**The memory group is the only clear win (+19% over control). Microstructure and
+flow *hurt* the linear baseline, and all 22 together land slightly below the
+original 10.**
+
+**Decision: ship all 22 anyway.** The ridge is a *linear probe on next-day return*;
+the VQ-VAE's objective is *reconstruction of market state*, where a spread or an
+illiquidity level can be informative without being a linear return predictor. The
+ablation is reported rather than acted on. Caveat for honesty: these are small
+absolute numbers and RankIC is noisy at this magnitude — treat the ordering as
+evidence, not proof.
 
 **All four checkpoints are now stale** (`d_in` 10 → 22) and `tokens.npz` was
 deleted. The full stack (TS → CS → fusion → tokenize → predictor) must be
@@ -232,6 +255,20 @@ retrained on Colab GPU.
 3. **Corwin-Schultz clamp ordering is observable.** Clamping negatives *before* the
    rolling mean ≠ clamping after (both yield a non-negative output, but different
    numbers). The test now pins the ordering.
+4. **Frac-differencing does NOT remove a level term.** The truncated FFD weights sum
+   to 0.108, not 0, so `frac_diff(x) ≈ 0.108·x + (memory terms)`. Any input whose
+   *level* differs across tickers by orders of magnitude (raw OBV, dollar-denominated
+   ATR/Roll) therefore leaks a **ticker identifier** into the feature — which a
+   linear model will happily exploit, inflating the apparent baseline. **Normalize
+   to a scale-free quantity before frac-differencing.** This is the single most
+   valuable lesson from the branch, and it is easy to miss: the feature *looks*
+   stationary and passes every causality test.
+5. **A high between-ticker variance share is not automatically a bug.** The
+   volatility estimators (~20-23%) and Amihud (~30%) legitimately encode persistent
+   cross-sectional character — some stocks really are more volatile or less liquid.
+   The pre-existing `realized_vol` sits at 19.9% for exactly this reason. The tell
+   for a *bad* level term is a share far outside that band (raw `obv_frac` was 56%)
+   with no economic reading.
 
 ## Out of scope
 
