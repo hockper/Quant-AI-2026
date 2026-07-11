@@ -1,0 +1,222 @@
+"""Teaching a VQ-VAE to compress the market.
+
+The model is given a grid, squeezes it to one word, and tries to rebuild the grid
+from that word alone. Training makes the rebuild as accurate as it can be — and
+that pressure is what forces the words to come to mean something.
+
+**The number to watch is not the loss. It is the perplexity.**
+
+Perplexity says how many words are actually in use. A VQ-VAE has a nasty habit: a
+few words win everything early on, the rest are never chosen again, and the model
+settles for describing the entire market with a handful of words. The loss can
+look respectable while this happens. Perplexity is what exposes it:
+
+    perplexity ≈ 1        catastrophe — one word for everything, nothing learned
+    perplexity ≈ 50       poor — the vocabulary collapsed to a fraction of itself
+    perplexity ≈ 300+     healthy — the model is genuinely using its dictionary
+
+We fight the collapse by reviving dead words: any word nobody is choosing gets
+dropped onto a real encoder output, so it has somewhere realistic to compete from.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from itertools import cycle
+
+import numpy as np
+import pandas as pd
+import torch
+
+from bubble_bi.settings import device as detect_device
+
+
+def pick_device(settings: dict) -> torch.device:
+    wanted = settings.get("device", "auto")
+    if wanted != "auto":
+        return torch.device(wanted)
+    found = detect_device()
+    return torch.device("cuda" if found == "gpu" else "cpu")
+
+
+def _to(batch: dict, where: torch.device) -> dict:
+    return {k: v.to(where) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+@dataclass
+class History:
+    """What happened during training. Every number here was measured, not guessed."""
+
+    rows: list[dict] = field(default_factory=list)
+    seconds: float = 0.0
+
+    def add(self, **row) -> None:
+        self.rows.append(row)
+
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows).set_index("step")
+
+    @property
+    def last(self) -> dict:
+        return self.rows[-1] if self.rows else {}
+
+
+@torch.no_grad()
+def evaluate(model, loader, where: torch.device, limit: int = 40) -> dict:
+    """How well does the model rebuild grids it has never seen?
+
+    `rebuild` is scored against a deliberately stupid baseline: guessing the average
+    for everything. Because every feature was normalised to an average of 0 and a
+    spread of 1, that baseline scores almost exactly 1.0. So:
+
+        rebuild = 1.0   the token told us NOTHING
+        rebuild = 0.4   the token captured 60% of what was happening
+
+    which makes the number mean something on its own, without another run to compare
+    against.
+    """
+    model.eval()
+    total, guessing, batches, chosen = 0.0, 0.0, 0, []
+
+    for i, batch in enumerate(loader):
+        if i >= limit:
+            break
+        batch = _to(batch, where)
+        out = model(batch)
+        total += float(out["rebuild_loss"])
+
+        # the "just guess the average" baseline, on this same batch
+        grid = batch["grid"]
+        present = batch.get("present")
+        if present is not None:
+            w = present.unsqueeze(-1).unsqueeze(-1).to(grid.dtype)
+            guessing += float((grid.pow(2) * w).sum() / w.expand_as(grid).sum().clamp(min=1))
+        else:
+            guessing += float(grid.pow(2).mean())
+
+        chosen.append(out["ids"].cpu())
+        batches += 1
+
+    model.train()
+    if not batches:
+        return {"rebuild": float("nan"), "guessing": float("nan"),
+                "perplexity": 0.0, "words_used": 0}
+
+    ids = torch.cat(chosen)
+    counts = torch.bincount(ids, minlength=model.codebook.words).float()
+    p = counts / counts.sum()
+    live = p[p > 0]
+    return {
+        "rebuild": total / batches,
+        "guessing": guessing / batches,
+        "perplexity": float(torch.exp(-(live * live.log()).sum())),
+        "words_used": int((counts > 0).sum()),
+    }
+
+
+def train(
+    model,
+    loaders: dict,
+    settings: dict,
+    steps: int | None = None,
+    revive_every: int = 50,
+    check_every: int | None = None,
+    quiet: bool = False,
+) -> History:
+    """Train one VQ-VAE. Returns everything that happened.
+
+    loaders: {"learn": ..., "tune": ...} — the grids for this entry (TS or CS).
+    steps:   how many batches to learn from. Defaults to settings["steps"].
+    """
+    steps = steps or settings["steps"]
+    check_every = check_every or max(1, steps // 10)
+    where = pick_device(settings)
+    model.to(where).train()
+
+    optimiser = torch.optim.AdamW(
+        model.parameters(), lr=settings["learning_rate"], weight_decay=0.01
+    )
+    feed = cycle(loaders["learn"])
+    history = History()
+    started = time.time()
+
+    if not quiet:
+        print(f"Training on {str(where).upper()} for {steps:,} steps "
+              f"({len(loaders['learn'].dataset):,} grids to learn from)\n")
+        print(f"{'step':>6}  {'rebuild':>8}  {'vs guessing':>12}  "
+              f"{'perplexity':>11}  {'words used':>11}")
+        print("  " + "─" * 58)
+
+    revived = 0
+    for step in range(1, steps + 1):
+        batch = _to(next(feed), where)
+        out = model(batch)
+
+        optimiser.zero_grad(set_to_none=True)
+        out["loss"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimiser.step()
+
+        # Words nobody is choosing are restarted on real data, so they have somewhere
+        # realistic to compete from. Without this the dictionary quietly collapses.
+        if step % revive_every == 0:
+            revived += model.codebook.revive_dead_words(out["summary"].detach())
+
+        if step % check_every == 0 or step == steps:
+            scored = evaluate(model, loaders["tune"], where)
+            history.add(
+                step=step,
+                rebuild=scored["rebuild"],
+                guessing=scored["guessing"],
+                perplexity=scored["perplexity"],
+                words_used=scored["words_used"],
+                revived=revived,
+            )
+            if not quiet:
+                share = scored["rebuild"] / max(scored["guessing"], 1e-9)
+                print(f"{step:>6}  {scored['rebuild']:>8.3f}  {share:>11.0%}  "
+                      f"{scored['perplexity']:>11.1f}  "
+                      f"{scored['words_used']:>5} / {model.codebook.words}")
+
+    history.seconds = time.time() - started
+    if not quiet:
+        print(f"\n  {history.seconds:.0f}s, {revived:,} dead words revived along the way")
+    return history
+
+
+def baseline_rebuild(loader, limit: int = 40) -> float:
+    """What you would score by simply guessing the average for everything.
+
+    Close to 1.0, because the features were normalised to spread 1 — but measured,
+    not assumed.
+    """
+    total, seen = 0.0, 0
+    for i, batch in enumerate(loader):
+        if i >= limit:
+            break
+        grid = batch["grid"]
+        present = batch.get("present")
+        if present is not None:
+            w = present.unsqueeze(-1).unsqueeze(-1).to(grid.dtype)
+            total += float((grid.pow(2) * w).sum() / w.expand_as(grid).sum().clamp(min=1))
+        else:
+            total += float(grid.pow(2).mean())
+        seen += 1
+    return total / max(seen, 1)
+
+
+def word_usage(model, loader, where: torch.device | None = None,
+               limit: int = 200) -> np.ndarray:
+    """How often each word gets chosen — for looking at what the model learned."""
+    where = where or next(model.parameters()).device
+    model.eval()
+    counts = torch.zeros(model.codebook.words)
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= limit:
+                break
+            ids = model(_to(batch, where))["ids"].cpu()
+            counts += torch.bincount(ids, minlength=model.codebook.words).float()
+    model.train()
+    return counts.numpy()

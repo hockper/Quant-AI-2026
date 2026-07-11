@@ -276,11 +276,20 @@ def make_tensors(table: pd.DataFrame, settings: dict) -> Batches:
         out = {}
         for period in PERIODS:
             dataset = build(arrays, scaled, days[period], window)
+            if len(dataset) == 0:
+                raise ValueError(
+                    f"No usable {window}-day grids in the '{period}' period. The slow "
+                    "features need a long run-up (a year, for illiquidity) — either "
+                    "start the history earlier, or use fewer companies."
+                )
             out[period] = DataLoader(
                 dataset,
                 batch_size=batch,
                 shuffle=(period == "learn"),     # order within a period does not matter;
-                drop_last=(period == "learn"),   # the SPLIT is what keeps time honest
+                # Dropping a ragged final batch is fine -- unless it is the ONLY batch,
+                # in which case it would silently hand back an empty loader and the
+                # model would appear to train on nothing.
+                drop_last=(period == "learn" and len(dataset) > batch),
             )
         return out
 

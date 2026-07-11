@@ -26,6 +26,8 @@ import pandas as pd
 
 # Shared rolling window for all three estimators.
 WINDOW = 21
+# Roughly a trading year: the stretch each company's illiquidity is judged against.
+NORM_WINDOW = 252
 
 # Corwin-Schultz denominator, 3 - 2*sqrt(2), used twice in the alpha formula.
 _CS_DEN = 3.0 - 2.0 * np.sqrt(2.0)
@@ -50,7 +52,13 @@ def build(df: pd.DataFrame, settings: dict) -> dict[str, pd.Series]:
     # brutal right skew survives untouched. A plain log of a strictly positive
     # quantity is what actually compresses it, and turns a number spanning orders of
     # magnitude into one that spans a handful of units.
-    out["amihud"] = np.log(illiq.where(illiq > 0))       # a zero would be -inf -> blank
+    log_illiq = np.log(illiq.where(illiq > 0))           # a zero would be -inf -> blank
+    # ...and then measured against this company's OWN recent norm, not as an absolute
+    # level. Markets have grown steadily more liquid over sixteen years, so the raw
+    # level drifts downward forever -- by the test years it sat 4.5x further from its
+    # training average than it should. "How illiquid is today compared with this
+    # company's last year?" does not drift, and is the question we actually want.
+    out["amihud"] = log_illiq - log_illiq.rolling(NORM_WINDOW).mean()
 
     # --- roll_spread: Roll (1984) implied spread from the bid-ask bounce ----
     # A dealer quotes a bid below and an ask above the "true" price, so a trade

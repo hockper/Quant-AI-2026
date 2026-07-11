@@ -60,7 +60,13 @@ def build(df: pd.DataFrame, settings: dict) -> dict[str, pd.Series]:
 
     ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
     ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
-    macd = ema_fast - ema_slow
+    # Divided by the price. Textbook MACD is a difference of two averages, so it is
+    # measured in DOLLARS -- and a company whose share price climbs from $6 to $200
+    # has a MACD that climbs with it. Measured on the real data, that made MACD 34x
+    # larger in the test years than in the training years: the model would meet a
+    # feature it had never seen. As a fraction of price it is scale-free, and stays
+    # the same size forever.
+    macd = (ema_fast - ema_slow) / close
     signal = macd.ewm(span=MACD_SIGNAL, adjust=False).mean()
     out["macd"] = macd
     out["macd_signal"] = signal

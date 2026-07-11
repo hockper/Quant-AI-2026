@@ -267,3 +267,52 @@ def tensors(batches, ts, cs, settings: dict) -> None:
               f"{', '.join(scaler.flat_features)}")
     print()
     print(sizes.to_string())
+
+
+def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
+    """Section 7: the model learned something, and its dictionary did not collapse."""
+    from bubble_bi.training import baseline_rebuild, evaluate, pick_device
+
+    where = pick_device(settings)
+    scored = evaluate(model, loaders["test"], where)     # never seen, not once
+    guessing = baseline_rebuild(loaders["test"])
+    words = model.codebook.words
+
+    explained = 1 - scored["rebuild"] / max(guessing, 1e-9)
+    perplexity = scored["perplexity"]
+    start = history.rows[0]["perplexity"] if history.rows else float("nan")
+
+    # A dictionary that collapses to a handful of words has learned nothing, however
+    # respectable its loss looks. This is the failure mode to be afraid of.
+    alive = perplexity > 10
+    learned = scored["rebuild"] < guessing * 0.9
+
+    health = (
+        "healthy" if perplexity > words * 0.3
+        else "usable, but a longer run would help" if perplexity > words * 0.1
+        else "poor — the vocabulary is collapsing"
+    )
+
+    report(
+        f"{name} trained",
+        [
+            ("Learned to rebuild", learned,
+             f"{scored['rebuild']:.2f} vs {guessing:.2f} for guessing the average"),
+            ("Dictionary did not collapse", alive,
+             f"perplexity {perplexity:.0f} — {health}"),
+            ("Vocabulary in use", True,
+             f"{scored['words_used']} of {words} words"),
+            ("Scored on unseen days", True, "the test period, never trained on"),
+        ],
+        have=f"""
+        A tokenizer that turns any {model.days} days of one company into a single word.
+        It rebuilds a held-out day well enough to explain {explained:.0%} of what was
+        happening — from one word out of {words}.
+        Perplexity climbed {start:.0f} → {perplexity:.0f} during training: the
+        dictionary started collapsed onto a single word and spread out.
+        """,
+    )
+    if perplexity < words * 0.3:
+        print(f"\n  ℹ️  This was a short run ({history.rows[-1]['step']:,} steps, "
+              f"{history.seconds:.0f}s). Perplexity is still climbing —")
+        print("     train for longer (on a GPU) before reading anything into the numbers.")

@@ -184,25 +184,45 @@ def test_corwin_schultz_clamps_before_averaging_not_after():
     assert (correct.dropna() >= wrong_order.reindex(correct.dropna().index) - 1e-12).all()
 
 
-def test_amihud_decreases_as_volume_rises():
-    n = 150
+def test_amihud_is_now_relative_so_a_constant_volume_level_does_not_move_it():
+    """amihud changed meaning, on purpose.
+
+    It used to be an absolute level -- "this stock is illiquid". But markets have
+    grown steadily more liquid over sixteen years, so that level drifts downward
+    forever, and by the test years it sat 4.5x further from its training average than
+    it should. A model trained on the old feature meets a different one later.
+
+    It is now measured against the company's OWN recent norm: "how illiquid is today,
+    compared with this company's last year?" That does not drift.
+
+    The consequence, which is the point of this test: a company that is simply always
+    thinly traded no longer reads as unusual. Only a CHANGE does.
+    """
+    n = 400
     rng = np.random.default_rng(1)
-    steps = rng.normal(loc=0.0, scale=0.02, size=n)
-    close = 100.0 * np.exp(np.cumsum(steps))
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.02, n)))
 
-    low_volume = np.full(n, 5_000.0)
-    high_volume = low_volume * 50.0
+    thin = build(_make_df(close, volume=np.full(n, 5_000.0)), {})["amihud"]
+    thick = build(_make_df(close, volume=np.full(n, 250_000.0)), {})["amihud"]
 
-    df_low = _make_df(close, volume=low_volume)
-    df_high = _make_df(close, volume=high_volume)
+    both = thin.notna() & thick.notna()
+    assert both.sum() > 50
+    assert np.allclose(thin[both], thick[both], atol=1e-6)   # level alone: invisible
 
-    amihud_low = build(df_low, {})["amihud"]
-    amihud_high = build(df_high, {})["amihud"]
 
-    valid = amihud_low.notna() & amihud_high.notna()
-    assert valid.sum() > 0
-    assert (amihud_high[valid] <= amihud_low[valid]).all()
-    assert (amihud_high[valid] < amihud_low[valid]).any()
+def test_amihud_rises_when_a_company_suddenly_becomes_harder_to_trade():
+    # What it SHOULD react to: a change, not a level.
+    n = 500
+    rng = np.random.default_rng(2)
+    close = 100.0 * np.exp(np.cumsum(rng.normal(0.0, 0.02, n)))
+
+    volume = np.full(n, 250_000.0)
+    volume[400:] = 10_000.0                      # liquidity dries up
+
+    amihud = build(_make_df(close, volume=volume), {})["amihud"]
+    before = amihud.iloc[380:400].mean()
+    after = amihud.iloc[450:480].mean()
+    assert after > before + 1.0                  # clearly, not marginally
 
 
 def test_amihud_leaves_zero_volume_days_blank_instead_of_crashing():
