@@ -11,13 +11,25 @@ def test_hurst_near_half_for_random_walk():
     assert abs(h.mean() - 0.5) < 0.15          # random walk -> H ~ 0.5
 
 
-def test_hurst_above_half_for_strong_trend():
-    n = 600
-    rng = np.random.default_rng(1)
-    drift = np.linspace(0, 1.2, n)                       # persistent trend
-    close = pd.Series(100 * np.exp(drift + 0.001 * rng.normal(size=n)))
-    h = hurst(close, window=200).dropna()
-    assert h.mean() > 0.6
+def _prices_from_ar1(rho, n=1200, seed=0, sigma=0.01):
+    rng = np.random.default_rng(seed)
+    eps = rng.normal(0, sigma, n)
+    r = np.zeros(n)
+    for i in range(1, n):
+        r[i] = rho * r[i - 1] + eps[i]
+    return pd.Series(100 * np.exp(np.cumsum(r)))
+
+
+def test_hurst_higher_for_persistent_than_random_walk():
+    h_persistent = hurst(_prices_from_ar1(0.4, seed=1), window=200).dropna().mean()
+    h_rw = hurst(_prices_from_ar1(0.0, seed=1), window=200).dropna().mean()
+    assert h_persistent > h_rw
+
+
+def test_hurst_lower_for_antipersistent_than_random_walk():
+    h_antipersistent = hurst(_prices_from_ar1(-0.4, seed=1), window=200).dropna().mean()
+    h_rw = hurst(_prices_from_ar1(0.0, seed=1), window=200).dropna().mean()
+    assert h_antipersistent < h_rw
 
 
 def test_entropy_zero_for_constant_returns():

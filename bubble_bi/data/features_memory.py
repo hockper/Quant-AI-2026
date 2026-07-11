@@ -10,19 +10,13 @@ from numpy.lib.stride_tricks import sliding_window_view
 def _rs_for_scale(views: np.ndarray, s: int) -> np.ndarray:
     """Mean rescaled-range (R/S) at sub-scale s, for every window. -> [n_windows]
 
-    Deliberately does NOT demean each sub-chunk before accumulating: a
-    genuine deterministic drift in returns (e.g. a persistent trend) is a
-    near-constant additive term, and per-chunk mean-subtraction would cancel
-    it exactly at every scale -- making it mathematically impossible for a
-    trending series to ever score above a random walk. Keeping the raw
-    cumulative sum lets sustained drift show up as faster-than-sqrt(n)
-    growth in the range, which is what the rolling Hurst feature is meant
-    to capture.
+    Classical R/S: cumulative sum of each chunk's deviation from its own mean.
     """
     n_win, W = views.shape
     n_chunks = W // s
     seg = views[:, :n_chunks * s].reshape(n_win, n_chunks, s)
-    dev = np.cumsum(seg, axis=2)
+    mean = seg.mean(axis=2, keepdims=True)
+    dev = np.cumsum(seg - mean, axis=2)
     R = dev.max(axis=2) - dev.min(axis=2)          # [n_win, n_chunks]
     S = seg.std(axis=2)
     with np.errstate(divide="ignore", invalid="ignore"):
