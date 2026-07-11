@@ -31,8 +31,9 @@ def report(title: str, checks: list[tuple[str, bool, str]], have: str) -> None:
     print(f"  {'✅' if passed else '❌'}  {title}"
           f"{'' if passed else '  —  SOMETHING IS WRONG'}")
     print(_RULE)
+    column = max(30, max(len(label) for label, _, _ in checks) + 2)
     for label, ok, detail in checks:
-        print(f"  {'✅' if ok else '❌'}  {label:<28}{detail}")
+        print(f"  {'✅' if ok else '❌'}  {label:<{column}}{detail}")
 
     if passed:
         print()

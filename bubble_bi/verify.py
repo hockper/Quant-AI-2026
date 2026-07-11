@@ -131,3 +131,59 @@ def features(table, prices_only, settings: dict) -> None:
         This table is what the tokenizer will learn to compress into single tokens.
         """,
     )
+
+
+def models(ts, cs, settings: dict) -> None:
+    """Section 5: both entries are built, wired up, and able to learn."""
+    import torch
+
+    features = ts.features
+    batch = 4
+
+    # Push a fake grid through each and see what comes out the other side.
+    ts_grid = torch.randn(batch, ts.companies, ts.days, features)
+    cs_grid = torch.randn(batch, cs.companies, cs.days, features)
+    ts_out = ts({"grid": ts_grid})
+    cs_out = cs({"grid": cs_grid})
+
+    one_word_each = (
+        tuple(ts_out["ids"].shape) == (batch,) and tuple(cs_out["ids"].shape) == (batch,)
+    )
+    rebuilds = (
+        ts.rebuild(ts_out["summary"]).shape == ts_grid.shape
+        and cs.rebuild(cs_out["summary"]).shape == cs_grid.shape
+    )
+
+    # Snapping to the nearest word is a step function with no gradient. If the
+    # straight-through trick were broken, the encoder would silently never learn --
+    # training would run, the loss would sit still, and nothing would say why.
+    probe = torch.randn(batch, ts.companies, ts.days, features, requires_grad=True)
+    ts({"grid": probe})["loss"].backward()
+    learns = probe.grad is not None and bool(torch.isfinite(probe.grad).all()) \
+        and float(probe.grad.abs().sum()) > 0
+
+    same_class = type(ts) is type(cs)
+    ts_words = ts.codebook.words
+    cs_words = cs.codebook.words
+    weights = (sum(p.numel() for p in ts.parameters())
+               + sum(p.numel() for p in cs.parameters())) / 1e6
+
+    report(
+        "The two entries",
+        [
+            ("Both are the same class", same_class, f"one {type(ts).__name__}, built twice"),
+            ("TS reads one company", ts.companies == 1,
+             f"1 × {ts.days} days → 1 word of {ts_words}"),
+            ("CS reads the market", cs.companies == len(settings["tickers"]),
+             f"{cs.companies} × {cs.days} days → 1 word of {cs_words}"),
+            ("One word per example", one_word_each, "not a sequence — a single token"),
+            ("The decoder rebuilds the grid", rebuilds, "same shape back out"),
+            ("Gradients survive the snap", learns, "so the encoder can actually learn"),
+        ],
+        have=f"""
+        Two untrained machines, {weights:.1f}M weights between them.
+        Their dictionaries are still random noise — {ts_words} meaningless words each.
+        Nothing has been learned yet: right now they would rebuild the market as
+        garbage. Training is what drags those words onto real market states.
+        """,
+    )
