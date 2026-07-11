@@ -141,9 +141,11 @@ yfinance (daily OHLCV, auto_adjust)
 - **M3 — Transformer predictor** on frozen fusion tokens. Concretized: **categorical
   next-token only** this milestone (per-stock causal GPT over the one-token-per-day
   fusion-token sequences, weights shared, no cross-stock attention; CE over the
-  512-vocab). Eval: next-token accuracy/perplexity vs a marginal baseline + light
-  multi-step token rollout. Regression/RankIC head deferred; `use_fusion` ablation
-  optional. Design: `docs/superpowers/specs/2026-07-10-m3-predictor-design.md`.
+  512-vocab). **Llama-3-style decoder** (RMSNorm + RoPE + SwiGLU + bias-free; GQA
+  configurable, KV-cache deferred). Eval: next-token accuracy/perplexity vs a
+  marginal baseline + light multi-step token rollout. Regression/RankIC head
+  deferred; `use_fusion` ablation optional. Design:
+  `docs/superpowers/specs/2026-07-10-m3-predictor-design.md`.
 - **M4 — Optional joint fine-tune** end-to-end + full metric suite + ablations.
   Emits the frozen **Transformer world-model artifact** consumed by Spec 2.
 

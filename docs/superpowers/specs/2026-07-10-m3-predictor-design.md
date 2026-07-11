@@ -51,15 +51,28 @@ Spec-2 handoff: freeze the GPT, drop the Linear head, expose h as the RL observa
   split by its **last target day**. Uses the same `chronological_split` fractions.
 - The regression target (`panel.target`) is **not** used in M3 (categorical only).
 
-## Model (`models/predictor.py`)
+## Model (`models/predictor.py`) — Llama-3-style decoder
+
+A **Llama-3-style** causal decoder (not `nn.TransformerEncoderLayer`): RMSNorm
+pre-norm, rotary positional embeddings (RoPE), SwiGLU feed-forward, and **bias-free**
+linears throughout. GQA is configurable (default = full multi-head); KV-cache is
+**not** implemented (training is teacher-forced; the light rollout recomputes).
 
 `NextTokenPredictor(cfg, vocab)`:
-- `Embedding(vocab, cfg.d_model)`, learned `pos[1, cfg.pred_window, d_model]`.
-- `cfg.pred_layers` × `nn.TransformerEncoderLayer(d_model, heads, ff, dropout,
-  batch_first=True, norm_first=True)` wrapped in `nn.TransformerEncoder`
-  (`enable_nested_tensor=False`), applied with a causal mask
-  (`nn.Transformer.generate_square_subsequent_mask(W)`).
-- `Linear(d_model, vocab)` head.
+- `Embedding(vocab, cfg.d_model)` — **no** learned positional embedding (RoPE
+  supplies position).
+- `cfg.pred_layers` × `LlamaBlock` (pre-norm residual):
+  ```
+  h = h + Attention(RMSNorm(h))     # bias-free q/k/v/o; RoPE applied to q,k; causal mask;
+                                     # GQA-capable: cfg.n_kv_heads KV heads (default = cfg.heads)
+  h = h + SwiGLU(RMSNorm(h))         # W2( SiLU(W1 x) ⊙ W3 x ), bias-free, hidden = cfg.ff
+  ```
+- final `RMSNorm`, then bias-free `Linear(d_model, vocab)` head.
+- Building blocks (each small, unit-tested): `RMSNorm(dim, eps)`;
+  `RotaryEmbedding(head_dim, max_len=cfg.pred_window, theta=cfg.rope_theta)` →
+  precomputed cos/sin, applied to q,k as the standard rotate-half; `SwiGLU(dim, hidden)`.
+  Attention uses `n_heads=cfg.heads`, `head_dim=d_model//heads`, repeats KV heads
+  when `n_kv_heads < heads` (GQA), and a causal mask so position `t` never sees `t+1`.
 - `forward(batch: {"tokens":[B,W], "targets":[B,W]}) → dict` with `loss` (CE),
   `recon_loss` (= same CE, for Trainer/metrics compatibility), `perplexity`
   (`exp(CE)`), `accuracy` (top-1 next-token), `logits`.
@@ -71,8 +84,10 @@ Spec-2 handoff: freeze the GPT, drop the Linear head, expose h as the RL observa
 Reuse the `Trainer` (dict batches, AMP-on-CUDA, grad-clip, full-state checkpoint/
 resume, `MetricsLogger`) unchanged. Loss is the CE. `_scalars(out)` logs
 `loss`/`recon_loss`/`perplexity`/`accuracy` densely. Chronological split; AdamW
-(lr 1e-4, wd 0.05). Config adds `pred_window: int = 64`, `pred_layers: int = 4`;
-reuses `d_model`, `heads`, `ff`, `dropout`; vocab = `fusion_codebook_size`.
+(lr 1e-4, wd 0.05). Config adds `pred_window: int = 64`, `pred_layers: int = 4`,
+`n_kv_heads: int = 0` (0 ⇒ full multi-head = `heads`; set `<heads` for GQA),
+`rope_theta: float = 10000.0`; reuses `d_model`, `heads`, `ff` (SwiGLU hidden),
+`dropout`; vocab = `fusion_codebook_size`.
 
 ## Eval (`eval/predictor_eval.py`)
 
@@ -119,6 +134,9 @@ market context earns its place. Run only if time allows.
   in `[-1, vocab)`; invalid stock-days are `-1`; cache round-trips.
 - **TokenSeqDataset:** window contents = grid slice; `targets` = tokens shifted by
   one; windows with any `-1` excluded; split-by-last-day correct.
+- **Llama blocks:** `RMSNorm` gives unit-RMS output; `RotaryEmbedding` preserves
+  vector norm and differs by position; `SwiGLU` output shape; attention has **no
+  bias** params; GQA (`n_kv_heads<heads`) runs and matches full-MHA shapes.
 - **model:** forward shapes `[B,W,vocab]`; causal mask (future token change doesn't
   affect earlier-position logits); overfits a tiny batch (accuracy → 1).
 - **eval:** accuracy/perplexity finite; marginal baseline computed; a model that
@@ -149,9 +167,12 @@ later concern (needs the M2 `JointDecoder` over all stocks).
 
 | Setting | Default |
 |---|---|
+| Block style | **Llama-3**: RMSNorm + RoPE + SwiGLU + bias-free |
 | Context window `pred_window` (W) | 64 |
 | Predictor layers `pred_layers` | 4 |
-| `d_model` H / heads / ff | 128 / 4 / 256 |
+| `d_model` H / heads / ff (SwiGLU hidden) | 128 / 4 / 256 |
+| `n_kv_heads` (GQA) | 0 ⇒ full multi-head; KV-cache deferred |
+| `rope_theta` | 10000.0 |
 | Vocab | `fusion_codebook_size` (512) |
 | Optim/Trainer | AdamW lr 1e-4 / wd 0.05 / grad-clip 1.0 |
 | Ablation | optional `use_fusion=false` config, run if time |
