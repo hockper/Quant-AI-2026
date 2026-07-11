@@ -42,6 +42,16 @@ DEFAULTS: dict = {
         "depth": 4,
     },
 
+    # How to divide history. Strictly by DATE, never at random: the model must be
+    # tested on days it has never seen, in the order they actually happened.
+    #   learn    the model trains on these
+    #   tune     used to check progress and stop at the right time
+    #   test     touched once, at the very end. Whatever is left over.
+    "split": {
+        "learn": 0.70,
+        "tune": 0.15,
+    },
+
     # Shared on purpose: TS and CS meet in a cross-attention layer, which needs
     # both sides to be the same width. Splitting this would need extra projection
     # layers -- an architecture change, not a setting.
@@ -115,6 +125,15 @@ def check(settings: dict) -> dict:
 
     if out["learning_rate"] <= 0:
         raise ValueError(f"`learning_rate` must be above 0, got {out['learning_rate']!r}.")
+
+    learn, tune = out["split"]["learn"], out["split"]["tune"]
+    if not (0 < learn < 1) or not (0 < tune < 1):
+        raise ValueError(f"`split` fractions must be between 0 and 1, got {out['split']}.")
+    if learn + tune >= 1:
+        raise ValueError(
+            f"`split['learn']` + `split['tune']` = {learn + tune:.2f}, which leaves "
+            "nothing for the final test. They must add up to less than 1."
+        )
 
     return out
 

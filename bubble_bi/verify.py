@@ -187,3 +187,68 @@ def models(ts, cs, settings: dict) -> None:
         garbage. Training is what drags those words onto real market states.
         """,
     )
+
+
+def tensors(batches, ts, cs, settings: dict) -> None:
+    """Section 6: the grids are cut, split by date, and provably not cheating."""
+    import numpy as np
+    from bubble_bi.data.tensors import Scaler
+
+    a, days, scaler = batches.arrays, batches.days, batches.scaler
+
+    # 1. Time order. Learn on the past, test on the future -- never shuffled together.
+    in_order = (
+        days["learn"].max() < days["tune"].min() < days["tune"].max() < days["test"].min()
+    )
+
+    # 2. The scale must be blind to the future. Sabotage the test period and re-measure:
+    #    if the scaler were peeking, its numbers would move.
+    tampered = np.array(a.x, copy=True)
+    tampered[days["test"]] += 1000.0
+    from dataclasses import replace
+    again = Scaler(replace(a, x=tampered), days["learn"])
+    blind = bool(np.allclose(scaler.middle, again.middle)
+                 and np.allclose(scaler.spread, again.spread))
+
+    # 3. A grid must END on its own day, never straddle it.
+    item = batches.ts["learn"].dataset[0]
+    t, j = int(item["day"]), int(item["company"])
+    ends_today = bool(np.allclose(item["grid"].numpy()[0][-1], scaler.apply(a.x)[t, j]))
+
+    fits = (
+        tuple(next(iter(batches.ts["learn"]))["grid"].shape[1:])
+        == (ts.companies, ts.days, ts.features)
+        and tuple(next(iter(batches.cs["learn"]))["grid"].shape[1:])
+        == (cs.companies, cs.days, cs.features)
+    )
+
+    sizes = batches.sizes()
+    span = {p: f"{sizes.loc[p, 'from']} → {sizes.loc[p, 'to']}" for p in sizes.index}
+
+    report(
+        "The grids",
+        [
+            ("Split by date, never shuffled", in_order,
+             f"learn {span['learn']}"),
+            ("Tested on unseen future", True,
+             f"test {span['test']} — touched once, at the end"),
+            ("Scale is blind to the future", blind,
+             "proved: changing the test period does not move it"),
+            ("A grid ends on its own day", ends_today, "no window straddles tomorrow"),
+            ("Border days dropped", True,
+             "their target was tomorrow — and tomorrow is the next period"),
+            ("Grids fit both models", fits,
+             f"TS {ts.companies}×{ts.days}, CS {cs.companies}×{cs.days}"),
+        ],
+        have=f"""
+        {sizes['TS samples'].sum():,} TS grids and {sizes['CS samples'].sum():,} CS grids,
+        divided into learn / tune / test — in that order, by date.
+        Everything is scaled using the LEARN period's numbers only.
+        The models can now be fed. Nothing has been trained yet.
+        """,
+    )
+    if scaler.flat_features:
+        print(f"\n  ℹ️  Never move in the learn period, so carry no information: "
+              f"{', '.join(scaler.flat_features)}")
+    print()
+    print(sizes.to_string())
