@@ -182,6 +182,57 @@ Target: `build-panel` stays well under a minute.
 4. Retrain the full stack on Colab GPU (TS → CS → fusion → tokenize → predictor)
    and compare against the D=10 results.
 
+## Results (measured 2026-07-11, after implementation)
+
+**Panel:** `(4153, 30, 22)` — rebuilt in **13 s** (the vectorised `sliding_window_view`
+paths held up; a `rolling.apply` implementation would have taken minutes).
+
+**Warm-up cost — cheaper than estimated.** Valid mask **97.1%**, down from 99.0% at
+D=10: only **1.9 points** lost. The binding constraint is `hurst_window=100`
+(first usable day = index 100), exactly as predicted; the frac-diff window turned
+out to be **L=49 lags** at the defaults (`d=0.45`, `thresh=1e-3`), not the ~65–70
+estimated, so `frac_max_lags=200` never binds.
+
+Per-feature valid fraction: `hurst` 97.1% (the floor), the frac-diff family
+(`close_frac`/`volume_frac`/`obv_frac`) 98.4%, `entropy`/`atr_frac` 98.1%,
+everything else ≥ 99.0%.
+
+**New ridge floor — the features carry real signal.** On identical walk-forward
+splits (25 windows):
+
+| | D=10 | **D=22** |
+|---|---|---|
+| RankIC | 0.0062 | **0.0081** (+31%) |
+| RankICIR | 0.0230 | **0.0317** (+38%) |
+
+A *linear* model extracts materially more signal from the expanded set — before
+the VQ-VAE sees it. **0.0081 replaces 0.0062 as the floor the neural stack must
+beat.**
+
+**All four checkpoints are now stale** (`d_in` 10 → 22) and `tokens.npz` was
+deleted. The full stack (TS → CS → fusion → tokenize → predictor) must be
+retrained on Colab GPU.
+
+### Implementation findings worth keeping
+
+1. **Classical R/S must demean each sub-chunk.** An early implementation dropped
+   the mean-subtraction to satisfy a (wrong) test asserting that a deterministic
+   uptrend should score `H > 0.6`. Measured on synthetic processes, the demeaned
+   (textbook) estimator separates persistence correctly — AR(1) ρ=+0.4 → **0.590**,
+   random walk → **0.531**, AR(1) ρ=−0.4 → **0.479** — whereas dropping the demean
+   *compresses* that spread (0.554 / 0.527 / 0.493) and instead lights up on drift
+   (**0.945** on a deterministic trend). A deterministic drift is **not** long-range
+   dependence, and R/S is *supposed* to be blind to it. The test was wrong, not the
+   estimator; it now asserts the AR(1) ordering.
+2. **Roll's "exactly 0" guard needs a relative tolerance.** On a near-linear price
+   path the true serial covariance is 0, but float64 cancellation in
+   `rolling().cov()` returns ~`-1e-17`, which would yield a spurious nonzero spread.
+   Guarded with `tol = eps · window · mean(Δp²)` — ~15 orders of magnitude below any
+   real covariance, so it cannot suppress genuine signal.
+3. **Corwin-Schultz clamp ordering is observable.** Clamping negatives *before* the
+   rolling mean ≠ clamping after (both yield a non-negative output, but different
+   numbers). The test now pins the ordering.
+
 ## Out of scope
 
 VPIN, Kyle's λ, Higuchi fractal dimension, any CFI/clustering/feature-selection
