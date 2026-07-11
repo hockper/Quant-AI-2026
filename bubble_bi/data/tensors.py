@@ -97,41 +97,83 @@ def split_days(arrays: Arrays, settings: dict) -> dict[str, np.ndarray]:
 
 
 class Scaler:
-    """Puts every feature on a comparable scale.
+    """Normalises each company against ITS OWN history — along time, not across companies.
 
-    Measured on the LEARN period only. Using all of history would let the average of
-    days the model has not seen yet leak backwards into its training.
+    Companies live on wildly different scales. Measured on the raw features, half of
+    `close_frac`'s variation is nothing but *which company it is*; a third of
+    `obv_frac`, a third of `amihud`, a fifth of every volatility estimator. Pooling
+    them and computing one average per feature would leave that company-identity
+    baked into the numbers — and the codebook would spend its precious 512 words
+    memorising "this is NVDA" instead of "this is a panic".
+
+    So every company gets its own average and its own spread, computed down the time
+    axis. A feature then says the same thing for everyone:
+
+        "how unusual is today — FOR THIS COMPANY?"
+
+    which is exactly what a shared vocabulary needs.
+
+    ⚠️ What this deliberately throws away: that one company is *genuinely* more
+    volatile, or less liquid, than another. Afterwards, a sleepy utility sitting at
+    its own average volatility and a wild biotech sitting at ITS own average
+    volatility look identical. That is the price of a token meaning the same thing
+    whichever company it describes.
+
+    Measured on the LEARN period only — using all of history would let days the model
+    has not seen yet leak backwards into its training.
     """
 
-    # Below this, a feature's variation is indistinguishable from float noise. Every
-    # feature here is of order 1 (returns, ratios, z-scores), so nothing real is
-    # anywhere near it.
-    FLAT = 1e-6
+    # "Flat" has to be judged RELATIVE to the feature's own size, never against a
+    # fixed number. Illiquidity for a mega-cap lives around 1e-6 while varying by 30%
+    # of itself — real, useful signal that an absolute threshold would throw away.
+    # A genuinely constant feature has a spread made of pure float noise, which is
+    # ~1e-7 of its own magnitude in float32; 1e-9 sits comfortably below that.
+    FLAT = 1e-9
+    # A company with less history than this cannot give a trustworthy average.
+    LEAST_DAYS = 60
 
     def __init__(self, arrays: Arrays, learn_days: np.ndarray, names: list[str] | None = None):
-        rows = arrays.x[learn_days]                      # [t, N, F]
-        usable = arrays.ok[learn_days]                   # [t, N]
-        flat = rows[usable]                              # [rows, F] -- real cells only
-        if flat.size == 0:
-            raise ValueError("The learn period has no usable rows to measure a scale from.")
-
-        # float64 for the statistics: in float32, summing 100k rows loses enough
+        # float64 throughout: in float32, summing thousands of rows loses enough
         # precision to matter when we are about to divide by the result.
-        flat = flat.astype(np.float64)
-        self.middle = flat.mean(axis=0)
-        self.spread = flat.std(axis=0)
+        rows = arrays.x[learn_days].astype(np.float64)   # [t, N, F]
+        usable = arrays.ok[learn_days]                   # [t, N]
+        days_each = usable.sum(axis=0)                   # [N] -- per company
 
-        # A feature that never moves carries no information -- and dividing by its
-        # (near-zero) spread would amplify pure rounding error into ±1 garbage. Leave
-        # it alone instead, and remember, so the notebook can say so out loud.
-        self.constant = self.spread < self.FLAT
-        self.spread = np.where(self.constant, 1.0, self.spread)
-        self.flat_features = [
-            n for n, is_flat in zip(names or [], self.constant) if is_flat
+        thin = [
+            t for t, n in zip(arrays.tickers, days_each) if n < self.LEAST_DAYS
         ]
+        if thin:
+            raise ValueError(
+                f"Too little history in the learn period to normalise: {thin}. "
+                f"Each company needs at least {self.LEAST_DAYS} usable days — either "
+                "start earlier, or drop these companies."
+            )
+
+        keep = usable[:, :, None]                        # [t, N, 1]
+        counts = days_each[:, None]                      # [N, 1]
+
+        # Each company's own average and spread, down the time axis.
+        self.middle = np.where(keep, rows, 0.0).sum(axis=0) / counts          # [N, F]
+        gap = np.where(keep, rows - self.middle[None], 0.0)
+        self.spread = np.sqrt((gap ** 2).sum(axis=0) / counts)                # [N, F]
+
+        # A feature that never moves for a given company carries no information, and
+        # dividing by its (near-zero) spread would amplify rounding error into ±1
+        # garbage. Leave it alone, and remember, so the notebook can say so out loud.
+        # Judged relative to the feature's own size -- see FLAT.
+        size = np.maximum(np.abs(self.middle), np.abs(rows).max(axis=(0, 1))[None, :])
+        self.constant = self.spread < self.FLAT * np.maximum(size, 1e-30)     # [N, F]
+        self.spread = np.where(self.constant, 1.0, self.spread)
+
+        self.flat_features = sorted({
+            names[f]
+            for _, f in zip(*np.nonzero(self.constant))
+            if names
+        }) if names else []
 
     def apply(self, x: np.ndarray) -> np.ndarray:
-        return ((x - self.middle) / self.spread).astype(np.float32)
+        """x: [T, N, F] -> each company normalised against its own history."""
+        return ((x - self.middle[None]) / self.spread[None]).astype(np.float32)
 
 
 def _complete_windows(ok: np.ndarray, days: int) -> np.ndarray:

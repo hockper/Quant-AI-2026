@@ -9,17 +9,30 @@ from bubble_bi.data.tensors import Scaler, make_tensors, split_days, to_arrays
 
 @pytest.fixture
 def table():
-    """A small but realistic feature table: 3 companies, enough days to warm up."""
+    """Three companies that look nothing like each other — as real ones do not.
+
+    A penny stock, a blue chip and a mid-cap: prices spanning 25x, volumes spanning
+    100x, and quite different volatilities. If the fixture made them interchangeable
+    it could not catch the very thing this module exists to fix.
+    """
     rng = np.random.default_rng(0)
     days = pd.date_range("2015-01-01", periods=700, freq="B", name="date")
+    shape = {                       # ticker: (price level, daily vol, volume, range)
+        "AAA": (20.0, 0.030, 5e7, 0.03),      # cheap, wild, heavily traded
+        "BBB": (500.0, 0.008, 3e5, 0.005),    # expensive, sleepy, thin
+        "CCC": (100.0, 0.015, 4e6, 0.012),    # middle of the road
+    }
     frames = []
-    for ticker in ("AAA", "BBB", "CCC"):
-        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, len(days))))
+    for ticker, (level, vol, turnover, band) in shape.items():
+        close = level * np.exp(np.cumsum(rng.normal(0, vol, len(days))))
+        wobble = rng.uniform(0.4, 1.0, len(days))          # the daily range varies
         one = pd.DataFrame(
             {
-                "open": close * 0.999, "high": close * 1.01,
-                "low": close * 0.99, "close": close,
-                "volume": rng.integers(1e6, 5e6, len(days)).astype(float),
+                "open": close * (1 + rng.normal(0, vol / 3, len(days))),
+                "high": close * (1 + band * wobble),
+                "low": close * (1 - band * wobble),
+                "close": close,
+                "volume": (turnover * rng.uniform(0.5, 1.5, len(days))),
             },
             index=days,
         )
@@ -92,23 +105,18 @@ def test_the_scale_is_measured_on_the_learn_period_only(table):
     assert np.allclose(scaler.spread, after.spread)
 
 
-def test_the_learn_period_is_centred_and_the_later_periods_are_left_alone(table):
+def test_the_later_periods_are_scaled_with_the_learn_numbers_not_their_own(table):
+    # They must NOT be re-centred on themselves -- that would be quietly re-fitting on
+    # data we are pretending not to have seen.
     data, settings = table
     batches = make_tensors(data, settings)
-    a, days = batches.arrays, batches.days
-    scaled = batches.scaler.apply(a.x)
+    a, days, scaler = batches.arrays, batches.days, batches.scaler
+    scaled = scaler.apply(a.x)
 
-    learn = scaled[days["learn"]][a.ok[days["learn"]]]
-    moves = ~batches.scaler.constant                       # a constant feature stays at 0
-    assert np.allclose(learn.mean(axis=0), 0, atol=1e-4)   # centred, by construction
-    assert np.allclose(learn.std(axis=0)[moves], 1, atol=1e-3)
-
-    # The later periods get the SAME numbers applied to them -- they are not re-centred
-    # on themselves, which would be re-fitting on data we are pretending not to have.
-    test = scaled[days["test"]][a.ok[days["test"]]]
-    by_hand = ((a.x[days["test"]][a.ok[days["test"]]] - batches.scaler.middle)
-               / batches.scaler.spread)
-    assert np.allclose(test, by_hand)
+    by_hand = (a.x[days["test"]] - scaler.middle[None]) / scaler.spread[None]
+    usable = a.ok[days["test"]]
+    assert np.allclose(scaled[days["test"]][usable], by_hand[usable].astype(np.float32),
+                       atol=1e-5)
 
 
 # ----------------------------------------------------------------- the grids
@@ -204,11 +212,110 @@ def test_a_feature_that_never_moves_is_left_alone_not_blown_up(table):
     a.x[:, :, 3] = 7.0                                   # feature 3 never changes
 
     scaler = Scaler(a, days["learn"], a.names)
-    assert scaler.constant[3]
-    assert scaler.spread[3] == 1.0
+    assert scaler.constant[:, 3].all()                   # flat for every company
+    assert (scaler.spread[:, 3] == 1.0).all()
     assert a.names[3] in scaler.flat_features
 
     scaled = scaler.apply(a.x)
     usable = scaled[a.ok]                                # warm-up rows are blank by design
     assert np.abs(usable[:, 3]).max() < 1e-6            # stays at zero, not +/-1
     assert np.isfinite(usable).all()
+
+
+# ------------------------------------------ normalising each company against itself
+
+def test_each_company_is_normalised_against_its_own_history(table):
+    data, settings = table
+    batches = make_tensors(data, settings)
+    a, days, scaler = batches.arrays, batches.days, batches.scaler
+
+    assert scaler.middle.shape == (3, 22)        # one average PER COMPANY, per feature
+    assert scaler.spread.shape == (3, 22)
+
+    scaled = scaler.apply(a.x)
+    learn_ok = a.ok[days["learn"]]
+    moves = ~scaler.constant
+    for j in range(3):                            # every company, on its own
+        mine = scaled[days["learn"]][:, j][learn_ok[:, j]]
+        keep = moves[j]
+        assert np.allclose(mine.mean(axis=0)[keep], 0, atol=1e-4)
+        assert np.allclose(mine.std(axis=0)[keep], 1, atol=1e-3)
+
+
+def test_a_companys_scale_is_not_affected_by_the_other_companies(table):
+    # The whole point of "time only, not spatial": company AAA's numbers must not
+    # move when company CCC is sabotaged.
+    data, settings = table
+    a = to_arrays(data, settings)
+    days = split_days(a, settings)
+    before = Scaler(a, days["learn"], a.names)
+
+    tampered = to_arrays(data, settings)
+    tampered.x[:, 2, :] *= 1000.0                 # company CCC goes berserk
+    after = Scaler(tampered, days["learn"], a.names)
+
+    assert np.allclose(before.middle[0], after.middle[0])    # AAA untouched
+    assert np.allclose(before.spread[0], after.spread[0])
+    assert not np.allclose(before.middle[2], after.middle[2])  # CCC did change
+
+
+def test_normalising_erases_which_company_a_row_belongs_to(table):
+    # Before: a company's average level identifies it, and the codebook would waste
+    # words memorising "this is BBB". After: every company sits at its own zero.
+    data, settings = table
+    batches = make_tensors(data, settings)
+    a, days = batches.arrays, batches.days
+    scaled = batches.scaler.apply(a.x)
+
+    def company_share(x, rows):
+        """How much of a feature's variance is just WHICH company it is?"""
+        x = np.where(a.ok[rows][:, :, None], x[rows], np.nan)
+        per_company = np.nanmean(x, axis=0)                        # [N, F]
+        return np.nanvar(per_company, axis=0) / np.nanvar(x, axis=(0, 1))
+
+    learn = days["learn"]
+    assert np.nanmax(company_share(a.x, learn)) > 0.10             # identity WAS there
+    assert np.nanmax(company_share(scaled, learn)) < 1e-3          # and is gone
+
+    # Over the WHOLE of history it does not vanish completely, and that is honest:
+    # the scale may only be measured on the learn period, so a company that genuinely
+    # drifts afterwards is allowed to sit off-centre. We are not permitted to peek at
+    # the future to flatten it.
+    everything = np.arange(len(a.dates))
+    before = np.nanmax(company_share(a.x, everything))
+    after = np.nanmax(company_share(scaled, everything))
+    assert after < before / 3
+
+
+def test_a_company_with_almost_no_history_is_refused_not_guessed(table):
+    data, settings = table
+    a = to_arrays(data, settings)
+    days = split_days(a, settings)
+    a.ok[:, 1] = False
+    a.ok[:5, 1] = True                            # BBB has 5 usable days. Not enough.
+    with pytest.raises(ValueError, match="Too little history"):
+        Scaler(a, days["learn"], a.names)
+
+
+def test_a_tiny_but_varying_feature_is_not_mistaken_for_a_flat_one(table):
+    """The bug this guards against.
+
+    Illiquidity for a mega-cap sits around 1e-6 while varying by 30% of itself --
+    real, useful signal. An absolute "is it flat?" threshold threw it away and told
+    the notebook it carried no information. Flatness must be judged relative to the
+    feature's own size.
+    """
+    data, settings = table
+    a = to_arrays(data, settings)
+    days = split_days(a, settings)
+
+    rng = np.random.default_rng(0)
+    tiny = 1e-6 * (1 + 0.3 * rng.normal(size=a.x.shape[:2]))   # small, but ALIVE
+    a.x[:, :, 5] = tiny.astype(np.float32)
+
+    scaler = Scaler(a, days["learn"], a.names)
+    assert not scaler.constant[:, 5].any()            # kept, not zeroed
+    assert a.names[5] not in scaler.flat_features
+
+    scaled = scaler.apply(a.x)[a.ok]
+    assert scaled[:, 5].std() > 0.5                   # and it still varies once scaled

@@ -222,6 +222,18 @@ def tensors(batches, ts, cs, settings: dict) -> None:
         == (cs.companies, cs.days, cs.features)
     )
 
+    # 4. Company identity must be gone. A $500 stock and a $20 stock have wildly
+    #    different levels; left alone, the codebook would spend its 512 words
+    #    memorising WHICH company it is looking at instead of WHAT is happening.
+    def company_share(values, rows):
+        v = np.where(a.ok[rows][:, :, None], values[rows], np.nan)
+        return np.nanvar(np.nanmean(v, axis=0), axis=0) / np.nanvar(v, axis=(0, 1))
+
+    learn = days["learn"]
+    was = float(np.nanmax(company_share(a.x, learn)))
+    now = float(np.nanmax(company_share(scaler.apply(a.x), learn)))
+    anonymous = now < 0.01
+
     sizes = batches.sizes()
     span = {p: f"{sizes.loc[p, 'from']} → {sizes.loc[p, 'to']}" for p in sizes.index}
 
@@ -234,6 +246,8 @@ def tensors(batches, ts, cs, settings: dict) -> None:
              f"test {span['test']} — touched once, at the end"),
             ("Scale is blind to the future", blind,
              "proved: changing the test period does not move it"),
+            ("Each company scaled to itself", anonymous,
+             f"company identity: {was:.0%} of a feature → {now:.1%}"),
             ("A grid ends on its own day", ends_today, "no window straddles tomorrow"),
             ("Border days dropped", True,
              "their target was tomorrow — and tomorrow is the next period"),
@@ -243,7 +257,8 @@ def tensors(batches, ts, cs, settings: dict) -> None:
         have=f"""
         {sizes['TS samples'].sum():,} TS grids and {sizes['CS samples'].sum():,} CS grids,
         divided into learn / tune / test — in that order, by date.
-        Everything is scaled using the LEARN period's numbers only.
+        Every company is normalised against its OWN history, so a feature now says
+        "how unusual is today, for this company" rather than "this is a $500 stock".
         The models can now be fed. Nothing has been trained yet.
         """,
     )

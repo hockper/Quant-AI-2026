@@ -45,7 +45,12 @@ def build(df: pd.DataFrame, settings: dict) -> dict[str, pd.Series]:
     log_ret_abs = np.log(close).diff().abs()
     dollar_volume = (close * volume).replace(0.0, np.nan)  # zero-volume days -> NaN, not a crash
     illiq = (log_ret_abs / dollar_volume).rolling(WINDOW).mean()
-    out["amihud"] = np.log1p(1e6 * illiq)  # log1p tames the extreme right skew
+    # A plain log, NOT log1p. Illiquidity for a mega-cap is around 1e-11, so
+    # log1p(1e6 * 1e-11) = log1p(1e-5) ~= 1e-5 -- the log does nothing at all and the
+    # brutal right skew survives untouched. A plain log of a strictly positive
+    # quantity is what actually compresses it, and turns a number spanning orders of
+    # magnitude into one that spans a handful of units.
+    out["amihud"] = np.log(illiq.where(illiq > 0))       # a zero would be -inf -> blank
 
     # --- roll_spread: Roll (1984) implied spread from the bid-ask bounce ----
     # A dealer quotes a bid below and an ask above the "true" price, so a trade
