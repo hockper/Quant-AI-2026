@@ -138,9 +138,18 @@ yfinance (daily OHLCV, auto_adjust)
   `FusionVQVAE.encode → ids[B,N]`. Plans:
   `docs/superpowers/plans/2026-07-10-m2-phase2-cs-vqvae.md`,
   `2026-07-10-m2-phase3-fusion.md`.
-- **M3 — Transformer predictor (hybrid heads)** on frozen tokens: next-token CE +
-  regression MSE. Eval: token accuracy/perplexity, RankIC on regressed return,
-  multi-step generative-rollout sanity check.
+- **M3 — Transformer predictor** on frozen fusion tokens. Concretized: **categorical
+  next-token only** this milestone (per-stock causal GPT over the one-token-per-day
+  fusion-token sequences, weights shared, no cross-stock attention; CE over the
+  512-vocab). **Llama-3-style decoder** (RMSNorm + RoPE + SwiGLU + bias-free; GQA
+  configurable, KV-cache deferred). Eval: next-token accuracy/perplexity vs a
+  marginal baseline + light multi-step token rollout. Regression/RankIC head
+  deferred; `use_fusion` ablation optional. Design:
+  `docs/superpowers/specs/2026-07-10-m3-predictor-design.md`.
+  **DONE (2026-07-10):** token grid (4153×30, 98.9% valid); Llama-3 GPT held-out
+  next-token accuracy **58.6%**, perplexity 9.5 (of 512), rollout 33.9%. Plan:
+  `docs/superpowers/plans/2026-07-10-m3-predictor.md`. (Caveat: marginal baseline
+  weak; a persistence baseline is a good follow-up.)
 - **M4 — Optional joint fine-tune** end-to-end + full metric suite + ablations.
   Emits the frozen **Transformer world-model artifact** consumed by Spec 2.
 

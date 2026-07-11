@@ -53,6 +53,10 @@ class ModelConfig:
     fusion_codebook_size: int = 512
     fusion_layers: int = 2
     use_fusion: bool = True
+    pred_window: int = 64
+    pred_layers: int = 4
+    n_kv_heads: int = 0
+    rope_theta: float = 10000.0
 
 
 @dataclass

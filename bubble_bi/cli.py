@@ -12,10 +12,16 @@ from bubble_bi.data.splits import walk_forward_splits
 from bubble_bi.data.universe import load_universe
 from bubble_bi.baselines.ridge import evaluate_baseline
 from bubble_bi.data.windows import build_loaders, build_day_loaders
+import numpy as np
+
 from bubble_bi.eval.tokenizer_eval import evaluate_tokenizer, evaluate_cs, evaluate_fusion
+from bubble_bi.eval.predictor_eval import evaluate_predictor, rollout_accuracy, train_marginal_token
+from bubble_bi.data.token_grid import build_token_grid, build_token_loaders
+from bubble_bi.data.windows import Standardizer
 from bubble_bi.models.ts_vqvae import TSVQVAE
 from bubble_bi.models.cs_vqvae import CSVQVAE
 from bubble_bi.models.fusion_vqvae import FusionVQVAE
+from bubble_bi.models.predictor import NextTokenPredictor
 from bubble_bi.train.trainer import Trainer, resolve_device, set_seed
 from bubble_bi.viz.plots import plot_run, plot_compare
 
@@ -202,6 +208,80 @@ def eval_fusion(cfg: Config, run_name: str | None = None) -> dict:
     return result
 
 
+def _load_frozen_fusion(cfg: Config, device):
+    import torch
+
+    panel = _load_or_build_panel(cfg)
+    ckpt = Path(cfg.data.cache_dir) / "checkpoints_fusion" / "last.pt"
+    if not ckpt.exists():
+        raise FileNotFoundError(f"missing fusion tokenizer {ckpt}; run train-fusion first")
+    state = torch.load(str(ckpt), map_location=device, weights_only=False)
+    model = FusionVQVAE(cfg.model, d_in=panel.features.shape[2], n_stocks=len(panel.tickers))
+    model.load_state_dict(state["model"])
+    std = Standardizer()
+    std.load_state_dict(state["standardizer"])
+    return panel, model, std
+
+
+def tokenize_panel(cfg: Config) -> np.ndarray:
+    device = resolve_device(cfg.train.device)
+    panel, model, std = _load_frozen_fusion(cfg, device)
+    window_len = max(cfg.model.p, cfg.model.cs_p)
+    grid = build_token_grid(model, std.transform(panel.features), panel.mask, window_len, device)
+    out = Path(cfg.data.cache_dir) / "tokens.npz"
+    np.savez_compressed(out, grid=grid)
+    print(f"token grid {grid.shape} -> {out}  (valid {(grid != -1).mean():.1%})")
+    return grid
+
+
+def _load_or_build_token_grid(cfg: Config) -> np.ndarray:
+    p = Path(cfg.data.cache_dir) / "tokens.npz"
+    if p.exists():
+        return np.load(str(p))["grid"]
+    return tokenize_panel(cfg)
+
+
+def train_predictor(cfg: Config, run_name: str | None = None) -> dict:
+    set_seed(cfg.seed)
+    grid = _load_or_build_token_grid(cfg)
+    loaders = build_token_loaders(grid, cfg)
+    model = NextTokenPredictor(cfg.model, vocab=cfg.model.fusion_codebook_size)
+    run_name = run_name or f"pred_{cfg.train.max_steps}"
+    ckpt_dir = Path(cfg.data.cache_dir) / "checkpoints_predictor"
+    trainer = Trainer(model, loaders, cfg.train, str(ckpt_dir),
+                      run_dir=str(_run_dir(cfg, run_name)))
+    metrics = trainer.train()
+    trainer.logger.write_meta({"model": "predictor", "pred_window": cfg.model.pred_window,
+                               "pred_layers": cfg.model.pred_layers,
+                               "vocab": cfg.model.fusion_codebook_size,
+                               "max_steps": cfg.train.max_steps, "final": metrics})
+    print(f"[pred] trained {metrics['step']} steps | ce {metrics['recon']:.4f} "
+          f"| val {metrics['val_mse']:.4f} | ppl {metrics['perplexity']:.1f}")
+    return metrics
+
+
+def eval_predictor(cfg: Config, run_name: str | None = None) -> dict:
+    set_seed(cfg.seed)
+    grid = _load_or_build_token_grid(cfg)
+    loaders = build_token_loaders(grid, cfg)
+    device = resolve_device(cfg.train.device)
+    model = NextTokenPredictor(cfg.model, vocab=cfg.model.fusion_codebook_size).to(device)
+    ckpt = Path(cfg.data.cache_dir) / "checkpoints_predictor" / "last.pt"
+    if ckpt.exists():
+        import torch
+
+        state = torch.load(str(ckpt), map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+    marginal = train_marginal_token(loaders["train"])
+    result = evaluate_predictor(model, loaders["test"], device, marginal)
+    result["rollout_accuracy"] = rollout_accuracy(model, loaders["test"], device)
+    print(f"[pred] acc {result['accuracy']:.2%} (baseline {result['baseline_accuracy']:.2%}) "
+          f"| ppl {result['perplexity']:.1f} | rollout {result['rollout_accuracy']:.2%}")
+    if run_name:
+        _write_eval_json(cfg, run_name, result)
+    return result
+
+
 def plot_metrics(cfg: Config, run_names: list[str]) -> list[str]:
     dirs = [str(_run_dir(cfg, n)) for n in run_names]
     if len(dirs) == 1:
@@ -219,7 +299,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=["ingest", "build-panel", "baseline",
                                             "train-tokenizer", "eval-tokenizer",
                                             "train-cs", "eval-cs",
-                                            "train-fusion", "eval-fusion", "plot-metrics"])
+                                            "train-fusion", "eval-fusion",
+                                            "tokenize", "train-predictor", "eval-predictor",
+                                            "plot-metrics"])
     parser.add_argument("--config", default="configs/m0.yaml")
     parser.add_argument("--run-name", nargs="+", default=None)
     args = parser.parse_args(argv)
@@ -245,6 +327,12 @@ def main(argv: list[str] | None = None) -> int:
         train_fusion(cfg, run_name=run_name)
     elif args.command == "eval-fusion":
         eval_fusion(cfg, run_name=run_name)
+    elif args.command == "tokenize":
+        tokenize_panel(cfg)
+    elif args.command == "train-predictor":
+        train_predictor(cfg, run_name=run_name)
+    elif args.command == "eval-predictor":
+        eval_predictor(cfg, run_name=run_name)
     elif args.command == "plot-metrics":
         plot_metrics(cfg, args.run_name or [_default_dual_run(cfg)])
     return 0
