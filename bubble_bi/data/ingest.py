@@ -40,16 +40,22 @@ def ingest(
     paths: dict[str, str] = {}
     for ticker in tickers:
         path = Path(raw_dir) / f"{ticker}.parquet"
-        existing = pd.read_parquet(path) if path.exists() else None
-        fetch_start = start
-        if existing is not None and len(existing):
-            fetch_start = str(existing.index.max().date())
+        cached = pd.read_parquet(path) if path.exists() else None
+        has_cache = cached is not None and len(cached) > 0
+
+        # Refetch from the last cached date (not the day after), so the ranges
+        # overlap by a day; the dedup below absorbs it and re-runs stay idempotent.
+        fetch_start = str(cached.index.max().date()) if has_cache else start
         new = source.fetch(ticker, fetch_start, end)
-        if existing is not None and len(existing):
-            combined = pd.concat([existing, new])
+
+        if has_cache:
+            combined = pd.concat([cached, new])
+            # keep="last": a refetched day overwrites the cached one, so restated
+            # prices win.
             combined = combined[~combined.index.duplicated(keep="last")].sort_index()
         else:
             combined = new.sort_index()
+
         combined[COLUMNS].to_parquet(path)
         paths[ticker] = str(path)
     return paths
