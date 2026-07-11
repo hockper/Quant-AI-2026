@@ -46,3 +46,23 @@ def evaluate_cs(model, loader, device) -> dict:
     return {"recon_mse": se / max(n, 1), "mean_baseline_mse": base / max(n, 1),
             "perplexity": ppl / max(batches, 1), "codes_used_frac": len(used) / model.vq.K}
 
+
+@torch.no_grad()
+def evaluate_fusion(model, loader, device) -> dict:
+    model.eval()
+    se, base, n, ppl, batches = 0.0, 0.0, 0, 0.0, 0
+    used: set[int] = set()
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        out = model(batch)
+        ts_in = batch["block"][:, :, -model.p:, :]
+        valid = batch["valid"].float()
+        denom = float(valid.sum().clamp(min=1.0))
+        se += float(out["recon_loss"]) * denom
+        base += float((ts_in.pow(2).mean(dim=(2, 3)) * valid).sum())
+        n += denom
+        ppl += float(out["perplexity"]); batches += 1
+        used.update(out["ids"][batch["valid"]].tolist())
+    return {"recon_mse": se / max(n, 1), "mean_baseline_mse": base / max(n, 1),
+            "perplexity": ppl / max(batches, 1), "codes_used_frac": len(used) / model.vq.K}
+
