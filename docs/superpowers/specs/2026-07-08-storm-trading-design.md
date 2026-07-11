@@ -146,6 +146,10 @@ yfinance (daily OHLCV, auto_adjust)
   marginal baseline + light multi-step token rollout. Regression/RankIC head
   deferred; `use_fusion` ablation optional. Design:
   `docs/superpowers/specs/2026-07-10-m3-predictor-design.md`.
+  **DONE (2026-07-10):** token grid (4153×30, 98.9% valid); Llama-3 GPT held-out
+  next-token accuracy **58.6%**, perplexity 9.5 (of 512), rollout 33.9%. Plan:
+  `docs/superpowers/plans/2026-07-10-m3-predictor.md`. (Caveat: marginal baseline
+  weak; a persistence baseline is a good follow-up.)
 - **M4 — Optional joint fine-tune** end-to-end + full metric suite + ablations.
   Emits the frozen **Transformer world-model artifact** consumed by Spec 2.
 

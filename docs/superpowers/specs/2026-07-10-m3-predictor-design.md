@@ -163,6 +163,27 @@ market context earns its place. Run only if time allows.
 categorical head enables token-level imagination rollouts; full candle decode is a
 later concern (needs the M2 `JointDecoder` over all stocks).
 
+## Results (recorded 2026-07-10)
+
+Frozen M2 fusion tokenizer → `tokenize` → token grid `(4153, 30)`, **98.9% valid**.
+Predictor `configs/m3.yaml` (Llama-3 block, `W=64`, 4 layers, `d_model=128`,
+1000 steps CPU).
+
+| Metric | Value |
+|---|---|
+| Held-out next-token top-1 accuracy | **58.6%** |
+| Marginal baseline accuracy | 0.03% |
+| Perplexity (held-out) | **9.5** (of vocab 512) |
+| Free-running rollout accuracy (horizon 5) | 33.9% |
+| Train CE / val CE | 2.37 / 2.49 |
+
+The Llama-3 GPT learns real market-token dynamics — perplexity 9.5 (vs ~512 for a
+random model) means it's effectively choosing among ~10 codes. **Caveat (honest):**
+the marginal baseline is a *weak* floor; daily tokens are sticky (the market state
+changes slowly, so tomorrow's token often equals today's), so a **persistence
+baseline** ("predict yesterday's token") would be a fairer comparison — a good
+follow-up. Rollout degrades under free-running (33.9% at h=5) as expected. **M3 DONE.**
+
 ## Defaults
 
 | Setting | Default |
