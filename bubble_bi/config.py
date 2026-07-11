@@ -23,6 +23,16 @@ class FeatureConfig:
     rsi_window: int = 14
     vol_window: int = 20
     volume_window: int = 20
+    frac_d: float = 0.45
+    frac_thresh: float = 1e-3
+    frac_max_lags: int = 200
+    atr_window: int = 14
+    hurst_window: int = 100
+    entropy_window: int = 60
+    entropy_bins: int = 10
+    amihud_window: int = 21
+    roll_window: int = 21
+    cs_window: int = 21
 
 
 @dataclass
