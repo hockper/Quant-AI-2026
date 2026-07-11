@@ -24,21 +24,32 @@ from bubble_bi.config import (  # noqa: E402
 )
 from bubble_bi.runtime import detect_runtime  # noqa: E402
 
+_TS_KEYS = {"days", "vocabulary", "encoder_depth", "decoder_depth"}
+_CS_KEYS = {"days", "vocabulary", "encoder_depth", "decoder_depth"}
+_FUSION_KEYS = {"vocabulary", "depth"}
+_PREDICTOR_KEYS = {"sentence_length", "depth"}
+
+
+def _check(block: dict, allowed: set[str], name: str) -> dict:
+    unknown = set(block) - allowed
+    if unknown:
+        raise ValueError(
+            f"`{name}` got unknown setting(s) {sorted(unknown)}. "
+            f"Allowed: {sorted(allowed)}."
+        )
+    return block
+
 
 def make_config(
     tickers: list[str],
     start: str | None = None,
     end: str | None = None,
     *,
-    # the tokenizer — how each stock-day becomes one "word"
-    vocabulary: int = 512,
-    days_per_token: int = 4,
-    market_days: int = 5,
+    ts: dict | None = None,
+    cs: dict | None = None,
+    fusion: dict | None = None,
+    predictor: dict | None = None,
     model_size: int = 128,
-    # the predictor — the GPT that reads the sentences
-    sentence_length: int = 64,
-    predictor_layers: int = 4,
-    # training
     steps: int = 2000,
     batch_size: int = 256,
     learning_rate: float = 1e-4,
@@ -48,16 +59,30 @@ def make_config(
 ) -> Config:
     """Build the project's configuration from plain notebook values.
 
-    Friendly names in, the engine's names out. Anything not listed here keeps a
-    sensible default — you should not have to care about it.
+    The tokenizer has two entries, each with its own settings:
+
+      ts     -- what THIS stock has been doing (one stock, over time)
+      cs     -- what the WHOLE MARKET was doing (all stocks, on a day)
+      fusion -- where the two entries merge into the single token we keep
+
+    `model_size` is deliberately shared: the two entries meet in a cross-attention
+    layer, which requires both sides to have the same width.
     """
+    ts = _check(dict(ts or {}), _TS_KEYS, "ts")
+    cs = _check(dict(cs or {}), _CS_KEYS, "cs")
+    fusion = _check(dict(fusion or {}), _FUSION_KEYS, "fusion")
+    predictor = _check(dict(predictor or {}), _PREDICTOR_KEYS, "predictor")
+
     tickers = [t.strip().upper() for t in tickers if t.strip()]
     if not tickers:
         raise ValueError("`tickers` is empty — list at least one company, e.g. ['AAPL'].")
-    if days_per_token < 1:
-        raise ValueError(f"`days_per_token` must be at least 1, got {days_per_token}.")
-    if vocabulary < 2:
-        raise ValueError(f"`vocabulary` must be at least 2, got {vocabulary}.")
+    for entry, block in (("ts", ts), ("cs", cs)):
+        if block.get("days", 1) < 1:
+            raise ValueError(f"`{entry}['days']` must be at least 1, got {block['days']}.")
+        if block.get("vocabulary", 2) < 2:
+            raise ValueError(
+                f"`{entry}['vocabulary']` must be at least 2, got {block['vocabulary']}."
+            )
 
     return Config(
         data=DataConfig(
@@ -70,14 +95,23 @@ def make_config(
         features=FeatureConfig(),
         splits=SplitConfig(),
         model=ModelConfig(
-            p=days_per_token,
-            cs_p=market_days,
-            d_model=model_size,
-            codebook_size=vocabulary,
-            cs_codebook_size=vocabulary,
-            fusion_codebook_size=vocabulary,
-            pred_window=sentence_length,
-            pred_layers=predictor_layers,
+            d_model=model_size,                                   # shared (see above)
+            # entry 1 — TS
+            p=ts.get("days", 4),
+            codebook_size=ts.get("vocabulary", 512),
+            enc_layers=ts.get("encoder_depth", 3),
+            dec_layers=ts.get("decoder_depth", 2),
+            # entry 2 — CS
+            cs_p=cs.get("days", 5),
+            cs_codebook_size=cs.get("vocabulary", 512),
+            cs_enc_layers=cs.get("encoder_depth", 3),
+            cs_dec_layers=cs.get("decoder_depth", 2),
+            # where the two entries merge
+            fusion_codebook_size=fusion.get("vocabulary", 512),
+            fusion_layers=fusion.get("depth", 2),
+            # the predictor
+            pred_window=predictor.get("sentence_length", 64),
+            pred_layers=predictor.get("depth", 4),
         ),
         train=TrainConfig(
             lr=learning_rate,
@@ -94,11 +128,18 @@ def describe(cfg: Config) -> str:
     d, m, t = cfg.data, cfg.model, cfg.train
     where = detect_runtime() if t.device == "auto" else t.device
     period = f"from {d.start}" if d.start else "all available history"
-    return (
-        f"✅ Ready to run on {where.upper()}\n"
-        f"   {len(d.tickers)} companies, {period}\n"
-        f"   Vocabulary: {m.codebook_size} market 'words', "
-        f"each summarising {m.p} days\n"
-        f"   Predictor reads sentences of {m.pred_window} tokens\n"
-        f"   Data folder: {d.raw_dir.rsplit('/', 1)[0]}/"
-    )
+
+    ts = f"     TS  this stock, {m.p} days back".ljust(40)
+    cs = f"     CS  whole market, {m.cs_p} days back".ljust(40)
+    return "\n".join([
+        f"✅ Ready to run on {where.upper()}",
+        f"   {len(d.tickers)} companies, {period}",
+        "",
+        "   The tokenizer's two entries:",
+        f"{ts}→ {m.codebook_size} words, depth {m.enc_layers}",
+        f"{cs}→ {m.cs_codebook_size} words, depth {m.cs_enc_layers}",
+        f"     ⤷ merged into ONE token out of {m.fusion_codebook_size}",
+        "",
+        f"   Predictor reads sentences of {m.pred_window} tokens (depth {m.pred_layers})",
+        f"   Shared brain width: {m.d_model}",
+    ])

@@ -60,6 +60,11 @@ class ModelConfig:
     dead_code_reinit_every: int = 250
     cs_codebook_size: int = 512
     cs_p: int = 5
+    # CS reads the whole market on a day; TS reads one stock over time. Different
+    # problems, so they get their own depth. (d_model stays shared -- the two meet
+    # in cross-attention, which requires matching widths.)
+    cs_enc_layers: int = 3
+    cs_dec_layers: int = 2
     fusion_codebook_size: int = 512
     fusion_layers: int = 2
     use_fusion: bool = True

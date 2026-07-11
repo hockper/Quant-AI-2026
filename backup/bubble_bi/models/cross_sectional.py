@@ -14,7 +14,7 @@ class CSFieldEncoder(nn.Module):
         self.stock_id = nn.Parameter(torch.zeros(1, n_stocks, 1, cfg.d_model))
         self.day_pos = nn.Parameter(torch.zeros(1, 1, cfg.cs_p, cfg.d_model))
         self.cls = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
-        self.enc = _encoder_stack(cfg, cfg.enc_layers)
+        self.enc = _encoder_stack(cfg, cfg.cs_enc_layers)
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         B, N, P, D = x.shape
@@ -36,7 +36,7 @@ class CSFieldDecoder(nn.Module):
         self.cs_p = cfg.cs_p
         self.stock_id = nn.Parameter(torch.zeros(1, n_stocks, 1, cfg.d_model))
         self.day_pos = nn.Parameter(torch.zeros(1, 1, cfg.cs_p, cfg.d_model))
-        self.dec = _encoder_stack(cfg, cfg.dec_layers)
+        self.dec = _encoder_stack(cfg, cfg.cs_dec_layers)
         self.out = nn.Linear(cfg.d_model, d_out)
 
     def forward(self, z_q: torch.Tensor) -> torch.Tensor:
