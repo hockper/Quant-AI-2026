@@ -44,6 +44,48 @@ def test_corwin_schultz_never_negative():
     assert (s >= 0).all()
 
 
+def test_corwin_schultz_clamps_before_rolling_not_after():
+    # Mostly flat, narrow-band days (small positive raw CS) with a single-day
+    # spike to a far-away level every 5th day. That spike day's two-day range
+    # (gamma) dwarfs the single-day ranges (beta) on both sides of it, driving
+    # the raw CS estimate sharply negative for those two adjacent day-pairs
+    # while leaving the other days in the same rolling window positive --
+    # exactly the mix needed to distinguish clamp-before from clamp-after.
+    n = 60
+    levels = np.full(n, 100.0)
+    levels[np.arange(4, n, 5)] = 250.0
+    high = levels * 1.002
+    low = levels * 0.998
+    df = _df(levels, high=high, low=low)
+
+    h, l = df["high"], df["low"]
+    _DEN = 3.0 - 2.0 * np.sqrt(2.0)
+    hl2 = np.log(h / l) ** 2
+    beta = hl2 + hl2.shift(1)
+    h2 = pd.concat([h, h.shift(1)], axis=1).max(axis=1)
+    l2 = pd.concat([l, l.shift(1)], axis=1).min(axis=1)
+    gamma = np.log(h2 / l2) ** 2
+    alpha = (np.sqrt(2.0 * beta) - np.sqrt(beta)) / _DEN - np.sqrt(gamma / _DEN)
+    raw = 2.0 * (np.exp(alpha) - 1.0) / (1.0 + np.exp(alpha))
+
+    # Sanity: the fixture must actually exercise the negative-raw-value case,
+    # otherwise the ordering distinction below is untested.
+    assert (raw < 0).any()
+
+    window = 5
+    wrong = raw.rolling(window).mean().clip(lower=0.0)  # clamp AFTER averaging
+    right = corwin_schultz(df, window)                   # clamp BEFORE averaging (correct)
+
+    idx = right.dropna().index.intersection(wrong.dropna().index)
+    r, w = right.loc[idx], wrong.loc[idx]
+
+    # The two orderings must produce different numbers here...
+    assert not np.allclose(r, w)
+    # ...and clamping negatives away per-day before averaging can only raise
+    # (or leave unchanged) the resulting rolling mean.
+    assert (r >= w - 1e-12).all()
+
+
 def test_amihud_decreases_with_volume():
     c = np.array([100.0, 101.0, 100.0, 101.0] * 30)
     low_vol = amihud(_df(c, volume=np.full(len(c), 1e5)), 21).dropna()
