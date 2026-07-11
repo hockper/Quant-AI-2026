@@ -71,11 +71,15 @@ y_t = Σ_{k=0}^{L−1} w_k · x_{t−k}          # causal: past lags only
 first L−1 values are NaN (warm-up)
 ```
 
-**Window-length trade-off (a real number, not a detail):** at `d = 0.45`, a
-threshold of `1e-4` requires **~575 lags** (~14% of our 4153 days lost to warm-up).
-We default to `frac_thresh = 1e-3` with `frac_max_lags = 200`, which keeps warm-up
-near 200 days while still retaining deep memory. A looser threshold retains less
-memory — hence both are config-exposed.
+**Window-length trade-off (a real number, not a detail):** the weights decay like
+`k^-(d+1)`, so the threshold sets the window. At `d = 0.45`, a threshold of `1e-4`
+requires **~575 lags** (~14% of our 4153 days lost to warm-up). We default to
+`frac_thresh = 1e-3`, where the weights cross the threshold at **~65–70 lags** —
+deep memory retained, cheap warm-up. `frac_max_lags = 200` is a safety cap that
+does *not* bind at these defaults (it only matters if `d` or the threshold is
+lowered). A looser threshold retains less memory — hence both are config-exposed.
+
+**So the binding warm-up is `hurst_window = 100`, not the frac-diff window.**
 
 Produces: `fracdiff_weights(d, thresh, max_lags) -> np.ndarray` and
 `frac_diff(series, d, thresh, max_lags) -> pd.Series`.
@@ -127,9 +131,10 @@ Target: `build-panel` stays well under a minute.
 
 ## Consequences
 
-- **Warm-up grows to ~200 days** (driven by `frac_max_lags`, then `hurst_window`),
-  so `Panel.mask` drops more early rows (~5% of history). Handled automatically —
-  the mask already gates every consumer.
+- **Warm-up grows to ~100 days** (driven by `hurst_window`; the frac-diff window is
+  ~65–70 lags at the defaults), so `Panel.mask` drops more early rows (~2–3% of
+  history). Handled automatically — the mask already gates every consumer. The
+  build step measures the real valid fraction rather than assuming it.
 - **D: 10 → 22 invalidates all four checkpoints** (`d_in` mismatch on load).
   `panel.npz` and `tokens.npz` must be rebuilt and **every stage retrained**
   (TS → CS → fusion → predictor). This is expected and is what the Colab GPU
