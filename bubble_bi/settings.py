@@ -209,6 +209,48 @@ def device() -> str:
     return "gpu" if torch.cuda.is_available() else "cpu"
 
 
+def hardware() -> dict:
+    """Everything about the hardware, so nobody has to guess why it is slow.
+
+    ⚠️ The trap this exists to catch: **a CPU-only build of PyTorch.** Colab ships a CUDA
+    build, but a careless `pip install` can quietly replace it with a CPU one — and then
+    `torch.cuda.is_available()` is False on a machine with a perfectly good GPU sitting
+    idle. The tell is `torch.version.cuda` being None: the library was never built to talk
+    to a GPU at all, so no amount of Runtime → GPU will help.
+    """
+    facts = {"where": "cpu", "torch": None, "built for cuda": None,
+             "cuda available": False, "gpu": None, "why": None}
+    try:
+        import torch
+    except ImportError:
+        facts["why"] = "PyTorch is not installed at all."
+        return facts
+
+    facts["torch"] = torch.__version__
+    facts["built for cuda"] = torch.version.cuda          # None => CPU-ONLY BUILD
+    facts["cuda available"] = bool(torch.cuda.is_available())
+    facts["where"] = device()
+
+    if facts["cuda available"]:
+        try:
+            facts["gpu"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+    elif facts["built for cuda"] is None:
+        facts["why"] = (
+            "This PyTorch was built WITHOUT CUDA — a CPU-only wheel. It cannot use a GPU "
+            "whatever runtime you pick. Something (usually a pip install) replaced Colab's "
+            "CUDA build. Fix: Runtime → Disconnect and delete runtime, start again, and do "
+            "not let anything install `torch`."
+        )
+    elif facts["where"] == "cpu":
+        facts["why"] = (
+            "PyTorch has CUDA support but finds no GPU. Turn one on: Runtime → Change "
+            "runtime type → T4 GPU, then Runtime → Restart session."
+        )
+    return facts
+
+
 def summary(settings: dict) -> str:
     """A one-glance description of what is about to run."""
     ts, cs = settings["ts"], settings["cs"]

@@ -90,3 +90,40 @@ def test_a_clean_run_stays_short(tmp_path):
     passed, summary = run_tests(str(tmp_path))
     assert passed is True
     assert summary == "1 passed"
+
+
+def test_the_hardware_report_spots_a_cpu_only_torch_build(monkeypatch):
+    """The trap this exists for.
+
+    Colab ships a CUDA build of PyTorch, but a careless pip install can replace it with a
+    CPU-only wheel. Then `cuda.is_available()` is False on a machine with a perfectly
+    good GPU sitting idle, and "Hardware: CPU" tells you nothing about WHY. The tell is
+    `torch.version.cuda` being None.
+    """
+    import torch
+
+    from bubble_bi.settings import hardware
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)
+
+    kit = hardware()
+    assert kit["where"] == "cpu"
+    assert kit["built for cuda"] is None
+    assert "CPU-only wheel" in kit["why"]
+    assert "not let anything install `torch`" in kit["why"]
+
+
+def test_the_hardware_report_distinguishes_no_gpu_from_no_cuda_torch(monkeypatch):
+    # A CUDA-capable torch that simply cannot find a GPU is a DIFFERENT problem, with a
+    # different fix — turn the runtime on, rather than reinstall everything.
+    import torch
+
+    from bubble_bi.settings import hardware
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", "12.1")
+
+    kit = hardware()
+    assert "Change runtime type" in kit["why"]
+    assert "CPU-only" not in kit["why"]

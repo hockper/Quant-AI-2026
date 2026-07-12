@@ -10,13 +10,14 @@ import os
 from pathlib import Path
 
 from bubble_bi.report import report, run_tests
-from bubble_bi.settings import device
+from bubble_bi.settings import device, hardware
 
 
 def setup(settings: dict) -> None:
     """Section 1-2: the settings are sound and the code runs here."""
     n = len(settings["tickers"])
-    where = device()
+    kit = hardware()
+    where = kit["where"]
 
     data_dir = Path(settings["data_dir"])
     try:
@@ -28,13 +29,17 @@ def setup(settings: dict) -> None:
     except OSError:
         writable = False
 
-    try:
-        import torch  # noqa: F401
-        has_torch = True
-    except ImportError:
-        has_torch = False
-
+    has_torch = kit["torch"] is not None
     tests_pass, tests_summary = run_tests()
+
+    # Say WHICH device, and name it. "GPU" alone hides the thing that actually goes
+    # wrong: a CPU-only build of PyTorch on a machine that has a GPU.
+    if kit["gpu"]:
+        found = f"{kit['gpu']} — torch {kit['torch']}"
+    else:
+        found = f"CPU — torch {kit['torch']}"
+        if kit["built for cuda"] is None and kit["torch"]:
+            found += "  ⚠️ CPU-ONLY BUILD"
 
     ts, cs = settings["ts"], settings["cs"]
     report(
@@ -43,7 +48,7 @@ def setup(settings: dict) -> None:
             ("Settings understood", True, f"{n} companies, no typos"),
             ("Data folder writable", writable, f"{data_dir}/"),
             ("PyTorch available", has_torch, "required to train"),
-            ("Hardware", True, where.upper()),
+            ("Hardware", True, found),
             ("Project's own tests", tests_pass, tests_summary),
         ],
         have=f"""
@@ -53,7 +58,9 @@ def setup(settings: dict) -> None:
         No prices downloaded, no model trained.
         """,
     )
-    if where == "cpu" and os.environ.get("COLAB_GPU") is None:
+    if kit["why"]:
+        print(f"\n  ⚠️  {kit['why']}")
+    elif where == "cpu":
         print("\n  ℹ️  Running on CPU. Training will work but be slow —")
         print("     on Colab, switch to a GPU runtime for a large speed-up.")
 

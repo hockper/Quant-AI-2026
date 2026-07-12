@@ -40,6 +40,19 @@ def pick_device(settings: dict) -> torch.device:
     return torch.device("cuda" if found == "gpu" else "cpu")
 
 
+def describe_device(where: torch.device) -> str:
+    """Name the hardware, so a slow run cannot leave you guessing which one it used."""
+    if where.type == "cuda":
+        try:
+            return f"GPU ({torch.cuda.get_device_name(where.index or 0)})"
+        except Exception:
+            return "GPU"
+    if where.type == "cpu":
+        built = torch.version.cuda
+        return "CPU" + ("  ⚠️ torch is a CPU-only build" if built is None else "")
+    return str(where).upper()
+
+
 def _to(batch: dict, where: torch.device) -> dict:
     return {k: v.to(where) if torch.is_tensor(v) else v for k, v in batch.items()}
 
@@ -142,7 +155,7 @@ def train(
     started = time.time()
 
     progress = _Progress(steps, model.codebook.words, len(loaders["learn"].dataset),
-                         str(where), enabled=not quiet)
+                         describe_device(where), enabled=not quiet)
 
     revived = 0
     for step in range(1, steps + 1):
@@ -190,7 +203,7 @@ class _Progress:
         self.last_drawn = 0.0
         self.line = ""
         if enabled:
-            print(f"Training on {where.upper()} for {steps:,} steps "
+            print(f"Training on {where} for {steps:,} steps "
                   f"({grids:,} grids to learn from)")
             print(f"\n{'step':>7}  {'rebuild':>8}  {'vs guessing':>12}  "
                   f"{'perplexity':>11}  {'words used':>12}")
@@ -311,7 +324,7 @@ def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
     started = time.time()
 
     if not quiet:
-        print(f"Training on {str(where).upper()} for {steps:,} steps "
+        print(f"Training on {describe_device(where)} for {steps:,} steps "
               f"({len(loaders['learn'].dataset):,} sentences)")
         print(f"\n{'step':>6}  {'names it':>9}  {'persistence':>12}  "
               f"{'draws it':>9}  {'shrugging':>10}  {'perplexity':>11}")
