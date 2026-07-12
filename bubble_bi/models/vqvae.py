@@ -68,11 +68,12 @@ class VQVAE(nn.Module):
         commitment: float = 1.0,
         diversity: float = 0.1,
         batch: int | None = None,
+        steps: int | None = None,
     ):
-        # `batch` is not a model setting -- it belongs to the data loader. It is
-        # accepted and ignored here purely so the notebook can hand over an entry's
-        # whole settings block in one go: VQVAE(..., **settings["ts"]).
-        del batch
+        # `batch` and `steps` are not model settings -- they belong to the data loader and
+        # the trainer. They are accepted and ignored here purely so the notebook can hand
+        # over an entry's whole settings block in one go: VQVAE(..., **settings["ts"]).
+        del batch, steps
         super().__init__()
         if companies < 1 or days < 1 or features < 1:
             raise ValueError(

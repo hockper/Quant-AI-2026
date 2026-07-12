@@ -63,6 +63,7 @@ class History:
 
     rows: list[dict] = field(default_factory=list)
     seconds: float = 0.0
+    best_step: int = 0
 
     def add(self, **row) -> None:
         self.rows.append(row)
@@ -149,15 +150,32 @@ def train(
     loaders: dict,
     settings: dict,
     steps: int | None = None,
+    entry: str | None = None,
     revive_every: int = 50,
     check_every: int | None = None,
+    patience: int = 5,
     quiet: bool = False,
 ) -> History:
-    """Train one VQ-VAE. Returns everything that happened.
+    """Train one VQ-VAE, and STOP when it starts getting worse.
 
     loaders: {"learn": ..., "tune": ...} — the grids for this entry (TS or CS).
-    steps:   how many batches to learn from. Defaults to settings["steps"].
+    steps:   the MOST batches to learn from. Defaults to settings["steps"].
+    patience: give up after this many checks with no improvement on the held-out days.
+
+    ⚠️ Why this exists. CS has ~2,600 grids; TS has ~78,000. They share one `steps`
+    setting, so 10,000 steps is 33 passes over the TS data and **243 passes** over the
+    CS data. On a real run CS's held-out error bottomed out at step 1,000 and then climbed
+    steadily for the next nine thousand — 0.90 → 1.03, barely better than guessing —
+    while its codebook decayed from 187 words back down to 141. Every one of those steps
+    made the model worse, and without this it would have kept the wreckage.
+
+    So: we keep the BEST model we ever saw, not the last one.
+
+    entry: "ts" or "cs" — takes that entry's own step budget if it has one, because CS
+           needs far fewer than TS does.
     """
+    if steps is None and entry:
+        steps = settings.get(entry, {}).get("steps")
     steps = steps or settings["steps"]
     check_every = check_every or max(1, steps // 10)
     where = pick_device(settings)
@@ -175,6 +193,8 @@ def train(
 
     revived = 0
     running, seen = 0.0, 0
+    best, best_at, best_weights, stale = float("inf"), 0, None, 0
+
     for step in range(1, steps + 1):
         batch = _to(next(feed), where)
         out = model(batch)
@@ -213,7 +233,29 @@ def train(
             running, seen = 0.0, 0
             progress.checkpoint(step, scored, model.codebook.words)
 
+            # Keep the best model we ever saw, on days it was not trained on.
+            if scored["rebuild"] < best - 1e-4:
+                best, best_at, stale = scored["rebuild"], step, 0
+                best_weights = {k: v.detach().cpu().clone()
+                                for k, v in model.state_dict().items()}
+            else:
+                stale += 1
+                if stale >= patience:
+                    if not quiet:
+                        print(f"\n  ⏹  Stopping at step {step:,}: the held-out error has "
+                              f"not improved for {patience} checks.")
+                    break
+
     history.seconds = time.time() - started
+    history.best_step = best_at
+
+    # Hand back the BEST model, not the last one. The last one may be a wreck.
+    if best_weights is not None and best_at != history.rows[-1]["step"]:
+        model.load_state_dict(best_weights)
+        if not quiet:
+            print(f"  ↩︎  Kept the model from step {best_at:,} (held-out {best:.3f}) — "
+                  f"everything after it was worse.")
+
     progress.done(history.seconds, revived)
     return history
 
@@ -328,7 +370,7 @@ def score_predictions(world, loader, where: torch.device, limit: int = 30) -> di
 
 def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
                 revive_every: int = 50, check_every: int | None = None,
-                quiet: bool = False) -> History:
+                patience: int = 5, quiet: bool = False) -> History:
     """Train the fusion and the predictor together.
 
     The tokens are still moving while the predictor learns to name them — the codebook
@@ -357,6 +399,8 @@ def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
         print("  " + "─" * 68)
 
     revived = 0
+    best, best_at, best_weights, stale = float("inf"), 0, None, 0
+
     for step in range(1, steps + 1):
         batch = _to(next(feed), where)
         out = world(batch)
@@ -380,7 +424,30 @@ def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
                       f"{scored['candle']:>9.3f}  {scored['shrugging']:>10.3f}  "
                       f"{scored['perplexity']:>11.1f}")
 
+            # The score to keep the best on is how well it DRAWS tomorrow -- accuracy is
+            # the one the model can cheat by collapsing the codebook, so it is not safe
+            # to optimise a checkpoint against.
+            watch = scored["candle"]
+            if watch < best - 1e-4:
+                best, best_at, stale = watch, step, 0
+                best_weights = {k: v.detach().cpu().clone()
+                                for k, v in world.state_dict().items()}
+            else:
+                stale += 1
+                if stale >= patience:
+                    if not quiet:
+                        print(f"\n  ⏹  Stopping at step {step:,}: it has not drawn "
+                              f"tomorrow any better for {patience} checks.")
+                    break
+
     history.seconds = time.time() - started
+    history.best_step = best_at
+    if best_weights is not None and best_at != history.rows[-1]["step"]:
+        world.load_state_dict(best_weights)
+        if not quiet:
+            print(f"  ↩︎  Kept the model from step {best_at:,} (drew tomorrow at "
+                  f"{best:.3f}) — everything after it was worse.")
+
     if not quiet:
         print(f"\n  {history.seconds:.0f}s, {revived:,} dead words revived")
     return history

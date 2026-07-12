@@ -25,6 +25,7 @@ DEFAULTS: dict = {
         "encoder_depth": 3,
         "decoder_depth": 2,
         "batch": 256,
+        "steps": None,        # None -> use the shared `steps`
     },
     # Entry 2 — CS: what the WHOLE MARKET was doing (all stocks, on a day).
     # Only ONE grid per day, so there are ~30x fewer of them — and each is ~30x bigger
@@ -36,6 +37,11 @@ DEFAULTS: dict = {
         "encoder_depth": 3,
         "decoder_depth": 2,
         "batch": 64,
+        # ⚠️ CS has ~2,600 grids to TS's ~78,000. At batch 64, 10,000 steps is 243 passes
+        # over the same data — it overfits badly and its held-out error CLIMBS. Give it
+        # its own, much smaller budget. (Early stopping catches it either way, but there
+        # is no sense burning nine thousand steps making the model worse.)
+        "steps": 2000,
     },
     # Where the two entries merge into the single token we keep.
     # `attend_to` decides how fine-grained a menu CS offers the cross-attention:
@@ -152,6 +158,15 @@ def check(settings: dict) -> dict:
         value = out[path[0]][path[1]] if len(path) > 1 else out[path[0]]
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{_where(path)} must be a whole number of at least 1, got {value!r}.")
+
+    for entry in ("ts", "cs"):
+        budget = out[entry].get("steps")
+        if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool)
+                                   or budget < 1):
+            raise ValueError(
+                f"`{entry}['steps']` must be a whole number of at least 1, or None to use "
+                f"the shared `steps`. Got {budget!r}."
+            )
 
     for path in _VOCAB:
         value = out[path[0]][path[1]]

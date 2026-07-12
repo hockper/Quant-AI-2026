@@ -264,3 +264,104 @@ def test_a_model_that_only_knew_the_window_average_would_beat_the_weak_bar():
 
     assert mean_cost < zero_cost
     assert 1 - mean_cost / zero_cost > 0.3      # knowing only the level "explains" >30%
+
+
+# ------------------------------------------------------------- early stopping
+
+def test_it_keeps_the_BEST_model_not_the_last_one():
+    """The failure this exists for, seen on a real GPU run.
+
+    CS has ~2,600 grids to TS's ~78,000, and they shared one `steps` setting -- so 10,000
+    steps was 33 passes over the TS data and 243 over the CS data. Its held-out error
+    bottomed out at step 1,000 and then climbed for the next nine thousand (0.90 -> 1.03,
+    barely better than guessing) while its codebook decayed from 187 words to 141. Every
+    one of those steps made the model worse, and we would have kept the wreckage.
+    """
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32,
+                  heads=2, dropout=0.0)
+    loaders = _loaders(n=64)          # tiny -> it will overfit, and fast
+
+    history = train(model, loaders, _settings(), steps=400, check_every=20,
+                    patience=3, quiet=True)
+
+    frame = history.frame()
+    assert history.best_step > 0
+    assert history.best_step in frame.index
+    # the kept step must be the best one, not simply the final one
+    assert frame.loc[history.best_step, "rebuild"] == frame["rebuild"].min()
+
+    # and the model we were handed back must actually BE that one
+    scored = evaluate(model, loaders["tune"], _where())
+    assert scored["rebuild"] <= frame["rebuild"].min() + 1e-3
+
+
+def test_it_gives_up_when_the_held_out_error_stops_improving():
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32,
+                  heads=2, dropout=0.0)
+    history = train(model, _loaders(n=64), _settings(), steps=2000, check_every=20,
+                    patience=2, quiet=True)
+    assert history.rows[-1]["step"] < 2000, "it should have stopped early"
+
+
+def test_each_entry_can_have_its_own_step_budget():
+    # CS needs far fewer steps than TS, because it has far less data.
+    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+                         "steps": 500, "cs": {"steps": 40}})
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
+
+    history = train(model, _loaders(), settings, entry="cs", check_every=10,
+                    patience=99, quiet=True)
+    assert history.rows[-1]["step"] == 40         # CS's own budget, not the shared 500
+
+
+# ------------------------------------------------------------- early stopping
+
+def test_it_keeps_the_BEST_model_not_the_last_one():
+    """The failure this exists for, seen on a real GPU run.
+
+    CS has ~2,600 grids to TS's ~78,000, and they shared one `steps` setting -- so 10,000
+    steps was 33 passes over the TS data and 243 over the CS data. Its held-out error
+    bottomed out at step 1,000 and then climbed for the next nine thousand (0.90 -> 1.03,
+    barely better than guessing) while its codebook decayed from 187 words to 141. Every
+    one of those steps made the model worse, and we would have kept the wreckage.
+    """
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32,
+                  heads=2, dropout=0.0)
+    loaders = _loaders(n=64)          # tiny -> it overfits, and fast
+
+    history = train(model, loaders, _settings(), steps=300, check_every=20,
+                    patience=3, quiet=True)
+
+    frame = history.frame()
+    assert history.best_step in frame.index
+    # the step we kept must be the BEST one, not simply the final one
+    assert frame.loc[history.best_step, "rebuild"] == frame["rebuild"].min()
+
+    # ...and the model handed back must actually BE that one
+    scored = evaluate(model, loaders["tune"], _where())
+    assert scored["rebuild"] <= frame["rebuild"].min() + 1e-3
+
+
+def test_it_gives_up_when_the_held_out_error_stops_improving():
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32,
+                  heads=2, dropout=0.0)
+    history = train(model, _loaders(n=64), _settings(), steps=2000, check_every=20,
+                    patience=2, quiet=True)
+    assert history.rows[-1]["step"] < 2000, "it should have stopped early"
+
+
+def test_each_entry_can_have_its_own_step_budget():
+    # CS needs far fewer steps than TS, because it has far less data to learn from.
+    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+                         "steps": 500, "cs": {"steps": 40}})
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
+
+    history = train(model, _loaders(), settings, entry="cs", check_every=10,
+                    patience=99, quiet=True)
+    assert history.rows[-1]["step"] == 40         # CS's own budget, not the shared 500
