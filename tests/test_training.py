@@ -5,7 +5,8 @@ from torch.utils.data import DataLoader, Dataset
 
 import bubble_bi as bb
 from bubble_bi.models import VQVAE
-from bubble_bi.training import baseline_rebuild, evaluate, train, word_usage
+from bubble_bi.training import (baseline_rebuild, evaluate, pick_device, train,
+                                word_usage)
 
 
 class _Grids(Dataset):
@@ -36,15 +37,25 @@ def _settings():
     return bb.check({"tickers": ["AAA"], "learning_rate": 3e-3})
 
 
+def _where():
+    """The device the TRAINER will pick.
+
+    Never hard-code CPU here. `train()` moves the model to whatever hardware it finds,
+    so a test that then evaluates on CPU passes forever on a laptop and fails the first
+    time it meets a GPU — which is exactly what happened on Colab.
+    """
+    return pick_device(_settings())
+
+
 def test_training_actually_reduces_the_rebuild_error():
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=32, width=32,
                   heads=2, dropout=0.0)
     loaders = _loaders()
 
-    before = evaluate(model, loaders["tune"], torch.device("cpu"))["rebuild"]
+    before = evaluate(model, loaders["tune"], _where())["rebuild"]
     train(model, loaders, _settings(), steps=150, quiet=True)
-    after = evaluate(model, loaders["tune"], torch.device("cpu"))["rebuild"]
+    after = evaluate(model, loaders["tune"], _where())["rebuild"]
 
     assert after < before * 0.6, f"barely learned: {before:.3f} -> {after:.3f}"
 
@@ -71,7 +82,7 @@ def test_a_model_that_beats_guessing_is_actually_saying_something():
     loaders = _loaders()
     train(model, loaders, _settings(), steps=200, quiet=True)
 
-    scored = evaluate(model, loaders["test"], torch.device("cpu"))
+    scored = evaluate(model, loaders["test"], _where())
     guessing = baseline_rebuild(loaders["test"])
     assert scored["rebuild"] < guessing * 0.8      # the token carries real information
 
@@ -102,7 +113,7 @@ def test_evaluation_does_not_train_the_model():
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
     loaders = _loaders()
     before = model.codebook.dictionary.clone()
-    evaluate(model, loaders["test"], torch.device("cpu"))
+    evaluate(model, loaders["test"], _where())
     assert torch.equal(model.codebook.dictionary, before)
 
 
@@ -110,7 +121,7 @@ def test_the_model_is_left_in_training_mode_afterwards():
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
     loaders = _loaders()
-    evaluate(model, loaders["test"], torch.device("cpu"))
+    evaluate(model, loaders["test"], _where())
     assert model.training                          # or the next training step is a no-op
 
 
@@ -163,7 +174,7 @@ def test_the_same_class_trains_as_cs_on_the_whole_market():
     loaders = {p: DataLoader(data, batch_size=32, shuffle=(p == "learn"))
                for p in ("learn", "tune", "test")}
 
-    before = evaluate(model, loaders["tune"], torch.device("cpu"))["rebuild"]
+    before = evaluate(model, loaders["tune"], _where())["rebuild"]
     history = train(model, loaders, _settings(), steps=200, quiet=True)
     after = history.rows[-1]
 

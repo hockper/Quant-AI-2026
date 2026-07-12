@@ -66,3 +66,27 @@ def test_a_known_problem_does_not_excuse_an_unexplained_failure():
     # Without a written explanation, a failure still stops everything.
     with pytest.raises(CheckFailed):
         report("Setup", [("Torch", False, "missing")], have="nothing")
+
+
+def test_a_failure_NAMES_the_tests_that_broke(tmp_path):
+    """'2 failed' is useless — you cannot act on a count.
+
+    This happened for real: the Colab run reported '2 failed, 176 passed' and the reader
+    had no way to know WHICH two, or why.
+    """
+    (tmp_path / "test_mixed.py").write_text(
+        "def test_fine():\n    assert True\n"
+        "def test_broken_thing():\n    assert False\n"
+        "def test_other_broken_thing():\n    assert False\n"
+    )
+    passed, summary = run_tests(str(tmp_path))
+    assert passed is False
+    assert "test_broken_thing" in summary
+    assert "test_other_broken_thing" in summary
+
+
+def test_a_clean_run_stays_short(tmp_path):
+    (tmp_path / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    passed, summary = run_tests(str(tmp_path))
+    assert passed is True
+    assert summary == "1 passed"

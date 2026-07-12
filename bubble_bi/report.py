@@ -65,14 +65,30 @@ def report(title: str, checks: list[tuple[str, bool, str]], have: str,
 
 
 def run_tests(path: str = "tests") -> tuple[bool, str]:
-    """Run the project's real test suite. Returns (passed, summary)."""
+    """Run the project's real test suite. Returns (passed, summary).
+
+    On failure the summary NAMES the tests that failed. "2 failed" tells you nothing —
+    you cannot act on a count, and the whole point of a check is to be actionable.
+    """
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", path, "-q", "--no-header", "-p", "no:cacheprovider"],
+        [sys.executable, "-m", "pytest", path, "-q", "--no-header",
+         "-p", "no:cacheprovider"],
         capture_output=True,
         text=True,
     )
-    last = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-    summary = last[-1].strip() if last else "no output"
-    # pytest's tail looks like "18 passed in 1.07s" / "1 failed, 17 passed in 1.2s"
-    summary = summary.split(" in ")[0].strip()
-    return proc.returncode == 0, summary
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    tail = lines[-1].strip() if lines else "no output"
+    summary = tail.split(" in ")[0].strip()
+
+    if proc.returncode == 0:
+        return True, summary
+
+    broke = [
+        ln.split("::")[-1].split(" ")[0]
+        for ln in lines
+        if ln.startswith("FAILED") or ln.startswith("ERROR")
+    ]
+    if broke:
+        shown = ", ".join(broke[:3]) + (f", +{len(broke) - 3} more" if len(broke) > 3 else "")
+        summary = f"{summary} → {shown}"
+    return False, summary
