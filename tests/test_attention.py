@@ -140,13 +140,9 @@ def test_every_company_is_measured_not_just_the_first_few():
                          width=width, heads=2)
     cs = bb.models.VQVAE(companies=companies, days=keys, features=6, vocabulary=16,
                          width=width, heads=2)
+    fusion = {**DEFAULTS["fusion"], "vocabulary": 16, "depth": 1}
     world = bb.models.WorldModel(
-        bb.models.Tokenizer(
-            ts, cs,
-            {"model_size": width,
-             "fusion": {**DEFAULTS["fusion"], "vocabulary": 16, "depth": 1}},
-            heads=2,
-        ),
+        bb.models.Tokenizer(ts, cs, model_size=width, heads=2, **fusion),
         sentence=days, depth=1, heads=2,
     )
 

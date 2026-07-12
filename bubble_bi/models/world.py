@@ -42,21 +42,47 @@ from bubble_bi.models.llama import RMSNorm, Block
 class Tokenizer(nn.Module):
     """Two frozen encoders, a cross-attention, and one codebook. Grids in, tokens out."""
 
-    def __init__(self, ts, cs, settings: dict, heads: int = 4, dropout: float = 0.1):
+    def __init__(
+        self,
+        ts,
+        cs,
+        *,
+        vocabulary: int = 512,
+        depth: int = 2,
+        attend_to: str = "days",
+        commitment: float = 0.25,
+        diversity: float = 0.1,
+        decay: float = 0.99,
+        model_size: int = 128,
+        batch: int | None = None,
+        heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        # `batch` is not a model setting -- it belongs to the data loader that builds
+        # sentences (see data/sentences.py, which reads `settings["fusion"]["batch"]`
+        # directly). It is accepted and ignored here purely so the notebook can hand
+        # over the whole `fusion` block in one go, the same way VQVAE takes and drops
+        # `batch`/`steps` so `VQVAE(**settings["ts"])` can splat cleanly.
+        del batch
         super().__init__()
         if ts.features != cs.features:
             raise ValueError("TS and CS must have been trained on the same features.")
 
-        # Unlike VQVAE (`VQVAE(**settings["ts"])`), this one takes the whole `settings`
-        # dict rather than a splat of one block: the fusion codebook is the one that
-        # COLLAPSES to ~12 words, and it needs both `fusion` (its own knobs) AND
-        # `model_size` (which lives outside that block) to be built correctly. Splatting
-        # just `**settings["fusion"]` would lose `model_size` entirely.
-        fusion = settings["fusion"]
-
         self.ts, self.cs = ts, cs
-        self.attend_to = fusion["attend_to"]
+        self.attend_to = attend_to
         self.width = ts.read.out_features
+
+        # The fusion is built from the encoders' ACTUAL width; the codebook below is
+        # built from `model_size`, a setting typed in by hand. Today the two always
+        # match, but nothing forces them to -- and if they ever drift apart, torch would
+        # report a cryptic shape mismatch deep in the cross-attention instead of telling
+        # you which setting to fix. Say it plainly, now, while we still know why.
+        if model_size != self.width:
+            raise ValueError(
+                f"`model_size` is {model_size} but the TS/CS encoders were built "
+                f"{self.width} wide. The cross-attention needs both sides the same "
+                "width, so these must agree."
+            )
 
         # Frozen: they already learned to describe a company and a market. Letting them
         # drift now would mean re-learning what we just spent two sections teaching them.
@@ -65,13 +91,13 @@ class Tokenizer(nn.Module):
             for weight in encoder.parameters():
                 weight.requires_grad = False
 
-        self.fusion = Fusion(self.width, depth=fusion["depth"], heads=heads, dropout=dropout)
+        self.fusion = Fusion(self.width, depth=depth, heads=heads, dropout=dropout)
         self.codebook = Codebook(
-            words=fusion["vocabulary"],
-            width=settings["model_size"],
-            commitment=fusion["commitment"],
-            diversity=fusion["diversity"],
-            decay=fusion["decay"],
+            words=vocabulary,
+            width=model_size,
+            commitment=commitment,
+            diversity=diversity,
+            decay=decay,
         )
 
     @torch.no_grad()

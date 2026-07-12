@@ -146,34 +146,25 @@ def test_the_optimiser_uses_the_weight_decay_setting():
 
 
 def test_no_fusion_setting_is_decorative():
-    """The same trap as the entry blocks, but disguised: `Tokenizer.__init__` takes a
-    whole `settings` dict, not `**fusion`, so a plain `inspect.signature` diff (like the
-    one above for ts/cs) can't tell us anything -- `settings` is always in the
-    signature, read or not. So this guards it two ways instead: (1) build a Tokenizer
-    with distinctive fusion values and check they actually reached the codebook/fusion
-    modules, and (2) grep the package source for `fusion["<key>"]` for every key in
-    DEFAULTS['fusion'], so a NEW fusion setting that nothing reads still fails this test
-    even though it can't be caught by signature inspection alone.
-    """
-    import pathlib
+    """The same trap as the entry blocks. This used to need two different checks,
+    because `Tokenizer.__init__` took a whole `settings` dict rather than `**fusion` --
+    `settings` is always in the signature, read or not, so a plain `inspect.signature`
+    diff couldn't tell us anything. Now that `Tokenizer` takes the fusion block as
+    explicit keyword arguments (the same convention as `VQVAE`), the honest
+    signature-diff check used for ts/cs above works here too.
 
+    Kept alongside it: build a Tokenizer with distinctive fusion values and check they
+    actually reached the codebook/fusion modules, not just that they were accepted.
+    """
     from bubble_bi.models import VQVAE
     from bubble_bi.models.world import Tokenizer
 
     ts = VQVAE(companies=1, days=4, features=6, width=16, heads=2)
     cs = VQVAE(companies=3, days=4, features=6, width=16, heads=2)
-    settings = {
-        "model_size": 16,
-        "fusion": {
-            "vocabulary": 17,
-            "depth": 3,
-            "attend_to": "companies",
-            "commitment": 0.81,
-            "diversity": 0.62,
-            "decay": 0.53,
-        },
-    }
-    tokenizer = Tokenizer(ts, cs, settings)
+    tokenizer = Tokenizer(
+        ts, cs, model_size=16, vocabulary=17, depth=3, attend_to="companies",
+        commitment=0.81, diversity=0.62, decay=0.53,
+    )
 
     assert tokenizer.codebook.words == 17
     assert tokenizer.codebook.commitment == 0.81
@@ -182,18 +173,9 @@ def test_no_fusion_setting_is_decorative():
     assert len(tokenizer.fusion.rounds) == 3
     assert tokenizer.attend_to == "companies"
 
-    # `batch` is legitimately read elsewhere (the fusion data loader), not by Tokenizer
-    # itself -- so this scans the whole package, not just world.py. It also has to
-    # allow BOTH the local-variable form (`fusion["key"]`, world.py's own style) and
-    # the chained form (`settings["fusion"]["key"]`, which is how data/sentences.py
-    # reads `batch` straight off the settings dict without unpacking it first).
-    package_dir = pathlib.Path(__import__("bubble_bi").__file__).parent
-    source = "\n".join(p.read_text() for p in package_dir.rglob("*.py"))
-    for key in DEFAULTS["fusion"]:
-        read_as_local = f'fusion["{key}"]' in source or f"fusion['{key}']" in source
-        read_chained = (f'"fusion"]["{key}"]' in source
-                        or f"'fusion']['{key}']" in source)
-        assert read_as_local or read_chained, (
-            f"DEFAULTS['fusion'][{key!r}] is never read anywhere as fusion[{key!r}] -- "
-            "a setting nothing reads is a lie."
-        )
+    accepted = set(inspect.signature(Tokenizer.__init__).parameters)
+    unread = set(DEFAULTS["fusion"]) - accepted
+    assert not unread, (
+        f"DEFAULTS['fusion'] contains settings Tokenizer never reads: {sorted(unread)}. "
+        "Either wire them up or delete them -- a setting that does nothing is a lie."
+    )
