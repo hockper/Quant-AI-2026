@@ -89,7 +89,11 @@ def evaluate(model, loader, where: torch.device, limit: int = 40) -> dict:
     which makes the number mean something on its own, without another run to compare
     against.
     """
-    model.eval()
+    # Move the model to where we were asked to work. `train()` already does this, so a
+    # model that has been trained is on the GPU and one that has not is still on the CPU
+    # -- and a caller should not have to know which. Assuming it was already in the right
+    # place is what broke every one of these on Colab while passing forever on a laptop.
+    model.to(where).eval()
     total, guessing, batches, chosen = 0.0, 0.0, 0, []
 
     for i, batch in enumerate(loader):
@@ -265,7 +269,7 @@ def score_predictions(world, loader, where: torch.device, limit: int = 30) -> di
                   usually still right today. A predictor that cannot beat persistence
                   has learned nothing worth having, however good its accuracy looks.
     """
-    world.eval()
+    world.to(where).eval()
     right = sticky = seen = 0
     perplexity, drawing, shrugging, batches = 0.0, 0.0, 0.0, 0
 

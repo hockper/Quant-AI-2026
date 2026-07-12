@@ -110,11 +110,27 @@ def test_history_records_what_actually_happened():
 def test_evaluation_does_not_train_the_model():
     # eval must not move the dictionary, or every "held out" score is a lie.
     torch.manual_seed(0)
-    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32,
+                  heads=2).to(_where())
     loaders = _loaders()
-    before = model.codebook.dictionary.clone()
+    before = model.codebook.dictionary.clone()          # cloned ON the device
     evaluate(model, loaders["test"], _where())
     assert torch.equal(model.codebook.dictionary, before)
+
+
+def test_evaluate_takes_the_model_to_the_device_it_was_given():
+    """The bug that only ever showed up on Colab.
+
+    `train()` moves the model to the GPU. `evaluate()` used to assume the model was
+    already wherever you asked it to work — so evaluating an UNTRAINED model on a GPU
+    machine left the weights on the CPU and the data on CUDA. On a laptop the two are
+    always the same place and it passed forever.
+    """
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
+    assert next(model.parameters()).device.type == "cpu"      # fresh, still on the CPU
+
+    evaluate(model, _loaders()["test"], _where())
+    assert next(model.parameters()).device.type == _where().type
 
 
 def test_the_model_is_left_in_training_mode_afterwards():
