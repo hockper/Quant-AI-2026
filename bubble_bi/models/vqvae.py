@@ -104,8 +104,16 @@ class VQVAE(nn.Module):
         nn.init.normal_(self.summary_slot, std=0.02)
 
     # ------------------------------------------------------------------ encode
-    def summarise(self, grid: torch.Tensor, present: torch.Tensor | None = None) -> torch.Tensor:
-        """Boil a grid [B, companies, days, features] down to one vector [B, width]."""
+    def read_grid(self, grid: torch.Tensor, present: torch.Tensor | None = None):
+        """Encode a grid. Returns (summary, cells).
+
+            summary  [B, width]                     the one vector the codebook quantises
+            cells    [B, companies, days, width]    every cell, having seen all the others
+
+        `cells` is what the fusion attends over, once this model's codebook and decoder
+        have been thrown away. Pooling it all the way down to `summary` would discard
+        exactly the detail cross-attention needs.
+        """
         b, c, d, f = grid.shape
         if (c, d, f) != (self.companies, self.days, self.features):
             raise ValueError(
@@ -127,7 +135,53 @@ class VQVAE(nn.Module):
             ignore = torch.cat([keep_summary, missing], dim=1)
 
         read = self.encoder(cells, src_key_padding_mask=ignore)
-        return read[:, 0]                                   # the summary slot
+        return read[:, 0], read[:, 1:].reshape(b, c, d, -1)
+
+    def summarise(self, grid: torch.Tensor, present: torch.Tensor | None = None) -> torch.Tensor:
+        """Boil a grid [B, companies, days, features] down to one vector [B, width]."""
+        return self.read_grid(grid, present)[0]
+
+    def context(self, grid: torch.Tensor, present: torch.Tensor | None = None,
+                how: str = "days") -> torch.Tensor:
+        """What CS hands the fusion to attend over: [B, keys, width].
+
+        The number of keys is a free choice — cross-attention's output length is set by
+        the QUERY, not the keys. The keys are simply the menu the company chooses from,
+        and this decides how fine-grained that menu is:
+
+            "days"       one vector per market day        (5 keys) -- what the paper does:
+                         its CS patch is "all stocks on a single trading day"
+            "companies"  one vector per company           (30 keys) -- lets a bank attend
+                         to other banks
+            "cells"      every (company, day)             (150 keys) -- richest: a specific
+                         peer on a specific day
+
+        A single vector would be a NO-OP: softmax over one key is identically 1.0, so
+        every company would receive the same market vector and the attention would learn
+        nothing. That is why there is no "one summary" option here.
+
+        Cost is linear in the number of keys (our query is a single vector), so even
+        "cells" is cheap. Start with "days"; widen it when tuning.
+
+        Companies that did not trade are left out of the averages, not counted as zeros.
+        """
+        if how not in ("days", "companies", "cells"):
+            raise ValueError(
+                f"`attend_to` must be 'days', 'companies' or 'cells' — got {how!r}."
+            )
+
+        _, cells = self.read_grid(grid, present)                 # [B, C, D, W]
+        b, c, d, w = cells.shape
+
+        if how == "cells":
+            return cells.reshape(b, c * d, w)
+        if how == "companies":                  # average over DAYS -> one per company
+            return cells.mean(dim=2)
+
+        if present is None:                     # "days": average over COMPANIES
+            return cells.mean(dim=1)
+        weight = present.to(cells.dtype).unsqueeze(-1).unsqueeze(-1)     # [B, C, 1, 1]
+        return (cells * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
 
     def rebuild(self, word: torch.Tensor) -> torch.Tensor:
         """Reconstruct the whole grid from a single vector [B, width]."""

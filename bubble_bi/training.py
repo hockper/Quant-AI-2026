@@ -159,7 +159,8 @@ def train(
         if step % revive_every == 0:
             revived += model.codebook.revive_dead_words(out["summary"].detach())
 
-        progress.tick(step, float(out["rebuild_loss"]), float(out["perplexity"]))
+        progress.tick(step, float(out["rebuild_loss"].detach()),
+                      float(out["perplexity"].detach()))
 
         if step % check_every == 0 or step == steps:
             scored = evaluate(model, loaders["tune"], where)

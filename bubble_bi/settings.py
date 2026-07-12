@@ -38,9 +38,16 @@ DEFAULTS: dict = {
         "batch": 64,
     },
     # Where the two entries merge into the single token we keep.
+    # `attend_to` decides how fine-grained a menu CS offers the cross-attention:
+    #   "days"       one vector per market day   (5 keys)  -- what the paper does
+    #   "companies"  one vector per company      (30 keys) -- a bank can attend to banks
+    #   "cells"      every (company, day)        (150 keys) -- richest, still cheap
+    # The output is ONE vector either way: cross-attention's length follows the QUERY.
     "fusion": {
         "vocabulary": 512,
         "depth": 2,
+        "attend_to": "days",
+        "batch": 32,
     },
     # The GPT that reads sentences of tokens.
     "predictor": {
@@ -73,7 +80,7 @@ DEFAULTS: dict = {
 _POSITIVE = {
     ("ts", "days"), ("ts", "encoder_depth"), ("ts", "decoder_depth"), ("ts", "batch"),
     ("cs", "days"), ("cs", "encoder_depth"), ("cs", "decoder_depth"), ("cs", "batch"),
-    ("fusion", "depth"),
+    ("fusion", "depth"), ("fusion", "batch"),
     ("predictor", "sentence_length"), ("predictor", "depth"),
     ("model_size",), ("steps",),
 }
@@ -127,6 +134,14 @@ def check(settings: dict) -> dict:
         value = out[path[0]][path[1]]
         if not isinstance(value, int) or isinstance(value, bool) or value < 2:
             raise ValueError(f"{_where(path)} must be at least 2, got {value!r}.")
+
+    attend = out["fusion"]["attend_to"]
+    if attend not in ("days", "companies", "cells"):
+        raise ValueError(
+            f"`fusion['attend_to']` must be 'days', 'companies' or 'cells' — "
+            f"got {attend!r}. It decides how fine-grained a menu the market offers "
+            "each company's token to read."
+        )
 
     if out["learning_rate"] <= 0:
         raise ValueError(f"`learning_rate` must be above 0, got {out['learning_rate']!r}.")
