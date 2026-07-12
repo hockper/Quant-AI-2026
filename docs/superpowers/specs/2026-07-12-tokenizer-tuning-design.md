@@ -226,6 +226,12 @@ and it is the price of a 12-trial budget. Two mitigations: Stage B's winner is c
 head-to-head at full budget (Part 2), and raising `trials` narrows the gap without any
 code change.
 
+**Built generic, on purpose.** The fusion + predictor search comes next, and it must be a
+new *objective and space* — not a second implementation. So `bb.tuning` takes the scoring
+function as an argument, and everything around it is shared: the trial table, the pruner,
+the collapse guard, the resume-to-Drive, the head-to-head confirm, and `tuned.json`. This
+spec supplies one scorer (`score_tokenizer`); the next spec supplies another.
+
 **Engine:** Optuna. TPE sampler + `MedianPruner`, study persisted to a SQLite file under
 `data_dir` (= Drive on Colab) **after every trial**, so a disconnect costs one trial and
 not the session. Optuna is pure Python with no torch dependency — it cannot replace
