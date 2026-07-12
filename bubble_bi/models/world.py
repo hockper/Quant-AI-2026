@@ -42,15 +42,20 @@ from bubble_bi.models.llama import RMSNorm, Block
 class Tokenizer(nn.Module):
     """Two frozen encoders, a cross-attention, and one codebook. Grids in, tokens out."""
 
-    def __init__(self, ts, cs, vocabulary: int = 512, depth: int = 2, heads: int = 4,
-                 dropout: float = 0.1, attend_to: str = "days",
-                 commitment: float = 1.0, diversity: float = 0.1):
+    def __init__(self, ts, cs, settings: dict, heads: int = 4, dropout: float = 0.1):
         super().__init__()
         if ts.features != cs.features:
             raise ValueError("TS and CS must have been trained on the same features.")
 
+        # Unlike VQVAE (`VQVAE(**settings["ts"])`), this one takes the whole `settings`
+        # dict rather than a splat of one block: the fusion codebook is the one that
+        # COLLAPSES to ~12 words, and it needs both `fusion` (its own knobs) AND
+        # `model_size` (which lives outside that block) to be built correctly. Splatting
+        # just `**settings["fusion"]` would lose `model_size` entirely.
+        fusion = settings["fusion"]
+
         self.ts, self.cs = ts, cs
-        self.attend_to = attend_to
+        self.attend_to = fusion["attend_to"]
         self.width = ts.read.out_features
 
         # Frozen: they already learned to describe a company and a market. Letting them
@@ -60,9 +65,14 @@ class Tokenizer(nn.Module):
             for weight in encoder.parameters():
                 weight.requires_grad = False
 
-        self.fusion = Fusion(self.width, depth=depth, heads=heads, dropout=dropout)
-        self.codebook = Codebook(words=vocabulary, width=self.width,
-                                 commitment=commitment, diversity=diversity)
+        self.fusion = Fusion(self.width, depth=fusion["depth"], heads=heads, dropout=dropout)
+        self.codebook = Codebook(
+            words=fusion["vocabulary"],
+            width=settings["model_size"],
+            commitment=fusion["commitment"],
+            diversity=fusion["diversity"],
+            decay=fusion["decay"],
+        )
 
     @torch.no_grad()
     def look(self, stock_grid: torch.Tensor, market_grid: torch.Tensor,
@@ -135,16 +145,20 @@ class WorldModel(nn.Module):
 
     def __init__(self, tokenizer: Tokenizer, sentence: int = 64, depth: int = 4,
                  heads: int = 4, kv_heads: int | None = None, theta: float = 10000.0,
-                 dropout: float = 0.0, candle_weight: float = 1.0,
-                 naming_weight: float = 0.1):
+                 dropout: float = 0.0, candle: float = 1.0,
+                 naming: float = 0.1):
         super().__init__()
         self.tokenizer = tokenizer
         self.sentence = sentence
         self.words = tokenizer.codebook.words
-        self.candle_weight = candle_weight
+        # Parameters are named `candle`/`naming` (not `candle_weight`/`naming_weight`) so
+        # `WorldModel(..., **settings["loss"])` can splat cleanly, the same way
+        # `VQVAE(**settings["ts"])` already does. The attributes below keep their old,
+        # more descriptive names -- nothing downstream needs to change because of this.
+        self.candle_weight = candle
         # Deliberately small by default. See the `loss` block in settings: this is the
         # weight that rewards cheating, and turning it up collapses the codebook.
-        self.naming_weight = naming_weight
+        self.naming_weight = naming
         width = tokenizer.width
 
         self.blocks = nn.ModuleList(

@@ -119,3 +119,81 @@ def test_commitment_defaults_to_the_literature_value():
     assert DEFAULTS["ts"]["commitment"] == 0.25
     assert DEFAULTS["cs"]["commitment"] == 0.25
     assert VQVAE(companies=1, days=4, features=6, width=16).codebook.commitment == 0.25
+
+
+def test_no_loss_weight_is_decorative():
+    """Same disease as the entry blocks: the predictor's weights must reach the predictor."""
+    from bubble_bi.models.world import WorldModel
+
+    accepted = set(inspect.signature(WorldModel.__init__).parameters)
+    unread = set(DEFAULTS["loss"]) - accepted
+    assert not unread, (
+        f"SETTINGS['loss'] contains weights WorldModel never reads: {sorted(unread)}."
+    )
+
+
+def test_the_optimiser_uses_the_weight_decay_setting():
+    """It was hardcoded to 0.01 while STORM uses 0.05, and no setting existed at all."""
+    import inspect as _inspect
+
+    from bubble_bi import training
+
+    source = _inspect.getsource(training)
+    assert "weight_decay=0.01" not in source, (
+        "training.py still hardcodes weight_decay=0.01 — it must come from settings."
+    )
+    assert DEFAULTS["weight_decay"] == 0.05
+
+
+def test_no_fusion_setting_is_decorative():
+    """The same trap as the entry blocks, but disguised: `Tokenizer.__init__` takes a
+    whole `settings` dict, not `**fusion`, so a plain `inspect.signature` diff (like the
+    one above for ts/cs) can't tell us anything -- `settings` is always in the
+    signature, read or not. So this guards it two ways instead: (1) build a Tokenizer
+    with distinctive fusion values and check they actually reached the codebook/fusion
+    modules, and (2) grep the package source for `fusion["<key>"]` for every key in
+    DEFAULTS['fusion'], so a NEW fusion setting that nothing reads still fails this test
+    even though it can't be caught by signature inspection alone.
+    """
+    import pathlib
+
+    from bubble_bi.models import VQVAE
+    from bubble_bi.models.world import Tokenizer
+
+    ts = VQVAE(companies=1, days=4, features=6, width=16, heads=2)
+    cs = VQVAE(companies=3, days=4, features=6, width=16, heads=2)
+    settings = {
+        "model_size": 16,
+        "fusion": {
+            "vocabulary": 17,
+            "depth": 3,
+            "attend_to": "companies",
+            "commitment": 0.81,
+            "diversity": 0.62,
+            "decay": 0.53,
+        },
+    }
+    tokenizer = Tokenizer(ts, cs, settings)
+
+    assert tokenizer.codebook.words == 17
+    assert tokenizer.codebook.commitment == 0.81
+    assert tokenizer.codebook.diversity == 0.62
+    assert tokenizer.codebook.decay == 0.53
+    assert len(tokenizer.fusion.rounds) == 3
+    assert tokenizer.attend_to == "companies"
+
+    # `batch` is legitimately read elsewhere (the fusion data loader), not by Tokenizer
+    # itself -- so this scans the whole package, not just world.py. It also has to
+    # allow BOTH the local-variable form (`fusion["key"]`, world.py's own style) and
+    # the chained form (`settings["fusion"]["key"]`, which is how data/sentences.py
+    # reads `batch` straight off the settings dict without unpacking it first).
+    package_dir = pathlib.Path(__import__("bubble_bi").__file__).parent
+    source = "\n".join(p.read_text() for p in package_dir.rglob("*.py"))
+    for key in DEFAULTS["fusion"]:
+        read_as_local = f'fusion["{key}"]' in source or f"fusion['{key}']" in source
+        read_chained = (f'"fusion"]["{key}"]' in source
+                        or f"'fusion']['{key}']" in source)
+        assert read_as_local or read_chained, (
+            f"DEFAULTS['fusion'][{key!r}] is never read anywhere as fusion[{key!r}] -- "
+            "a setting nothing reads is a lie."
+        )

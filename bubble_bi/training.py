@@ -182,7 +182,8 @@ def train(
     model.to(where).train()
 
     optimiser = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=0.01
+        model.parameters(), lr=settings["learning_rate"],
+        weight_decay=settings["weight_decay"],
     )
     feed = cycle(loaders["learn"])
     history = History()
@@ -386,7 +387,7 @@ def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
 
     learnable = [p for p in world.parameters() if p.requires_grad]
     optimiser = torch.optim.AdamW(learnable, lr=settings["learning_rate"],
-                                  weight_decay=0.01)
+                                  weight_decay=settings["weight_decay"])
     feed = cycle(loaders["learn"])
     history = History()
     started = time.time()
