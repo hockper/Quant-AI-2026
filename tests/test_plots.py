@@ -95,9 +95,35 @@ def test_the_kept_and_lost_chart_names_every_feature(world):
     assert sorted(labels) == sorted(bb.data.names())
 
 
-def test_the_progress_chart_shows_both_numbers_that_matter(world):
+def test_the_progress_chart_shows_the_three_numbers_that_matter(world):
     *_, history = world
     fig = bb.plots.progress(history, "TS")
-    left, right = fig.axes
-    assert "rebuild" in left.get_title(loc="left")
-    assert "perplexity" in right.get_title(loc="left")
+    loss, ppl, used = fig.axes
+    assert "rebuild" in loss.get_title(loc="left")
+    assert "perplexity" in ppl.get_title(loc="left")
+    assert "vocabulary" in used.get_title(loc="left")
+
+
+def test_the_loss_chart_shows_learning_AND_held_out_so_overfitting_is_visible(world):
+    """A loss curve with only one line cannot tell you the model is memorising."""
+    *_, history = world
+    labels = [line.get_label() for line in bb.plots.progress(history, "TS").axes[0].lines]
+    assert any("learns from" in l for l in labels)
+    assert any("never seen" in l for l in labels)
+    assert any("guessing" in l for l in labels)
+
+
+def test_progress_survives_a_model_that_was_loaded_rather_than_trained():
+    assert bb.plots.progress(None, "TS") is None
+
+
+def test_the_family_breakdown_shows_what_the_headline_average_is_hiding(world):
+    """'explains 44%' is an average over 26 features, carried by the easy ones. Broken
+    apart it says something quite different — and that is the number worth reporting."""
+    model, batches, _, settings, _ = world
+    fig, frame = bb.plots.kept_by_family(model, batches, settings, examples=48)
+
+    assert sorted(frame.index) == sorted(bb.data.FAMILIES)
+    assert "average" in fig.axes[0].get_title(loc="left")
+    # every family gets a number, and they are not all the same
+    assert frame.notna().all()

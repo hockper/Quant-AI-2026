@@ -162,6 +162,7 @@ def train(
                          describe_device(where), enabled=not quiet)
 
     revived = 0
+    running, seen = 0.0, 0
     for step in range(1, steps + 1):
         batch = _to(next(feed), where)
         out = model(batch)
@@ -176,19 +177,26 @@ def train(
         if step % revive_every == 0:
             revived += model.codebook.revive_dead_words(out["summary"].detach())
 
-        progress.tick(step, float(out["rebuild_loss"].detach()),
-                      float(out["perplexity"].detach()))
+        here = float(out["rebuild_loss"].detach())
+        running += here
+        seen += 1
+        progress.tick(step, here, float(out["perplexity"].detach()))
 
         if step % check_every == 0 or step == steps:
             scored = evaluate(model, loaders["tune"], where)
             history.add(
                 step=step,
+                # what it scores on the days it is LEARNING from...
+                learning=running / max(seen, 1),
+                # ...against the days it has never seen. If these two part company, it
+                # is memorising rather than learning.
                 rebuild=scored["rebuild"],
                 guessing=scored["guessing"],
                 perplexity=scored["perplexity"],
                 words_used=scored["words_used"],
                 revived=revived,
             )
+            running, seen = 0.0, 0
             progress.checkpoint(step, scored, model.codebook.words)
 
     history.seconds = time.time() - started

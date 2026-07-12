@@ -237,38 +237,120 @@ def predicted_candles(world, book, batches, prices: pd.DataFrame, settings: dict
 
 
 def progress(history, title: str = "TS"):
-    """The two numbers that matter, over the course of training.
+    """The loss curves, and the number that says whether the words mean anything.
+
+    Three things, and you need all three:
+
+      LOSS       what it scores on the days it is learning from, against days it has
+                 never seen. If the two part company, it is memorising, not learning.
+      PERPLEXITY how many words are actually in use. A loss can fall beautifully while
+                 the dictionary collapses to nothing -- this is what exposes that.
+      WORDS      how many of the 512 ever get chosen at all.
 
     Returns None if there is no history — which happens when the model was LOADED from
-    disk rather than trained in this session. There is nothing to plot, and that is
-    fine.
+    disk rather than trained in this session.
     """
     import matplotlib.pyplot as plt
 
     if history is None or not history.rows:
         print(f"({title} was loaded from disk — no training history to plot.)")
         return None
+
     frame = history.frame()
-    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 3.6))
+    words = frame["words_used"].max()
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.7))
+    loss, ppl, used = axes
 
-    left.plot(frame.index, frame["rebuild"], color="#1e88e5", marker="o", markersize=3)
-    left.axhline(frame["guessing"].iloc[-1], color="#ef5350", linestyle="--",
+    if "learning" in frame:
+        loss.plot(frame.index, frame["learning"], color="#90a4ae", linewidth=1.4,
+                  label="on the days it learns from")
+    loss.plot(frame.index, frame["rebuild"], color="#1e88e5", marker="o", markersize=3,
+              label="on days it has never seen")
+    loss.axhline(frame["guessing"].iloc[-1], color="#ef5350", linestyle="--",
                  linewidth=1, label="just guessing the average")
-    left.set_title(f"{title} — rebuild error", loc="left", fontsize=11)
-    left.set_xlabel("step")
-    left.legend(fontsize=8, frameon=False)
+    loss.set_title(f"{title} — rebuild error", loc="left", fontsize=11)
+    loss.set_xlabel("step")
+    loss.legend(fontsize=8, frameon=False)
 
-    right.plot(frame.index, frame["perplexity"], color="#26a69a", marker="o",
-               markersize=3)
-    right.axhline(1, color="#ef5350", linestyle="--", linewidth=1,
-                  label="collapsed to one word")
-    right.set_title(f"{title} — words in use (perplexity)", loc="left", fontsize=11)
-    right.set_xlabel("step")
-    right.legend(fontsize=8, frameon=False)
+    ppl.plot(frame.index, frame["perplexity"], color="#26a69a", marker="o", markersize=3)
+    ppl.axhline(1, color="#ef5350", linestyle="--", linewidth=1,
+                label="collapsed to one word")
+    ppl.set_title(f"{title} — words in use (perplexity)", loc="left", fontsize=11)
+    ppl.set_xlabel("step")
+    ppl.legend(fontsize=8, frameon=False)
 
-    for ax in (left, right):
+    used.plot(frame.index, frame["words_used"], color="#7e57c2", marker="o", markersize=3)
+    used.set_title(f"{title} — vocabulary reached", loc="left", fontsize=11)
+    used.set_xlabel("step")
+    used.set_ylabel("words ever chosen")
+
+    for ax in axes:
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
         ax.grid(alpha=0.25, linewidth=0.5)
+    del words
     fig.tight_layout()
     return fig
+
+
+def kept_by_family(model, batches, settings: dict, examples: int = 600):
+    """How much of each FAMILY of features survived — the honest headline.
+
+    "The token explains 44% of a held-out day" is an average over 26 features, and it is
+    carried entirely by the easy ones. Broken apart, it says something quite different:
+    the token keeps the slow, smooth indicators almost perfectly and knows next to
+    nothing about the actual candle.
+
+    That is not a bug. One token is 9 bits (log2 of 512). Fifteen days of MACD is a
+    SMOOTH CURVE — a few numbers describe it. Fifteen days of candle bodies are fifteen
+    INDEPENDENT RANDOM NUMBERS — incompressible. The token spends its 9 bits on what can
+    actually be compressed, and there is no way for it not to.
+    """
+    import matplotlib.pyplot as plt
+
+    from bubble_bi.data.features import FAMILIES
+
+    grids = batches.ts["test"].dataset
+    names = batches.arrays.names
+    where = next(model.parameters()).device
+
+    real, said = [], []
+    model.eval()
+    with torch.no_grad():
+        for i in range(min(examples, len(grids))):
+            grid = grids[i]["grid"].unsqueeze(0).to(where)
+            back = model.rebuild(model.codebook(model.summarise(grid))["snapped"])
+            real.append(grid[0, 0].cpu().numpy())
+            said.append(back[0, 0].cpu().numpy())
+    model.train()
+
+    real, said = np.stack(real), np.stack(said)
+    kept = 1 - ((real - said) ** 2).mean(axis=(0, 1)) / np.maximum(
+        (real ** 2).mean(axis=(0, 1)), 1e-9)
+
+    # Which feature belongs to which family — ask each family what it produces.
+    import pandas as pd
+
+    fake = pd.DataFrame(
+        {c: np.linspace(1, 2, 400) for c in ("open", "high", "low", "close", "volume")},
+        index=pd.date_range("2020-01-01", periods=400, freq="B"),
+    )
+    kept_by = {
+        family: float(np.mean([kept[names.index(n)] for n in module.build(fake, settings)]))
+        for family, module in FAMILIES.items()
+    }
+    frame = pd.Series(kept_by).sort_values()
+
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    colours = ["#26a69a" if v > 0.5 else "#ffa726" if v > 0.2 else "#ef5350"
+               for v in frame]
+    ax.barh(frame.index, frame.to_numpy() * 100, color=colours)
+    ax.set_xlabel("how much of this FAMILY the single word kept (%)")
+    ax.set_title("The 44% is an average — here is what it is made of",
+                 loc="left", fontsize=12)
+    ax.axvline(0, color="#444", linewidth=0.8)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.grid(axis="x", alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    return fig, frame

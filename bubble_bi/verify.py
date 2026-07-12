@@ -320,6 +320,10 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         On days it has never seen, that word explains {explained:.0%} of what was
         happening.{f" Perplexity went {start:.0f} → {perplexity:.0f} during training."
                     if rows else ""}
+
+        ⚠️ That {explained:.0%} is an AVERAGE over every feature, and it is carried by the
+        easy ones. Run bb.plots.kept_by_family() before you believe it: the token keeps
+        the slow indicators almost perfectly and knows next to nothing about the candle.
         """,
     )
     if explained < 0.25:
