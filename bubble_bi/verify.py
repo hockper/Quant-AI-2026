@@ -277,26 +277,27 @@ def tensors(batches, ts, cs, settings: dict) -> None:
 
 
 def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
-    """Section 7: the model learned something, and its dictionary did not collapse."""
-    from bubble_bi.training import baseline_rebuild, evaluate, pick_device
+    """Section 7/9: the model learned something — measured against a bar that HURTS."""
+    from bubble_bi.training import evaluate, pick_device
 
-    where = pick_device(settings)
-    scored = evaluate(model, loaders["test"], where)     # never seen, not once
-    guessing = baseline_rebuild(loaders["test"])
+    scored = evaluate(model, loaders["test"], pick_device(settings))     # never seen
     words = model.codebook.words
 
-    explained = 1 - scored["rebuild"] / max(guessing, 1e-9)
+    token = scored["rebuild"]
+    flat = scored["guessing"]           # predict zero. A WEAK bar.
+    level = scored["window_mean"]       # predict this window's own average. THE bar.
+    last = scored["last_day"]           # repeat the final day. Flatters us — measured.
+
     perplexity = scored["perplexity"]
-    # `history` is None when the model was LOADED rather than trained this session.
     rows = history.rows if history is not None else []
-    start = rows[0]["perplexity"] if rows else float("nan")
+    start_ppl = rows[0]["perplexity"] if rows else float("nan")
     squeeze = model.companies * model.days * model.features
 
-    # These two are the only things that mean the model is BROKEN, as opposed to
-    # merely undertrained or facing a hard job. Anything stricter would halt the
-    # notebook on a short run, which is worse than useless.
-    learned = scored["rebuild"] < guessing            # it beat doing nothing at all
-    alive = perplexity > 2                            # not everything got one word
+    # Against the weak bar the token looks fine. Against the bar that matters it may not.
+    # Report both, and FAIL on the one that matters -- otherwise the notebook is simply
+    # flattering itself, which is the whole thing we are trying not to do.
+    beats_level = token < level
+    alive = perplexity > 2
 
     health = (
         "healthy" if perplexity > words * 0.3
@@ -307,34 +308,41 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
     report(
         f"{name} trained",
         [
-            ("Beat doing nothing", learned,
-             f"{scored['rebuild']:.2f} vs {guessing:.2f} for guessing the average"),
             ("Dictionary did not collapse", alive,
              f"perplexity {perplexity:.0f} of {words} — {health}"),
-            ("Vocabulary in use", True,
-             f"{scored['words_used']} of {words} words"),
-            ("Scored on unseen days", True, "the test period, never trained on"),
+            ("Vocabulary in use", True, f"{scored['words_used']} of {words} words"),
+            ("Beats the long-run average", token < flat,
+             f"{token:.2f} vs {flat:.2f}  → explains {1 - token / max(flat, 1e-9):.0%}"
+             "   ⚠️ a WEAK bar"),
+            ("Beats THIS WINDOW's own average", beats_level,
+             f"{token:.2f} vs {level:.2f}  → "
+             f"{'explains ' + format(1 - token / max(level, 1e-9), '.0%') if beats_level else 'LOSES. This is the bar that matters.'}"),
+            ("(repeating the last day scores)", True,
+             f"{last:.2f} — worse than predicting zero, so it FLATTERS us. Ignore it."),
         ],
         have=f"""
         A tokenizer that squeezes {squeeze:,} numbers into ONE word out of {words}.
-        On days it has never seen, that word explains {explained:.0%} of what was
-        happening.{f" Perplexity went {start:.0f} → {perplexity:.0f} during training."
-                    if rows else ""}
-
-        ⚠️ That {explained:.0%} is an AVERAGE over every feature, and it is carried by the
-        easy ones. Run bb.plots.kept_by_family() before you believe it: the token keeps
-        the slow indicators almost perfectly and knows next to nothing about the candle.
+        {f"Perplexity went {start_ppl:.0f} → {perplexity:.0f} during training." if rows else ""}
+        Judge it on the window-mean bar, never on the long-run one.
+        Run bb.plots.kept_by_family() to see WHAT it kept — the headline is an average,
+        and it is carried by the easy features.
         """,
+        known_problem=(
+            "The token LOSES to simply predicting the average of the window it is "
+            "describing. The reconstruction objective is not producing a token worth "
+            "having.\n     See docs/DECISION-let-the-model-choose.md."
+        ) if not beats_level else None,
     )
-    if explained < 0.25:
-        print(f"\n  ℹ️  {explained:.0%} is low — and for {name} that is expected, not a bug.")
-        print(f"     One word is being asked to carry {squeeze:,} numbers. The harder the")
-        print("     squeeze, the less survives. What matters next is not this number but")
-        print("     whether the ENCODER learned something useful — which the fusion will use.")
+
+    if not beats_level:
+        print(f"\n  ⚠️  A baseline that knows NOTHING except the average of these "
+              f"{model.days} days")
+        print(f"     scores {level:.2f}. The token scores {token:.2f}. It is worse.")
+        print("     Every '% explained' figure against the long-run average was measured")
+        print("     against a bar so low that knowing one number per feature would clear it.")
     if perplexity < words * 0.3 and rows:
-        print(f"\n  ⏱️  Short run: {rows[-1]['step']:,} steps in "
-              f"{history.seconds:.0f}s. Perplexity is still climbing —")
-        print("     train for longer on a GPU before reading anything into these numbers.")
+        print(f"\n  ⏱️  Short run: {rows[-1]['step']:,} steps in {history.seconds:.0f}s.")
+        print("     Train for longer on a GPU before reading anything into these numbers.")
 
 
 def predictor(world, history, loaders, settings: dict) -> None:

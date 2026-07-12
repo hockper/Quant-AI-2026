@@ -77,40 +77,49 @@ class History:
 
 @torch.no_grad()
 def evaluate(model, loader, where: torch.device, limit: int = 40) -> dict:
-    """How well does the model rebuild grids it has never seen?
+    """How well does the token rebuild a window it has never seen?
 
-    `rebuild` is scored against a deliberately stupid baseline: guessing the average
-    for everything. Because every feature was normalised to an average of 0 and a
-    spread of 1, that baseline scores almost exactly 1.0. So:
+    Against THREE floors, because a single one lets you fool yourself.
 
-        rebuild = 1.0   the token told us NOTHING
-        rebuild = 0.4   the token captured 60% of what was happening
+      long-run average   Predict zero everywhere. The features are normalised, so zero IS
+                         the long-run average. ⚠️ A WEAK BAR: a token that knew nothing
+                         but "this window sits above its usual level" would already beat
+                         it. This is the bar we used to report against, and it flattered
+                         us badly.
 
-    which makes the number mean something on its own, without another run to compare
-    against.
+      the window's own   Predict the average of THIS window — one number per feature.
+      average            ⚠️ THIS IS THE BAR THAT MATTERS. It hands the model the level for
+                         free and asks whether it knows anything about the SHAPE inside
+                         the window. Measured: our token LOSES to it.
+
+      repeat the last    Predict every day as a copy of the final day. Intuitive — but
+      day                measured, it is WORSE than predicting zero, because one day is a
+                         noisy sample. So it FLATTERS the model. It is reported only so
+                         that nobody is tempted to headline it.
     """
-    # Move the model to where we were asked to work. `train()` already does this, so a
-    # model that has been trained is on the GPU and one that has not is still on the CPU
-    # -- and a caller should not have to know which. Assuming it was already in the right
-    # place is what broke every one of these on Colab while passing forever on a laptop.
     model.to(where).eval()
-    total, guessing, batches, chosen = 0.0, 0.0, 0, []
+    token = flat = level = last = 0.0
+    batches, chosen = 0, []
 
     for i, batch in enumerate(loader):
         if i >= limit:
             break
         batch = _to(batch, where)
         out = model(batch)
-        total += float(out["rebuild_loss"])
+        token += float(out["rebuild_loss"])
 
-        # the "just guess the average" baseline, on this same batch
-        grid = batch["grid"]
+        grid = batch["grid"]                                     # [B, C, days, F]
         present = batch.get("present")
-        if present is not None:
-            w = present.unsqueeze(-1).unsqueeze(-1).to(grid.dtype)
-            guessing += float((grid.pow(2) * w).sum() / w.expand_as(grid).sum().clamp(min=1))
-        else:
-            guessing += float(grid.pow(2).mean())
+        weight = (present.unsqueeze(-1).unsqueeze(-1).to(grid.dtype).expand_as(grid)
+                  if present is not None else torch.ones_like(grid))
+        total = weight.sum().clamp(min=1)
+
+        def cost(guess):
+            return float((((grid - guess) ** 2) * weight).sum() / total)
+
+        flat += cost(torch.zeros_like(grid))              # the long-run average
+        level += cost(grid.mean(dim=2, keepdim=True))     # THIS window's own average
+        last += cost(grid[:, :, -1:, :])                  # the final day, repeated
 
         chosen.append(out["ids"].cpu())
         batches += 1
@@ -118,6 +127,7 @@ def evaluate(model, loader, where: torch.device, limit: int = 40) -> dict:
     model.train()
     if not batches:
         return {"rebuild": float("nan"), "guessing": float("nan"),
+                "window_mean": float("nan"), "last_day": float("nan"),
                 "perplexity": 0.0, "words_used": 0}
 
     ids = torch.cat(chosen)
@@ -125,8 +135,10 @@ def evaluate(model, loader, where: torch.device, limit: int = 40) -> dict:
     p = counts / counts.sum()
     live = p[p > 0]
     return {
-        "rebuild": total / batches,
-        "guessing": guessing / batches,
+        "rebuild": token / batches,
+        "guessing": flat / batches,          # the weak bar
+        "window_mean": level / batches,      # THE bar
+        "last_day": last / batches,          # flattering; here so nobody headlines it
         "perplexity": float(torch.exp(-(live * live.log()).sum())),
         "words_used": int((counts > 0).sum()),
     }
@@ -192,6 +204,8 @@ def train(
                 # is memorising rather than learning.
                 rebuild=scored["rebuild"],
                 guessing=scored["guessing"],
+                window_mean=scored["window_mean"],
+                last_day=scored["last_day"],
                 perplexity=scored["perplexity"],
                 words_used=scored["words_used"],
                 revived=revived,

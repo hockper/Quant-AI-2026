@@ -10,11 +10,17 @@ from bubble_bi.training import (baseline_rebuild, evaluate, pick_device, train,
 
 
 class _Grids(Dataset):
-    """Grids with real structure in them: a few repeating market 'moods'."""
+    """Grids with real structure in them: a few repeating market 'moods'.
+
+    Each mood carries its own LEVEL as well as its own shape — as real windows do. Without
+    that, "predict the window's average" would have nothing to give away and could not be
+    the harder baseline it is meant to be.
+    """
 
     def __init__(self, n=512, companies=1, days=4, features=6, moods=8, seed=0):
         rng = np.random.default_rng(seed)
         shapes = rng.normal(size=(moods, companies, days, features)).astype(np.float32)
+        shapes += rng.normal(size=(moods, companies, 1, features)).astype(np.float32)
         which = rng.integers(0, moods, n)
         self.x = shapes[which] + 0.1 * rng.normal(
             size=(n, companies, days, features)
@@ -212,3 +218,49 @@ def test_a_company_that_did_not_trade_cannot_influence_cs_training():
         poisoned = {k: v.clone() for k, v in batch.items()}
         poisoned["grid"][:, -1] = 999.0             # garbage in the absent company
         assert torch.allclose(clean, model(poisoned)["rebuild_loss"], atol=1e-5)
+
+
+# ------------------------------------------------- the baseline that actually hurts
+
+def test_the_window_mean_baseline_is_harder_than_predicting_zero():
+    """The whole point.
+
+    'Predict zero' is the long-run average of a normalised feature — a WEAK bar. A model
+    that knew nothing except 'this window sits above its usual level' would already beat
+    it. Predicting the window's OWN average hands that away for free and asks whether the
+    model knows anything about the shape INSIDE the window.
+    """
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=6, features=6, vocabulary=16, width=32, heads=2)
+    scored = evaluate(model, _loaders(days=6)["test"], _where())
+
+    assert scored["window_mean"] < scored["guessing"], (
+        "the window-mean bar must be the harder one — if it is not, the fixture has no "
+        "level to give away and the test proves nothing"
+    )
+
+
+def test_repeating_the_last_day_is_a_FLATTERING_baseline_not_a_harsh_one():
+    """It sounds like the honest floor — 'nothing changed since yesterday' — and it is
+    not. One day is a noisy sample, so repeating it 15 times scores WORSE than predicting
+    the long-run mean. Reporting against it makes the model look better than it is."""
+    torch.manual_seed(0)
+    model = VQVAE(companies=1, days=6, features=6, vocabulary=16, width=32, heads=2)
+    scored = evaluate(model, _loaders(days=6)["test"], _where())
+
+    assert scored["last_day"] > scored["window_mean"]      # much weaker than the real bar
+
+
+def test_a_model_that_only_knew_the_window_average_would_beat_the_weak_bar():
+    """Proof that the old headline was worthless: a 'model' which does nothing but
+    predict the window's own mean already clears the long-run bar comfortably. Any
+    '% explained' measured against that bar therefore says nothing."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(200, 1, 6, 6)).astype(np.float32)
+    x += rng.normal(size=(200, 1, 1, 6)).astype(np.float32) * 1.5    # give each window a LEVEL
+
+    zero_cost = float((x ** 2).mean())
+    mean_cost = float(((x - x.mean(axis=2, keepdims=True)) ** 2).mean())
+
+    assert mean_cost < zero_cost
+    assert 1 - mean_cost / zero_cost > 0.3      # knowing only the level "explains" >30%
