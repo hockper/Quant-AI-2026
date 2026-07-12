@@ -280,7 +280,9 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
 
     explained = 1 - scored["rebuild"] / max(guessing, 1e-9)
     perplexity = scored["perplexity"]
-    start = history.rows[0]["perplexity"] if history.rows else float("nan")
+    # `history` is None when the model was LOADED rather than trained this session.
+    rows = history.rows if history is not None else []
+    start = rows[0]["perplexity"] if rows else float("nan")
     squeeze = model.companies * model.days * model.features
 
     # These two are the only things that mean the model is BROKEN, as opposed to
@@ -309,7 +311,8 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         have=f"""
         A tokenizer that squeezes {squeeze:,} numbers into ONE word out of {words}.
         On days it has never seen, that word explains {explained:.0%} of what was
-        happening. Perplexity went {start:.0f} → {perplexity:.0f} during training.
+        happening.{f" Perplexity went {start:.0f} → {perplexity:.0f} during training."
+                    if rows else ""}
         """,
     )
     if explained < 0.25:
@@ -317,8 +320,8 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         print(f"     One word is being asked to carry {squeeze:,} numbers. The harder the")
         print("     squeeze, the less survives. What matters next is not this number but")
         print("     whether the ENCODER learned something useful — which the fusion will use.")
-    if perplexity < words * 0.3:
-        print(f"\n  ⏱️  Short run: {history.rows[-1]['step']:,} steps in "
+    if perplexity < words * 0.3 and rows:
+        print(f"\n  ⏱️  Short run: {rows[-1]['step']:,} steps in "
               f"{history.seconds:.0f}s. Perplexity is still climbing —")
         print("     train for longer on a GPU before reading anything into these numbers.")
 

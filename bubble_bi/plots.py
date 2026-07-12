@@ -237,9 +237,17 @@ def predicted_candles(world, book, batches, prices: pd.DataFrame, settings: dict
 
 
 def progress(history, title: str = "TS"):
-    """The two numbers that matter, over the course of training."""
+    """The two numbers that matter, over the course of training.
+
+    Returns None if there is no history — which happens when the model was LOADED from
+    disk rather than trained in this session. There is nothing to plot, and that is
+    fine.
+    """
     import matplotlib.pyplot as plt
 
+    if history is None or not history.rows:
+        print(f"({title} was loaded from disk — no training history to plot.)")
+        return None
     frame = history.frame()
     fig, (left, right) = plt.subplots(1, 2, figsize=(11, 3.6))
 
