@@ -64,8 +64,13 @@ def _probe(x: np.ndarray, y: np.ndarray, train: float = 0.7) -> float:
 
 @torch.no_grad()
 def gather(world, book, batches, settings: dict, period: str = "test",
-           limit: int = 60) -> dict:
-    """Collect everything needed to tell the three culprits apart."""
+           every: int = 4) -> dict:
+    """Collect everything needed to tell the three culprits apart.
+
+    ⚠️ Takes every Nth batch across the WHOLE period, never the first N. The sentences
+    are ordered by company, so stopping early would sample only the first few companies
+    and quietly answer a different question than the one asked.
+    """
     from bubble_bi.training import _to, pick_device
 
     where = pick_device(settings)
@@ -77,8 +82,8 @@ def gather(world, book, batches, settings: dict, period: str = "test",
     y = arrays.y                                        # tomorrow's return
 
     for i, batch in enumerate(book["loaders"][period]):
-        if i >= limit:
-            break
+        if i % every:                                   # thin it out, but evenly
+            continue
         batch = _to(batch, where)
         b, t, width = batch["z_ts"].shape
 
