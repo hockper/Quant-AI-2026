@@ -33,15 +33,26 @@ are separate axes and our instinct to scale them together is wrong.
 
 ## What this is NOT optimising
 
-The obvious objective is "lowest reconstruction loss." **We reject it.**
+Two candidate objectives, and **both are wrong**.
 
-We have already proved that reconstruction loss misleads us: given the candle
-explicitly, the best compressor *threw it away* (`docs/DECISION-let-the-model-choose.md`).
-Pointing six knobs at "compress better" would buy us a better compressor and a token no
-more useful downstream. We would be automating our way deeper into the hole.
+**Not "lowest reconstruction loss."** We have already proved it misleads us: given the
+candle explicitly, the best compressor *threw it away*
+(`docs/DECISION-let-the-model-choose.md`). Reconstruction loss is an equally-weighted MSE
+over all 26 features, so it is dominated by the easy, smooth, compressible ones. Pointing
+six knobs at it would buy a better compressor and a token no more useful downstream.
 
-**The tokenizer's product is a token that feeds a predictor and an RL agent. So we score
-each trial by what a held-out linear probe can recover from that token.**
+**And not "predicts tomorrow" either.** TS and CS are **autoencoders**. They are trained
+to represent the *present* window and are never asked to forecast — the predictor does
+that. Score a tokenizer on tomorrow's return and every configuration scores ≈ 0 ± noise,
+*because tomorrow is unpredictable however good the tokenizer is*. The search would then
+rank pure noise and hand back whichever trial got luckiest. Worse, a null result would be
+uninterpretable: "tomorrow's return is hard to predict" is a tautology, not a finding
+about our tokenizer.
+
+**The right question for an autoencoder is whether the present day survives the
+bottleneck.** The token is a 9-bit summary of a window; the only thing we can ask of it is
+what it chose to keep. And that is the whole ballgame, because *information destroyed at
+the tokenizer can never be recovered by any predictor downstream*.
 
 ## The objective
 
@@ -50,45 +61,62 @@ Train on `learn`. Probe on `tune`. **`test` is never touched by the search.**
 ```
 skill(target) = R²(probe: token → target)  −  R²(probe: SHUFFLED token → target)
 
-score = skill(tomorrow's direction) + skill(tomorrow's volatility)
+score = skill(TODAY's direction) + skill(TODAY's volatility)
 ```
 
-`skill = 0` means "no better than luck". The probe is the ridge in
-`autopsy._probe` — deliberately linear: if a linear probe cannot find the information, a
+"Today" is the **last day of the window** — the day the token stands for in the
+predictor's sentence. `skill = 0` means "no better than luck". The probe is the ridge in
+`autopsy._probe`, deliberately linear: if a linear probe cannot find the information, a
 codebook of nearest-neighbour lookups will not dig it out either.
+
+This is *not* reconstruction in disguise. Reconstruction asks the decoder to redraw all 26
+features with equal weight. This asks a probe to recover the **two quantities anything
+downstream actually needs**, and ignores the 20 features that were only ever inflating the
+average.
 
 **The shuffled floor is load-bearing, not decoration.** The token enters the probe
 one-hot, so a 1024-word vocabulary gives the probe 1024 columns and a 128-word vocabulary
 gives it 128. Raw R² would rise with `vocabulary` *from capacity alone*, and the search
-would "discover" that bigger is better when it had discovered nothing. Shuffling the
-token IDs **at the same vocabulary** produces a capacity-matched floor, and subtracting
-it removes the confound exactly.
+would "discover" that bigger is better when it had discovered nothing. Shuffling the token
+IDs **at the same vocabulary** produces a capacity-matched floor, and subtracting it
+removes the confound exactly.
 
 ### The targets
 
-`arrays.y` is already tomorrow's return. No new data plumbing.
+Read straight from the window the model was just given — its **last day**. Nothing from
+the future enters the search at all, so the no-lookahead question does not even arise.
 
 | | direction | volatility |
 |---|---|---|
-| **TS** (one grid per company-day) | that company's return tomorrow | `abs` of it |
-| **CS** (one grid per day) | the market's mean return tomorrow | the mean `abs` return tomorrow |
+| **TS** (one grid per company-day) | that company's `log_return` and `body` today | its `volatility`-family features today |
+| **CS** (one grid per day) | the market's mean `log_return` and mean `body` today | the cross-section's dispersion of returns today |
+
+`_probe` already accepts a multi-column target, so each is one ridge fit.
+
+### Both targets carry real signal — which is the point
+
+| | if we had scored *tomorrow* | scoring *today* |
+|---|---|---|
+| direction | ≈ 0 — **noise; nothing to optimise** | ≈ 5% (`body`) — small, real, **improvable** |
+| volatility | ≈ 0.3 | ≈ 50% |
+
+Volatility still has more headroom than direction, so the plain sum leans toward regime.
+We keep the plain sum — no arbitrary reweighting — but **report both columns separately
+for every trial**, and if the winner-by-score and the winner-by-direction are different
+configurations, the notebook shows both and says so. That is the choice the user will
+actually want to make, and blending it into one number would hide it.
+
+**This is how the search can settle the open question.** If no configuration anywhere in
+the space can make the token keep today's direction, then direction is destroyed *at the
+tokenizer*, no downstream predictor can recover it, and the regime pivot is proven rather
+than assumed. If some configuration *can*, the candle was never noise — we were simply
+running the wrong hyperparameters, and the original plan stands.
 
 ### Rejection, not scoring
 
-A trial whose codebook **collapsed** — fewer than 5% of words alive — scores `−inf`. It
-is not ranked, it is thrown out. A token drawn from 12 live words carries ~3.5 bits and
-is useless downstream however well it probes.
-
-### One honest caveat, stated up front
-
-`skill(volatility)` will be around 0.3 and `skill(direction)` around 0.0. **Their sum is
-therefore dominated by volatility, so the search effectively optimises regime.** We
-accept this — it is what the data supports — but the `direction` column is reported
-*separately for every trial* and it is the column we watch. If any configuration in the
-space shows direction skill meaningfully above zero, the candle is not noise and the
-regime pivot is off. The search cannot prove direction is unrecoverable, but it is the
-widest net we have cast at the question, and a search that only ever optimised volatility
-could not answer it at all.
+A trial whose codebook **collapsed** — fewer than 5% of words alive — scores `−inf`. It is
+not ranked, it is thrown out. A token drawn from 12 live words carries ~3.5 bits and is
+useless downstream however well it probes.
 
 ## Part 0 — Wire the settings to the models
 
@@ -236,7 +264,7 @@ tuning **by cloning**. It records not just the numbers but what they were found 
   "found_on": "2026-07-12",
   "trials": 12,
   "fingerprint": {"tickers": 30, "features": 26, "start": "2010-01-01", "search_steps": 600},
-  "score": {"ts": {"direction": -0.01, "volatility": 0.31, "words_used": 412}, "cs": {...}},
+  "score": {"ts": {"direction": 0.09, "volatility": 0.54, "words_used": 412}, "cs": {"...": "..."}},
   "ts": {"learning_rate": 4.2e-4, "commitment": 0.31, "diversity": 0.4,
          "model_size": 256, "vocabulary": 1024, "days": 15},
   "cs": {"...": "..."}
@@ -328,6 +356,9 @@ One new section, after the tensors and before the TS training:
   26, warns and does not silently pass.
 - **The search never touches `test`:** assert the test loader is not constructed during a
   search. This is a no-lookahead guarantee and deserves a test, not a comment.
+- **The probe targets come from the window, not the future:** assert that corrupting
+  `arrays.y` (tomorrow's return) leaves every trial's score bit-for-bit identical. The
+  search must be provably blind to the future — and this test is what proves it.
 - **End-to-end:** a 2-trial search on a tiny synthetic panel completes, writes a
   `tuned.json` that `check()` accepts, and resumes from a killed study.
 
