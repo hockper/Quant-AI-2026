@@ -82,6 +82,30 @@ codebook **collapses** to ~12 words of 512. This is diagnosed, not fixed:
 [`docs/OPEN-QUESTION-codebook-collapse.md`](docs/OPEN-QUESTION-codebook-collapse.md).
 The notebook shows the ❌ and says *"do not pretend this passed"* rather than hiding it.
 
+## The finding the project turns on
+
+**Given the candle — explicitly, as four features — the tokenizer threw it away.**
+
+```
+volatility  50%      macd 85%   rsi 75%   sma_ratio_20 73%
+memory      49%
+price       45%      ...against...
+candle       3%      gap 4%   body 5%   log_return 9%   lower_wick -1%
+```
+
+And CS said the same about the market: its words explain **88%** of how *violent* a day
+was, and **8%** of which *way* it went — *below* its own shuffled floor.
+
+It is right to. One token is **9 bits**. Fifteen days of MACD is a smooth curve; fifteen
+candle bodies are fifteen independent random numbers. A 9-bit code spends itself on what
+compresses. **This is not the model failing — it is the model reporting that daily
+direction is close to noise and volatility regime is not.**
+
+So we do **not** force it to keep the candle. If direction turns out not to be there, the
+*downstream task* changes to fit what the model can actually see — trading the **regime**
+rather than the direction. See
+[`docs/DECISION-let-the-model-choose.md`](docs/DECISION-let-the-model-choose.md).
+
 **A number that must not be quoted alone:** the previous version of this project reported
 *"58.6% next-token accuracy"* against a weak baseline. Against **persistence** — the
 honest floor — it would not have cleared the bar either.
