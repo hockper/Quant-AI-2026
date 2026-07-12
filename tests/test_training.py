@@ -133,3 +133,55 @@ def test_guessing_the_average_scores_about_one_on_normalised_data():
         def __getitem__(self, i): return {"grid": torch.from_numpy(x[i])}
 
     assert baseline_rebuild(DataLoader(_D(), batch_size=32)) == pytest.approx(1.0, abs=0.1)
+
+
+class _MarketGrids(Dataset):
+    """CS-shaped grids: every company at once, one sample per day."""
+
+    def __init__(self, n=256, companies=6, days=5, features=6, moods=6, seed=0):
+        rng = np.random.default_rng(seed)
+        shapes = rng.normal(size=(moods, companies, days, features)).astype(np.float32)
+        self.x = shapes[rng.integers(0, moods, n)] + 0.1 * rng.normal(
+            size=(n, companies, days, features)
+        ).astype(np.float32)
+        self.present = np.ones((n, companies), dtype=bool)
+        self.present[:, -1] = False              # one company never trades
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return {"grid": torch.from_numpy(self.x[i]),
+                "present": torch.from_numpy(self.present[i])}
+
+
+def test_the_same_class_trains_as_cs_on_the_whole_market():
+    torch.manual_seed(0)
+    model = VQVAE(companies=6, days=5, features=6, vocabulary=32, width=32,
+                  heads=2, dropout=0.0)
+    data = _MarketGrids()
+    loaders = {p: DataLoader(data, batch_size=32, shuffle=(p == "learn"))
+               for p in ("learn", "tune", "test")}
+
+    before = evaluate(model, loaders["tune"], torch.device("cpu"))["rebuild"]
+    history = train(model, loaders, _settings(), steps=200, quiet=True)
+    after = history.rows[-1]
+
+    assert after["rebuild"] < before * 0.7          # it learned the market's moods
+    assert after["perplexity"] > 3                  # ...without collapsing
+
+
+def test_a_company_that_did_not_trade_cannot_influence_cs_training():
+    # If an absent company leaked into the loss, the model would be scored on
+    # rebuilding something that never happened.
+    torch.manual_seed(0)
+    model = VQVAE(companies=6, days=5, features=6, vocabulary=16, width=32,
+                  heads=2, dropout=0.0).eval()
+    data = _MarketGrids(n=32)
+    batch = next(iter(DataLoader(data, batch_size=8)))
+
+    with torch.no_grad():
+        clean = model(batch)["rebuild_loss"]
+        poisoned = {k: v.clone() for k, v in batch.items()}
+        poisoned["grid"][:, -1] = 999.0             # garbage in the absent company
+        assert torch.allclose(clean, model(poisoned)["rebuild_loss"], atol=1e-5)

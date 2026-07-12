@@ -270,9 +270,7 @@ def make_tensors(table: pd.DataFrame, settings: dict) -> Batches:
     scaler = Scaler(arrays, days["learn"], arrays.names)   # measured on the past ONLY
     scaled = scaler.apply(arrays.x)
 
-    batch = settings["batch_size"]
-
-    def loaders(build, window):
+    def loaders(build, window, batch):
         out = {}
         for period in PERIODS:
             dataset = build(arrays, scaled, days[period], window)
@@ -297,6 +295,6 @@ def make_tensors(table: pd.DataFrame, settings: dict) -> Batches:
         arrays=arrays,
         scaler=scaler,
         days=days,
-        ts=loaders(TSGrids, settings["ts"]["days"]),
-        cs=loaders(CSGrids, settings["cs"]["days"]),
+        ts=loaders(TSGrids, settings["ts"]["days"], settings["ts"]["batch"]),
+        cs=loaders(CSGrids, settings["cs"]["days"], settings["cs"]["batch"]),
     )

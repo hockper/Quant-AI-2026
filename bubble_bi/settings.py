@@ -18,18 +18,24 @@ DEFAULTS: dict = {
     "end": None,
 
     # Entry 1 — TS: what THIS stock has been doing (one stock, over time).
+    # One grid per company per day, so there are tens of thousands of them.
     "ts": {
         "days": 4,
         "vocabulary": 512,
         "encoder_depth": 3,
         "decoder_depth": 2,
+        "batch": 256,
     },
     # Entry 2 — CS: what the WHOLE MARKET was doing (all stocks, on a day).
+    # Only ONE grid per day, so there are ~30x fewer of them — and each is ~30x bigger
+    # (every company at once). Hence its own, much smaller batch: a batch of 256 would
+    # be a tenth of the entire training set, giving barely a handful of steps per pass.
     "cs": {
         "days": 5,
         "vocabulary": 512,
         "encoder_depth": 3,
         "decoder_depth": 2,
+        "batch": 64,
     },
     # Where the two entries merge into the single token we keep.
     "fusion": {
@@ -58,7 +64,6 @@ DEFAULTS: dict = {
     "model_size": 128,
 
     "steps": 2000,
-    "batch_size": 256,
     "learning_rate": 1e-4,
     "seed": 42,
     "data_dir": "artifacts",
@@ -66,11 +71,11 @@ DEFAULTS: dict = {
 
 # Settings that must be a positive whole number.
 _POSITIVE = {
-    ("ts", "days"), ("ts", "encoder_depth"), ("ts", "decoder_depth"),
-    ("cs", "days"), ("cs", "encoder_depth"), ("cs", "decoder_depth"),
+    ("ts", "days"), ("ts", "encoder_depth"), ("ts", "decoder_depth"), ("ts", "batch"),
+    ("cs", "days"), ("cs", "encoder_depth"), ("cs", "decoder_depth"), ("cs", "batch"),
     ("fusion", "depth"),
     ("predictor", "sentence_length"), ("predictor", "depth"),
-    ("model_size",), ("steps",), ("batch_size",),
+    ("model_size",), ("steps",),
 }
 # Settings that must be a vocabulary of at least two words.
 _VOCAB = {("ts", "vocabulary"), ("cs", "vocabulary"), ("fusion", "vocabulary")}

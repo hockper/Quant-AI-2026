@@ -167,3 +167,47 @@ def test_describe_tells_the_notebook_what_it_built():
     assert "1 company" in ts.describe()
     assert "all 30 companies" in cs.describe()
     assert "1 word out of 512" in ts.describe()
+
+
+# ------------------------------------------------- the diversity loss (STORM eq. 4)
+
+def test_the_diversity_loss_punishes_a_crowded_dictionary():
+    """The anti-collapse mechanism. Without it, CS collapses onto a few words."""
+    book = Codebook(words=8, width=2, diversity=1.0).eval()
+    # Put the words far apart and on known spots, so "crowded" and "spread" are not
+    # at the mercy of a random dictionary.
+    book.dictionary.copy_(torch.tensor(
+        [[10.0 * i, 0.0] for i in range(8)], dtype=book.dictionary.dtype))
+
+    crowded = book.dictionary[0].repeat(64, 1)        # every vector on ONE word
+    spread = book.dictionary.repeat(8, 1)             # eight vectors on each word
+
+    crowded_penalty = float(book(crowded)["diversity_loss"])
+    spread_penalty = float(book(spread)["diversity_loss"])
+    assert crowded_penalty > spread_penalty
+    # And the balanced case should sit near the best possible score: -log(words).
+    assert spread_penalty == pytest.approx(-torch.log(torch.tensor(8.0)).item(), abs=0.1)
+
+
+def test_the_diversity_loss_can_actually_reach_the_encoder():
+    # It must carry a gradient BACK to the encoder, telling it to spread out. A
+    # penalty on the dictionary alone would do nothing -- the dictionary is updated
+    # by moving averages, not gradients.
+    book = Codebook(words=16, width=8, diversity=0.1)
+    z = torch.randn(32, 8, requires_grad=True)
+    book(z)["diversity_loss"].backward()
+    assert z.grad is not None
+    assert float(z.grad.abs().sum()) > 0
+
+
+def test_turning_the_diversity_loss_off_makes_it_vanish():
+    book = Codebook(words=16, width=8, diversity=0.0)
+    assert float(book(torch.randn(32, 8))["diversity_loss"]) == 0.0
+
+
+def test_the_total_loss_carries_all_three_pressures():
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=32, width=16, heads=2)
+    out = model({"grid": _grid(8, 1, 4, 6)})
+    assert {"rebuild_loss", "commitment_loss", "diversity_loss"} <= set(out)
+    total = out["rebuild_loss"] + out["commitment_loss"] + out["diversity_loss"]
+    assert torch.allclose(out["loss"], total)

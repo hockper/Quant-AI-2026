@@ -28,11 +28,12 @@ class Codebook(nn.Module):
     """
 
     def __init__(self, words: int, width: int, decay: float = 0.99,
-                 commitment: float = 0.25, eps: float = 1e-5):
+                 commitment: float = 0.25, diversity: float = 0.1, eps: float = 1e-5):
         super().__init__()
         self.words = words
         self.decay = decay
         self.commitment = commitment
+        self.diversity = diversity
         self.eps = eps
 
         dictionary = torch.randn(words, width)
@@ -69,6 +70,8 @@ class Codebook(nn.Module):
         # word, rather than relying on the snap to clean up after it.
         commitment_loss = self.commitment * F.mse_loss(z, snapped.detach())
 
+        diversity_loss = self.diversity * self._crowding(distance)
+
         # Snapping is not differentiable, so we pass the gradient straight through it:
         # forward gives the snapped vector, backward acts as if nothing happened.
         snapped = z + (snapped - z).detach()
@@ -77,8 +80,33 @@ class Codebook(nn.Module):
             "snapped": snapped,
             "ids": chose,
             "commitment_loss": commitment_loss,
+            "diversity_loss": diversity_loss,
             "perplexity": self._perplexity(chose),
         }
+
+    def _crowding(self, distance: torch.Tensor) -> torch.Tensor:
+        """Punish a dictionary that crowds onto a few words. (STORM, eq. 4.)
+
+        Left alone, a VQ-VAE collapses: a handful of words win everything early and
+        the rest are never chosen again. Reviving dead words fights that from one
+        side; this fights it from the other.
+
+        We take a SOFT vote — how strongly each vector leans toward each word — average
+        those votes over the batch, and penalise the result for being lopsided. A
+        dictionary where every word gets its fair share of the vote has high entropy;
+        one that crowds onto a few words has low entropy. Minimising `p·log p` is
+        maximising that entropy.
+
+        This is not merely decorative. The soft vote depends on the DISTANCES between
+        the encoder's output and the words, so it carries a real gradient back into
+        the encoder — telling it to spread out. (An orthogonality penalty on the
+        dictionary itself, which the paper also uses, would do nothing here: our
+        dictionary is updated by moving averages, not gradients, so nothing could
+        act on it.)
+        """
+        vote = F.softmax(-distance, dim=1)          # [batch, words]
+        share = vote.mean(dim=0)                    # each word's share of the vote
+        return (share * torch.log(share + 1e-10)).sum()
 
     def _drift_words_toward(self, z: torch.Tensor, chose: torch.Tensor) -> None:
         """Nudge each chosen word toward the average of what chose it."""

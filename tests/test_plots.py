@@ -33,8 +33,8 @@ def world():
         frames.append(one.reset_index())
     prices = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
 
-    settings = bb.check({"tickers": ["AAA", "BBB"], "batch_size": 32,
-                         "learning_rate": 3e-3})
+    settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
+                         "ts": {"batch": 32}, "cs": {"batch": 32}})
     data = bb.data.add_features(prices, settings)
     batches = bb.data.make_tensors(data, settings)
 

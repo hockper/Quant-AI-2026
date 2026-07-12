@@ -65,7 +65,12 @@ class VQVAE(nn.Module):
         decoder_depth: int = 2,
         heads: int = 4,
         dropout: float = 0.1,
+        batch: int | None = None,
     ):
+        # `batch` is not a model setting -- it belongs to the data loader. It is
+        # accepted and ignored here purely so the notebook can hand over an entry's
+        # whole settings block in one go: VQVAE(..., **settings["ts"]).
+        del batch
         super().__init__()
         if companies < 1 or days < 1 or features < 1:
             raise ValueError(
@@ -164,9 +169,14 @@ class VQVAE(nn.Module):
             rebuild_loss = error.mean()
 
         return {
-            "loss": rebuild_loss + chosen["commitment_loss"],
+            # Three pressures, pulling in different directions:
+            #   rebuild      "say enough about the grid that I can redraw it"
+            #   commitment   "and say it in words that are already in the dictionary"
+            #   diversity    "and stop crowding onto the same few words"
+            "loss": rebuild_loss + chosen["commitment_loss"] + chosen["diversity_loss"],
             "rebuild_loss": rebuild_loss,
             "commitment_loss": chosen["commitment_loss"],
+            "diversity_loss": chosen["diversity_loss"],
             "perplexity": chosen["perplexity"],
             "ids": chosen["ids"],
             "summary": summary,

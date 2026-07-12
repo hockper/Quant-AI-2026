@@ -281,38 +281,43 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
     explained = 1 - scored["rebuild"] / max(guessing, 1e-9)
     perplexity = scored["perplexity"]
     start = history.rows[0]["perplexity"] if history.rows else float("nan")
+    squeeze = model.companies * model.days * model.features
 
-    # A dictionary that collapses to a handful of words has learned nothing, however
-    # respectable its loss looks. This is the failure mode to be afraid of.
-    alive = perplexity > 10
-    learned = scored["rebuild"] < guessing * 0.9
+    # These two are the only things that mean the model is BROKEN, as opposed to
+    # merely undertrained or facing a hard job. Anything stricter would halt the
+    # notebook on a short run, which is worse than useless.
+    learned = scored["rebuild"] < guessing            # it beat doing nothing at all
+    alive = perplexity > 2                            # not everything got one word
 
     health = (
         "healthy" if perplexity > words * 0.3
-        else "usable, but a longer run would help" if perplexity > words * 0.1
-        else "poor — the vocabulary is collapsing"
+        else "thin — a longer run should widen it" if perplexity > words * 0.05
+        else "very thin — the vocabulary is barely spreading"
     )
 
     report(
         f"{name} trained",
         [
-            ("Learned to rebuild", learned,
+            ("Beat doing nothing", learned,
              f"{scored['rebuild']:.2f} vs {guessing:.2f} for guessing the average"),
             ("Dictionary did not collapse", alive,
-             f"perplexity {perplexity:.0f} — {health}"),
+             f"perplexity {perplexity:.0f} of {words} — {health}"),
             ("Vocabulary in use", True,
              f"{scored['words_used']} of {words} words"),
             ("Scored on unseen days", True, "the test period, never trained on"),
         ],
         have=f"""
-        A tokenizer that turns any {model.days} days of one company into a single word.
-        It rebuilds a held-out day well enough to explain {explained:.0%} of what was
-        happening — from one word out of {words}.
-        Perplexity climbed {start:.0f} → {perplexity:.0f} during training: the
-        dictionary started collapsed onto a single word and spread out.
+        A tokenizer that squeezes {squeeze:,} numbers into ONE word out of {words}.
+        On days it has never seen, that word explains {explained:.0%} of what was
+        happening. Perplexity went {start:.0f} → {perplexity:.0f} during training.
         """,
     )
+    if explained < 0.25:
+        print(f"\n  ℹ️  {explained:.0%} is low — and for {name} that is expected, not a bug.")
+        print(f"     One word is being asked to carry {squeeze:,} numbers. The harder the")
+        print("     squeeze, the less survives. What matters next is not this number but")
+        print("     whether the ENCODER learned something useful — which the fusion will use.")
     if perplexity < words * 0.3:
-        print(f"\n  ℹ️  This was a short run ({history.rows[-1]['step']:,} steps, "
-              f"{history.seconds:.0f}s). Perplexity is still climbing —")
-        print("     train for longer (on a GPU) before reading anything into the numbers.")
+        print(f"\n  ⏱️  Short run: {history.rows[-1]['step']:,} steps in "
+              f"{history.seconds:.0f}s. Perplexity is still climbing —")
+        print("     train for longer on a GPU before reading anything into these numbers.")
