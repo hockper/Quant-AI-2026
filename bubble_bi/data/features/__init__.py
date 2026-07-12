@@ -48,6 +48,21 @@ def _for_one_company(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     return pd.DataFrame(columns, index=df.index)
 
 
+def by_family(settings: dict) -> dict[str, list[str]]:
+    """Which feature names each family produces.
+
+    Asked of the family modules themselves rather than kept as a hand-written list, so it
+    cannot drift out of date the next time someone adds a feature.
+    """
+    import numpy as np
+
+    fake = pd.DataFrame(
+        {c: np.linspace(1.0, 2.0, 400) for c in ("open", "high", "low", "close", "volume")},
+        index=pd.date_range("2020-01-01", periods=400, freq="B"),
+    )
+    return {name: list(module.build(fake, settings)) for name, module in FAMILIES.items()}
+
+
 def names() -> list[str]:
     """The feature column names, in order. Cheap — runs on a throwaway series."""
     import numpy as np

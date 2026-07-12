@@ -308,8 +308,6 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
     """
     import matplotlib.pyplot as plt
 
-    from bubble_bi.data.features import FAMILIES
-
     grids = batches.ts["test"].dataset
     names = batches.arrays.names
     where = next(model.parameters()).device
@@ -329,15 +327,11 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
         (real ** 2).mean(axis=(0, 1)), 1e-9)
 
     # Which feature belongs to which family — ask each family what it produces.
-    import pandas as pd
+    from bubble_bi.data.features import by_family
 
-    fake = pd.DataFrame(
-        {c: np.linspace(1, 2, 400) for c in ("open", "high", "low", "close", "volume")},
-        index=pd.date_range("2020-01-01", periods=400, freq="B"),
-    )
     kept_by = {
-        family: float(np.mean([kept[names.index(n)] for n in module.build(fake, settings)]))
-        for family, module in FAMILIES.items()
+        family: float(np.mean([kept[names.index(n)] for n in columns]))
+        for family, columns in by_family(settings).items()
     }
     frame = pd.Series(kept_by).sort_values()
 
