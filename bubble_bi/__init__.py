@@ -4,7 +4,7 @@ The notebook at the repo root is the entry point. Everything it needs is here.
 """
 
 from bubble_bi import (attention, autopsy, data, diagnostics, keep, models,
-                       plots, training, verify)
+                       plots, training, tuning, verify)
 from bubble_bi.report import CheckFailed, report, run_tests
 from bubble_bi.settings import check, device, summary
 from bubble_bi.training import train, train_world
@@ -18,5 +18,6 @@ __all__ = [
     "verify",                             # the check that closes each section
     "plots", "diagnostics", "autopsy",    # looking at what they learned, and what broke
     "attention",                          # ...and what each company chose to read
+    "tuning",                             # scoring a tokenizer for a hyperparameter search
     "report", "run_tests", "CheckFailed",
 ]
