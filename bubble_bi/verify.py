@@ -321,3 +321,45 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         print(f"\n  ⏱️  Short run: {history.rows[-1]['step']:,} steps in "
               f"{history.seconds:.0f}s. Perplexity is still climbing —")
         print("     train for longer on a GPU before reading anything into these numbers.")
+
+
+def market_moods(evidence: dict) -> None:
+    """Section 9b: do the CS tokens actually know what the market did?
+
+    The fair question for CS. It cannot redraw thirty companies from one word — nothing
+    could. But if its words separate a calm day from a panic, it has learned the
+    market's moods, and that is what the fusion needs from it.
+    """
+    scores = evidence["scores"]
+    real = scores["explained by the token"]
+    luck = scores["explained by luck"]
+
+    # The token must beat a SHUFFLED assignment -- the same words handed to the wrong
+    # days. With 512 words and a few hundred days, a token can look informative by
+    # sheer luck, and this is what that luck actually scores.
+    beats_luck = bool((real > luck + 0.02).any())
+    best = real.idxmax()
+
+    report(
+        "What the market words mean",
+        [
+            ("The words are not random", beats_luck,
+             f"best: '{best}' — {real[best]:.0%} explained, "
+             f"vs {luck[best]:.0%} by luck"),
+            ("Words in use on unseen days", evidence["words_used"] > 1,
+             f"{evidence['words_used']} different words across "
+             f"{len(evidence['tokens'])} days"),
+        ],
+        have=f"""
+        Knowing only which word a day was given, you can account for
+        {real[best]:.0%} of {best}. The market's moods are in the words.
+        This — not the rebuild score — is what CS was for: the fusion needs a market
+        CONTEXT, not a redrawing of the market.
+        """,
+    )
+    print()
+    print(scores.to_string(float_format=lambda v: f"{v:6.1%}"))
+    if not beats_luck:
+        print("\n  ⚠️  The words explain no more than a random shuffle would. On a short")
+        print("     run that may just be undertraining — but if it survives a long GPU")
+        print("     run, CS has learned nothing and the fusion has nothing to attend to.")
