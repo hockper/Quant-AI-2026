@@ -18,42 +18,53 @@ DEFAULTS: dict = {
     "end": None,
 
     # Entry 1 — TS: what THIS stock has been doing (one stock, over time).
-    # One grid per company per day, so there are tens of thousands of them.
     "ts": {
-        "days": 4,
+        "days": 15,
         "vocabulary": 512,
         "encoder_depth": 3,
         "decoder_depth": 2,
+        "heads": 4,
+        "dropout": 0.1,
         "batch": 256,
         "steps": None,        # None -> use the shared `steps`
+        # --- the codebook's own knobs. Every one of these reaches Codebook. ---
+        # commitment  how hard the encoder is pulled towards a word it already has.
+        #   ⚠️ 0.25 is the standard. We ran at 1.0 for the whole project by accident:
+        #   `loss["commitment"]` was in SETTINGS, was validated on every run, and was
+        #   handed to NOTHING. Too strong a commitment pins the encoder to the codebook
+        #   and is a documented cause of collapse.
+        "commitment": 0.25,
+        "diversity": 0.1,     # punish the dictionary for crowding (STORM eq. 4)
+        "decay": 0.99,        # the codebook is a moving average; this is its memory
     },
     # Entry 2 — CS: what the WHOLE MARKET was doing (all stocks, on a day).
-    # Only ONE grid per day, so there are ~30x fewer of them — and each is ~30x bigger
-    # (every company at once). Hence its own, much smaller batch: a batch of 256 would
-    # be a tenth of the entire training set, giving barely a handful of steps per pass.
+    # ~30x FEWER grids than TS, each ~30x bigger. Hence its own, much smaller batch and
+    # step budget: at batch 64, 10,000 steps is 243 passes and it overfits badly.
     "cs": {
         "days": 5,
         "vocabulary": 512,
         "encoder_depth": 3,
         "decoder_depth": 2,
+        "heads": 4,
+        "dropout": 0.1,
         "batch": 64,
-        # ⚠️ CS has ~2,600 grids to TS's ~78,000. At batch 64, 10,000 steps is 243 passes
-        # over the same data — it overfits badly and its held-out error CLIMBS. Give it
-        # its own, much smaller budget. (Early stopping catches it either way, but there
-        # is no sense burning nine thousand steps making the model worse.)
         "steps": 2000,
+        "commitment": 0.25,
+        "diversity": 0.1,
+        "decay": 0.99,
     },
     # Where the two entries merge into the single token we keep.
-    # `attend_to` decides how fine-grained a menu CS offers the cross-attention:
     #   "days"       one vector per market day   (5 keys)  -- what the paper does
-    #   "companies"  one vector per company      (30 keys) -- a bank can attend to banks
-    #   "cells"      every (company, day)        (150 keys) -- richest, still cheap
-    # The output is ONE vector either way: cross-attention's length follows the QUERY.
+    #   "companies"  one vector per company      (30 keys)
+    #   "cells"      every (company, day)        (150 keys)
     "fusion": {
         "vocabulary": 512,
         "depth": 2,
         "attend_to": "days",
         "batch": 32,
+        "commitment": 0.25,
+        "diversity": 0.1,
+        "decay": 0.99,
     },
     # The GPT that reads sentences of tokens.
     "predictor": {
@@ -61,27 +72,26 @@ DEFAULTS: dict = {
         "depth": 4,
     },
 
-    # What the model is being pulled towards, and how hard.
+    # The PREDICTOR's two heads. (commitment and diversity used to live here, which was
+    # the bug: they belong to a codebook, and there are three codebooks.)
     #
-    # These four fight each other, and the balance IS the design:
-    #
-    #   naming      predict tomorrow's WORD. ⚠️ This is the one that rewards CHEATING:
-    #               make every day the same word and it is trivially satisfied. Turn it
-    #               up and the codebook collapses -- we watched it fall to 3 words while
-    #               "accuracy" shot to 87%. The paper keeps it small (0.1) for this
-    #               reason, and so do we.
-    #   candle      draw tomorrow's CANDLE. This is the anchor. A collapsed token carries
-    #               no information, so it cannot draw a candle -- which makes the cheat
-    #               expensive. It also forces the token to carry DIRECTION (the body is
-    #               where it closed against where it opened), the one thing both halves
-    #               of the tokenizer were throwing away.
-    #   commitment  keep the encoder's output close to a word it already has.
-    #   diversity   punish the dictionary for crowding onto a few words (STORM eq. 4).
+    #   naming   predict tomorrow's WORD. ⚠️ This one rewards CHEATING: make every day the
+    #            same word and it is trivially satisfied. We watched "accuracy" hit 87%
+    #            on a 3-word codebook. The paper keeps it small (0.1); so do we.
+    #   candle   draw tomorrow's CANDLE. The anchor: a collapsed token carries no
+    #            information, so it cannot draw a candle, which makes the cheat expensive.
     "loss": {
         "naming": 0.1,
         "candle": 1.0,
-        "commitment": 1.0,
-        "diversity": 0.1,
+    },
+
+    # Finding the settings above, by measuring instead of guessing. OFF by default:
+    # the search is a one-time act of discovery, and everyone after inherits its answer
+    # from `tuned.json`. See docs/superpowers/specs/2026-07-12-tokenizer-tuning-design.md.
+    "search": {
+        "run": False,
+        "trials": 12,
+        "steps": 600,         # a CEILING per trial; early stopping usually ends it sooner
     },
 
     # How to divide history. Strictly by DATE, never at random: the model must be
@@ -101,6 +111,7 @@ DEFAULTS: dict = {
 
     "steps": 2000,
     "learning_rate": 1e-4,
+    "weight_decay": 0.05,     # STORM's value. Was hardcoded to 0.01 in training.py.
     "seed": 42,
     "data_dir": "artifacts",
 }
@@ -108,9 +119,11 @@ DEFAULTS: dict = {
 # Settings that must be a positive whole number.
 _POSITIVE = {
     ("ts", "days"), ("ts", "encoder_depth"), ("ts", "decoder_depth"), ("ts", "batch"),
+    ("ts", "heads"), ("cs", "heads"),
     ("cs", "days"), ("cs", "encoder_depth"), ("cs", "decoder_depth"), ("cs", "batch"),
     ("fusion", "depth"), ("fusion", "batch"),
     ("predictor", "sentence_length"), ("predictor", "depth"),
+    ("search", "trials"), ("search", "steps"),
     ("model_size",), ("steps",),
 }
 # Settings that must be a vocabulary of at least two words.
@@ -186,12 +199,33 @@ def check(settings: dict) -> dict:
             raise ValueError(
                 f"`loss['{name}']` must be a number of 0 or more, got {weight!r}."
             )
-    if out["loss"]["candle"] == 0 and out["loss"]["diversity"] == 0:
+
+    for entry in ("ts", "cs", "fusion"):
+        for knob in ("commitment", "diversity", "decay"):
+            value = out[entry][knob]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"`{entry}['{knob}']` must be a number of 0 or more, got {value!r}."
+                )
+        if not 0 < out[entry]["decay"] < 1:
+            raise ValueError(
+                f"`{entry}['decay']` is the codebook's memory and must sit strictly "
+                f"between 0 and 1, got {out[entry]['decay']!r}."
+            )
+        if out[entry]["commitment"] == 0 and out[entry]["diversity"] == 0:
+            raise ValueError(
+                f"With both `{entry}['commitment']` and `{entry}['diversity']` at 0, "
+                "nothing holds the codebook apart: it will crowd onto a few words, and a "
+                "token drawn from a handful of words carries almost no information."
+            )
+
+    if not isinstance(out["search"]["run"], bool):
         raise ValueError(
-            "With both `loss['candle']` and `loss['diversity']` at 0, nothing stops the "
-            "codebook collapsing: the model will make every day the same word, because "
-            "a constant word is trivially easy to predict."
+            f"`search['run']` must be True or False, got {out['search']['run']!r}."
         )
+
+    if out["weight_decay"] < 0:
+        raise ValueError(f"`weight_decay` must be 0 or more, got {out['weight_decay']!r}.")
 
     if out["learning_rate"] <= 0:
         raise ValueError(f"`learning_rate` must be above 0, got {out['learning_rate']!r}.")

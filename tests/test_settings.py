@@ -1,12 +1,15 @@
+import inspect
+
 import pytest
 
 import bubble_bi as bb
+from bubble_bi.models import VQVAE
 from bubble_bi.settings import DEFAULTS
 
 
 def test_minimal_settings_get_every_default_filled_in():
     s = bb.check({"tickers": ["AAPL"]})
-    assert s["ts"]["days"] == 4
+    assert s["ts"]["days"] == 15
     assert s["cs"]["days"] == 5
     assert s["fusion"]["vocabulary"] == 512
     assert s["predictor"]["sentence_length"] == 64
@@ -84,3 +87,35 @@ def test_summary_names_both_entries_and_the_merged_token():
 
 def test_device_reports_something_we_can_run_on():
     assert bb.device() in {"cpu", "gpu", "tpu"}
+
+
+def test_no_setting_in_an_entry_block_is_decorative():
+    """A setting no model reads is worse than no setting: it LIES.
+
+    This is the test that would have caught the bug this whole spec exists for.
+    `loss['commitment']` sat in SETTINGS for the entire project, was validated on every
+    run, and was handed to nothing. We trained at commitment=1.0 while reading 0.25.
+    """
+    accepted = set(inspect.signature(VQVAE.__init__).parameters)
+    for entry in ("ts", "cs"):
+        unread = set(DEFAULTS[entry]) - accepted
+        assert not unread, (
+            f"SETTINGS[{entry!r}] contains settings VQVAE never reads: {sorted(unread)}. "
+            "Either wire them up or delete them — a setting that does nothing is a lie."
+        )
+
+
+def test_the_codebook_knobs_actually_reach_the_codebook():
+    model = VQVAE(companies=1, features=6, width=16,
+                  **{**DEFAULTS["ts"], "commitment": 0.9, "diversity": 0.7, "decay": 0.5})
+    assert model.codebook.commitment == 0.9
+    assert model.codebook.diversity == 0.7
+    assert model.codebook.decay == 0.5
+
+
+def test_commitment_defaults_to_the_literature_value():
+    """0.25, not 1.0. An over-strong commitment pins the encoder to the codebook and is a
+    documented cause of the collapse we see in fusion."""
+    assert DEFAULTS["ts"]["commitment"] == 0.25
+    assert DEFAULTS["cs"]["commitment"] == 0.25
+    assert VQVAE(companies=1, days=4, features=6, width=16).codebook.commitment == 0.25

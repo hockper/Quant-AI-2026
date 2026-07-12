@@ -65,8 +65,9 @@ class VQVAE(nn.Module):
         decoder_depth: int = 2,
         heads: int = 4,
         dropout: float = 0.1,
-        commitment: float = 1.0,
+        commitment: float = 0.25,
         diversity: float = 0.1,
+        decay: float = 0.99,
         batch: int | None = None,
         steps: int | None = None,
     ):
@@ -96,7 +97,7 @@ class VQVAE(nn.Module):
         self.encoder = _transformer(width, encoder_depth, heads, dropout)
 
         # --- the dictionary ---------------------------------------------------
-        self.codebook = Codebook(words=vocabulary, width=width,
+        self.codebook = Codebook(words=vocabulary, width=width, decay=decay,
                                  commitment=commitment, diversity=diversity)
 
         # --- decoder: one vector -> grid --------------------------------------

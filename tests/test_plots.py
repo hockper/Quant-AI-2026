@@ -34,12 +34,12 @@ def world():
     prices = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
 
     settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
-                         "ts": {"batch": 32}, "cs": {"batch": 32}})
+                         "ts": {"batch": 32, "heads": 2}, "cs": {"batch": 32, "heads": 2}})
     data = bb.data.add_features(prices, settings)
     batches = bb.data.make_tensors(data, settings)
 
     torch.manual_seed(0)
-    model = VQVAE(companies=1, features=len(bb.data.names()), width=32, heads=2,
+    model = VQVAE(companies=1, features=len(bb.data.names()), width=32,
                   **settings["ts"])
     history = train(model, batches.ts, settings, steps=40, quiet=True)
     return model, batches, prices, settings, history
