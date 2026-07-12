@@ -298,3 +298,44 @@ def make_tensors(table: pd.DataFrame, settings: dict) -> Batches:
         ts=loaders(TSGrids, settings["ts"]["days"], settings["ts"]["batch"]),
         cs=loaders(CSGrids, settings["cs"]["days"], settings["cs"]["batch"]),
     )
+
+
+def tuning_loaders(batches: Batches, entry: str, days: int,
+                   batch: int) -> dict[str, DataLoader]:
+    """One entry's grids at a given window length — LEARN AND TUNE ONLY.
+
+    The hyperparameter search varies `days` (the window length), which changes the
+    shape of the grids themselves, so they have to be rebuilt from scratch for every
+    window the search tries.
+
+    ⚠️ `test` is not in the result, and that is the whole point. A search that could
+    reach the test days would quietly tune on the answer, then report a wonderful
+    score on it -- because it had already seen it. The defence here is not a comment
+    telling the next person to be careful with `test`; it is that the test loader is
+    never built in the first place, so there is nothing for the search to reach.
+    """
+    if entry not in ("ts", "cs"):
+        raise ValueError(f"`entry` must be 'ts' or 'cs', got {entry!r}.")
+
+    build = TSGrids if entry == "ts" else CSGrids
+    scaled = batches.scaler.apply(batches.arrays.x)
+
+    out = {}
+    for period in ("learn", "tune"):
+        dataset = build(batches.arrays, scaled, batches.days[period], days)
+        if len(dataset) == 0:
+            raise ValueError(
+                f"No usable {days}-day {entry.upper()} grids in the '{period}' period. "
+                f"A {days}-day window needs {days} days of run-up on top of what the slow "
+                "features already need -- try a shorter window, or a longer history."
+            )
+        out[period] = DataLoader(
+            dataset,
+            batch_size=batch,
+            shuffle=(period == "learn"),
+            # Same guard as in `make_tensors`: dropping a ragged final batch is fine
+            # unless it is the ONLY batch, in which case it would silently hand back
+            # an empty loader and the search would appear to train on nothing.
+            drop_last=(period == "learn" and len(dataset) > batch),
+        )
+    return out
