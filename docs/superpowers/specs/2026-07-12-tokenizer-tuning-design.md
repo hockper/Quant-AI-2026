@@ -112,11 +112,34 @@ tokenizer*, no downstream predictor can recover it, and the regime pivot is prov
 than assumed. If some configuration *can*, the candle was never noise — we were simply
 running the wrong hyperparameters, and the original plan stands.
 
+### Where "tomorrow" belongs
+
+Not here. The two modules have different jobs and must be tuned on different questions:
+
+| module | trained to produce | tuned on |
+|---|---|---|
+| **TS / CS** — *this spec* | a token standing for **today** | does today survive the bottleneck |
+| **fusion + predictor** — *the next spec* | **tomorrow's token**, and tomorrow's candle | does it forecast |
+
+Tomorrow is the predictor's target, and it gets measured when we tune the predictor. Ask
+the tokenizer to forecast and we are grading the wrong module for the wrong thing.
+
 ### Rejection, not scoring
 
 A trial whose codebook **collapsed** — fewer than 5% of words alive — scores `−inf`. It is
 not ranked, it is thrown out. A token drawn from 12 live words carries ~3.5 bits and is
 useless downstream however well it probes.
+
+**This guard is not hygiene. It is what stops the next spec's objective from being a trick
+question.** The predictor's target *is tomorrow's token* — so a collapsed codebook does not
+merely weaken the predictor, it **destroys its target**. Every day becomes the same word,
+"predict tomorrow's token" is satisfied by saying that word forever, and the predictor
+scores brilliantly while knowing nothing. We have watched this happen: naming accuracy hit
+**87% while the codebook fell to 3 words**.
+
+A tokenizer that collapses hands the predictor a task it can win by shrugging. So the
+tokenizer's contract is not just *be informative* — it is **keep tomorrow's token worth
+predicting**, and that is enforced here, at the only place it can be.
 
 ## Part 0 — Wire the settings to the models
 
@@ -364,7 +387,11 @@ One new section, after the tensors and before the TS training:
 
 ## Out of scope
 
-- Fusion and predictor tuning — their own spec, on top of these winners.
+- Fusion and predictor tuning — their own spec, on top of these winners. That is where
+  **tomorrow** gets measured, because tomorrow's token is the *predictor's* target, not the
+  tokenizer's. Note the dependency runs one way and cannot be reversed: this search must
+  land first, because a collapsed tokenizer would leave the predictor with a degenerate
+  target and make its whole search meaningless.
 - μP / width-aware learning-rate scaling. It is the principled fix for the Stage-A/Stage-B
   interaction and worth revisiting if the head-to-head confirm keeps rejecting winners,
   but it is an architecture change and not worth it at a 12-trial budget.
