@@ -44,3 +44,25 @@ def test_run_tests_reports_failure(tmp_path):
     passed, summary = run_tests(str(tmp_path))
     assert passed is False
     assert "failed" in summary
+
+
+def test_a_known_problem_shows_the_failure_but_lets_the_notebook_continue(capsys):
+    """Some failures are open research questions, not broken code. The ❌ must stay --
+    we do not dress up a bad result -- but the notebook has to be runnable."""
+    report(
+        "The predictor",
+        [("Beats persistence", False, "no — worse than doing nothing"),
+         ("Dictionary alive", False, "perplexity 12 of 512")],
+        have="A model that reads sentences.",
+        known_problem="Diagnosed, not fixed: docs/OPEN-QUESTION-codebook-collapse.md",
+    )
+    out = capsys.readouterr().out
+    assert "❌" in out
+    assert "A KNOWN PROBLEM" in out
+    assert "do not pretend this passed" in out
+
+
+def test_a_known_problem_does_not_excuse_an_unexplained_failure():
+    # Without a written explanation, a failure still stops everything.
+    with pytest.raises(CheckFailed):
+        report("Setup", [("Torch", False, "missing")], have="nothing")

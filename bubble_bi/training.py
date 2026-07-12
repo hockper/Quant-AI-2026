@@ -240,6 +240,113 @@ class _Progress:
         self.line = text
 
 
+@torch.no_grad()
+def score_predictions(world, loader, where: torch.device, limit: int = 30) -> dict:
+    """How often does the GPT name the next day's word correctly?
+
+    Scored against two floors, because "58% correct" means nothing on its own:
+
+      chance      1 / vocabulary. What you would get by guessing at random.
+      persistence just say TOMORROW LOOKS LIKE TODAY. This is the honest floor, and it
+                  is a HIGH one -- market regimes are sticky, so yesterday's word is
+                  usually still right today. A predictor that cannot beat persistence
+                  has learned nothing worth having, however good its accuracy looks.
+    """
+    world.eval()
+    right = sticky = seen = 0
+    perplexity, drawing, shrugging, batches = 0.0, 0.0, 0.0, 0
+
+    for i, batch in enumerate(loader):
+        if i >= limit:
+            break
+        out = world(_to(batch, where))
+        tokens = out["tokens"]                       # [B, T]
+        said = out["said"].argmax(-1)                # [B, T-1]
+        answer = tokens[:, 1:]
+
+        right += int((said == answer).sum())
+        sticky += int((tokens[:, :-1] == answer).sum())     # "same as yesterday"
+        seen += answer.numel()
+        perplexity += float(out["perplexity"])
+        drawing += float(out.get("drawing_loss", float("nan")))
+        shrugging += float(out.get("shrugging", float("nan")))
+        batches += 1
+
+    world.train()
+    if not seen:
+        return {"accuracy": float("nan"), "persistence": float("nan"),
+                "chance": float("nan"), "perplexity": 0.0,
+                "candle": float("nan"), "shrugging": float("nan")}
+    return {
+        "accuracy": right / seen,
+        "persistence": sticky / seen,
+        "chance": 1 / world.words,
+        "perplexity": perplexity / max(batches, 1),
+        "candle": drawing / max(batches, 1),        # how well it DRAWS tomorrow
+        "shrugging": shrugging / max(batches, 1),   # ...vs drawing the average candle
+    }
+
+
+def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
+                revive_every: int = 50, check_every: int | None = None,
+                quiet: bool = False) -> History:
+    """Train the fusion and the predictor together.
+
+    The tokens are still moving while the predictor learns to name them — the codebook
+    is being reshaped by this very loss. That is the point (the tokens arrange themselves
+    to be worth predicting), but it means the predictor is chasing a target that is
+    itself still settling. The codebook moves by slow moving averages, which is what
+    keeps that from thrashing.
+    """
+    steps = steps or settings["steps"]
+    check_every = check_every or max(1, steps // 10)
+    where = pick_device(settings)
+    world.to(where).train()
+
+    learnable = [p for p in world.parameters() if p.requires_grad]
+    optimiser = torch.optim.AdamW(learnable, lr=settings["learning_rate"],
+                                  weight_decay=0.01)
+    feed = cycle(loaders["learn"])
+    history = History()
+    started = time.time()
+
+    if not quiet:
+        print(f"Training on {str(where).upper()} for {steps:,} steps "
+              f"({len(loaders['learn'].dataset):,} sentences)")
+        print(f"\n{'step':>6}  {'names it':>9}  {'persistence':>12}  "
+              f"{'draws it':>9}  {'shrugging':>10}  {'perplexity':>11}")
+        print("  " + "─" * 68)
+
+    revived = 0
+    for step in range(1, steps + 1):
+        batch = _to(next(feed), where)
+        out = world(batch)
+
+        optimiser.zero_grad(set_to_none=True)
+        out["loss"].backward()
+        torch.nn.utils.clip_grad_norm_(learnable, 1.0)
+        optimiser.step()
+
+        if step % revive_every == 0:
+            revived += world.tokenizer.codebook.revive_dead_words(
+                out["fused"].detach().reshape(-1, world.tokenizer.width)
+            )
+
+        if step % check_every == 0 or step == steps:
+            scored = score_predictions(world, loaders["tune"], where)
+            history.add(step=step, revived=revived, **scored)
+            if not quiet:
+                print(f"{step:>6}  {scored['accuracy']:>8.1%}  "
+                      f"{scored['persistence']:>11.1%}  "
+                      f"{scored['candle']:>9.3f}  {scored['shrugging']:>10.3f}  "
+                      f"{scored['perplexity']:>11.1f}")
+
+    history.seconds = time.time() - started
+    if not quiet:
+        print(f"\n  {history.seconds:.0f}s, {revived:,} dead words revived")
+    return history
+
+
 def baseline_rebuild(loader, limit: int = 40) -> float:
     """What you would score by simply guessing the average for everything.
 

@@ -14,11 +14,12 @@ def _pair(width=32, heads=2):
     return ts, cs
 
 
-def _sentence(batch=2, days=8, width=32):
+def _sentence(batch=2, days=8, width=32, keys=3):
+    """A sentence, straight from the cache — which is how the world model is fed."""
     return {
-        "stock": torch.randn(batch, days, 1, 4, FEATURES),
-        "market": torch.randn(batch, days, COMPANIES, 3, FEATURES),
-        "present": torch.ones(batch, days, COMPANIES, dtype=torch.bool),
+        "z_ts": torch.randn(batch, days, width),          # what the company was doing
+        "market": torch.randn(batch, days, keys, width),  # what the market was offering
+        "candle": torch.randn(batch, days, 4),            # the candle each day really was
     }
 
 
@@ -179,6 +180,7 @@ def test_the_world_model_turns_a_sentence_into_tokens_and_guesses_the_next():
 
     assert out["tokens"].shape == (3, 8)              # one token per day
     assert out["attention"].shape == (3, 8, 3)        # ...and what each one read
+    assert out["drawn"].shape == (3, 7, 4)            # tomorrow's candle, for each day
     assert torch.isfinite(out["loss"])
     assert 0.0 <= float(out["accuracy"]) <= 1.0
 
@@ -217,3 +219,71 @@ def test_it_can_actually_learn_to_predict_the_next_token():
     last = float(world(batch)["naming_loss"])
 
     assert last < first * 0.7, f"barely learned: {first:.2f} -> {last:.2f}"
+
+
+# ------------------------------------------------- the candle head, and the cheat
+
+def test_the_model_is_asked_to_draw_tomorrows_candle():
+    ts, cs = _pair()
+    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+                       sentence=8, depth=2, heads=2, dropout=0.0)
+    out = world(_sentence(batch=3, days=8))
+
+    assert out["drawn"].shape == (3, 7, 4)          # gap, body, and the two wicks
+    assert "drawing_loss" in out and "shrugging" in out
+    # `shrugging` is what you score by drawing the AVERAGE candle. It is what makes
+    # `drawing_loss` mean something on its own.
+    assert float(out["shrugging"]) > 0
+
+
+def test_the_candle_loss_reaches_the_fusion_so_an_empty_token_is_punished():
+    """The whole point of the candle head. A collapsed token carries no information, so
+    it cannot draw a candle -- but only if the drawing loss actually reaches back into
+    the fusion that produced the token."""
+    ts, cs = _pair()
+    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+                       sentence=8, depth=2, heads=2, dropout=0.0)
+    world(_sentence())["drawing_loss"].backward()
+
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in world.tokenizer.fusion.parameters())
+
+
+def test_the_loss_weights_are_obeyed():
+    ts, cs = _pair()
+    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+                       sentence=8, depth=2, heads=2, dropout=0.0,
+                       naming_weight=0.1, candle_weight=1.0)
+    out = world(_sentence())
+    total = (0.1 * out["naming_loss"] + 1.0 * out["drawing_loss"]
+             + out["commitment_loss"] + out["diversity_loss"])
+    assert torch.allclose(out["loss"], total)
+
+
+def test_without_a_candle_the_model_still_runs_but_says_so():
+    # No candle in the batch -> no drawing loss. The model must not silently invent one.
+    ts, cs = _pair()
+    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+                       sentence=8, depth=2, heads=2, dropout=0.0)
+    batch = _sentence()
+    del batch["candle"]
+    out = world(batch)
+    assert "drawing_loss" not in out
+    assert torch.isfinite(out["loss"])
+
+
+def test_the_fusion_codebook_carries_the_diversity_penalty():
+    # The anti-collapse term must be on the FUSION's codebook, not just TS and CS.
+    ts, cs = _pair()
+    tok = Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0,
+                    commitment=1.0, diversity=0.5)
+    assert tok.codebook.commitment == 1.0
+    assert tok.codebook.diversity == 0.5
+
+    world = WorldModel(tok, sentence=8, depth=2, heads=2, dropout=0.0)
+    out = world(_sentence())
+    assert float(out["diversity_loss"]) != 0.0
+
+    out["diversity_loss"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in tok.fusion.parameters())

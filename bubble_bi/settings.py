@@ -55,6 +55,29 @@ DEFAULTS: dict = {
         "depth": 4,
     },
 
+    # What the model is being pulled towards, and how hard.
+    #
+    # These four fight each other, and the balance IS the design:
+    #
+    #   naming      predict tomorrow's WORD. ⚠️ This is the one that rewards CHEATING:
+    #               make every day the same word and it is trivially satisfied. Turn it
+    #               up and the codebook collapses -- we watched it fall to 3 words while
+    #               "accuracy" shot to 87%. The paper keeps it small (0.1) for this
+    #               reason, and so do we.
+    #   candle      draw tomorrow's CANDLE. This is the anchor. A collapsed token carries
+    #               no information, so it cannot draw a candle -- which makes the cheat
+    #               expensive. It also forces the token to carry DIRECTION (the body is
+    #               where it closed against where it opened), the one thing both halves
+    #               of the tokenizer were throwing away.
+    #   commitment  keep the encoder's output close to a word it already has.
+    #   diversity   punish the dictionary for crowding onto a few words (STORM eq. 4).
+    "loss": {
+        "naming": 0.1,
+        "candle": 1.0,
+        "commitment": 1.0,
+        "diversity": 0.1,
+    },
+
     # How to divide history. Strictly by DATE, never at random: the model must be
     # tested on days it has never seen, in the order they actually happened.
     #   learn    the model trains on these
@@ -141,6 +164,18 @@ def check(settings: dict) -> dict:
             f"`fusion['attend_to']` must be 'days', 'companies' or 'cells' — "
             f"got {attend!r}. It decides how fine-grained a menu the market offers "
             "each company's token to read."
+        )
+
+    for name, weight in out["loss"].items():
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool) or weight < 0:
+            raise ValueError(
+                f"`loss['{name}']` must be a number of 0 or more, got {weight!r}."
+            )
+    if out["loss"]["candle"] == 0 and out["loss"]["diversity"] == 0:
+        raise ValueError(
+            "With both `loss['candle']` and `loss['diversity']` at 0, nothing stops the "
+            "codebook collapsing: the model will make every day the same word, because "
+            "a constant word is trivially easy to predict."
         )
 
     if out["learning_rate"] <= 0:
