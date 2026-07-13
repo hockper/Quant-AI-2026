@@ -126,6 +126,111 @@ def test_score_tokenizer_reports_how_noisy_its_own_floor_is():
         assert scored[key] >= 0
 
 
+@pytest.fixture
+def tiny_settings(tmp_path):
+    return {
+        **DEFAULTS,
+        "tickers": ["AAA", "BBB", "CCC"],
+        # The Optuna study lands under data_dir -- keep it out of the real artifacts
+        # folder, or the resume test would find a stale study from a previous run.
+        "data_dir": str(tmp_path),
+        "model_size": 16,
+        "learning_rate": 1e-3,
+        "steps": 20,
+        "ts": {**DEFAULTS["ts"], "days": 3, "batch": 8, "vocabulary": 16,
+               "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
+        "cs": {**DEFAULTS["cs"], "days": 3, "batch": 4, "vocabulary": 16,
+               "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
+        "search": {"run": True, "trials": 2, "steps": 20},
+    }
+
+
+@pytest.fixture
+def tiny_batches(tiny_settings):
+    """A synthetic panel: 3 companies, 600 days, real features.
+
+    ⚠️ Sized 600, not the smaller 400 the brief sketched: the slowest feature
+    (`amihud`'s year-long normalising window, NORM_WINDOW=252 in microstructure.py)
+    needs ~273 days of run-up before it produces a single finite row. At 400 days,
+    the 70% learn split only reaches 8 usable days -- below `Scaler.LEAST_DAYS` (60)
+    -- and `make_tensors` refuses to normalise. 600 days clears that with room to
+    spare while still building and training in well under a second.
+    """
+    import pandas as pd
+
+    from bubble_bi.data import add_features, make_tensors
+
+    n = 600
+    rng = np.random.default_rng(0)
+    days = pd.date_range("2020-01-01", periods=n, freq="B")
+    frames = []
+    for ticker in tiny_settings["tickers"]:
+        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
+        one = pd.DataFrame({
+            "date": days,
+            "ticker": ticker,
+            "open": close * (1 + rng.normal(0, 0.002, n)),
+            "high": close * (1 + abs(rng.normal(0, 0.005, n))),
+            "low": close * (1 - abs(rng.normal(0, 0.005, n))),
+            "close": close,
+            "volume": rng.integers(1e6, 5e6, n).astype(float),
+        })
+        # add_features needs a (date, ticker) index and a `target` column, same as
+        # every other fixture in this suite -- tomorrow's return, computed per company.
+        one["target"] = one["close"].shift(-1) / one["close"] - 1.0
+        frames.append(one)
+    raw = pd.concat(frames, ignore_index=True).set_index(["date", "ticker"]).sort_index()
+    table = add_features(raw, tiny_settings)
+    return make_tensors(table, tiny_settings)
+
+
+def test_the_search_space_fixes_the_knobs_we_already_know():
+    """decoder_depth is not searched because the decoder is THROWN AWAY when we freeze the
+    tokenizer. Searching it would be tuning a part we delete."""
+    searched = {k for stage in tuning.SPACE.values() for k in stage}
+    assert "decoder_depth" not in searched
+    assert "batch" not in searched
+    assert searched == {"learning_rate", "commitment", "diversity",
+                        "model_size", "vocabulary", "days"}
+
+
+def test_the_balance_comes_before_the_sizes():
+    assert list(tuning.SPACE) == ["balance", "sizes"]
+    assert set(tuning.SPACE["balance"]) == {"learning_rate", "commitment", "diversity"}
+    assert set(tuning.SPACE["sizes"]) == {"model_size", "vocabulary", "days"}
+
+
+def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_settings):
+    """End-to-end on a 2-trial synthetic run: whatever the search hands back must be a
+    settings dict the project will actually accept.
+
+    `best` is a FLAT dict: it mixes the entry's own knobs (commitment, diversity,
+    vocabulary, days, ...) with the two top-level ones the search also tunes
+    (learning_rate, model_size) -- because that is what `SPACE` actually searches.
+    Applying it back means sorting each key into where `check()` expects it, exactly
+    as a notebook cell would.
+    """
+    from bubble_bi.settings import check
+
+    best, trials = tuning.search("ts", tiny_batches, tiny_settings)
+
+    assert len(trials) == 2
+    assert {"score", "direction", "volatility", "words_used"} <= set(trials.columns)
+    top, block = {"learning_rate", "model_size"}, {k: v for k, v in best.items()
+                                                    if k not in ("learning_rate", "model_size")}
+    check({**tiny_settings, **{k: best[k] for k in top},
+          "ts": {**tiny_settings["ts"], **block}})
+
+
+def test_a_killed_search_resumes_instead_of_starting_over(tiny_batches, tiny_settings):
+    """Colab WILL disconnect. The study is on disk, so a second call must top up the
+    trials that are missing -- not run the whole budget again on top of them."""
+    tuning.search("ts", tiny_batches, tiny_settings)
+    _, again = tuning.search("ts", tiny_batches, tiny_settings)
+
+    assert len(again) == 2, "the resumed search re-ran trials it had already completed"
+
+
 def test_the_probe_target_is_TODAY_and_never_tomorrow():
     """TS and CS are autoencoders. The target is the LAST DAY of the window they were just
     handed — read straight out of the grid, so nothing from the future can reach it."""

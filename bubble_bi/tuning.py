@@ -284,3 +284,163 @@ def score_tokenizer(model, loader, settings: dict) -> dict:
         "words_used": used,
         "why": "",
     }
+
+
+# ---------------------------------------------------------------- the search space
+#
+# Six knobs, tight informed ranges. What is NOT here matters as much as what is:
+#
+#   decoder_depth   the decoder is THROWN AWAY when we freeze the tokenizer.
+#                   Tuning it is tuning a part we delete.
+#   batch           already reasoned from the 30x data-size gap (TS 256 / CS 64).
+#   weight_decay    fixed at STORM's 0.05.
+#   revive_every    not where the problem is.
+#
+# Two stages, because the user asked two different questions -- "get the sizes correct,
+# the balance right" -- and at twelve trials a blind six-knob search is a lottery.
+SPACE = {
+    "balance": {
+        "learning_rate": ("log", 3e-5, 3e-3),   # never once tested. It is 1e-4 because
+                                                # somebody typed 1e-4.
+        "commitment": ("log", 0.1, 2.0),        # we ran at 1.0; the standard is 0.25
+        "diversity": ("float", 0.0, 1.0),       # the anti-collapse term
+    },
+    "sizes": {
+        "model_size": ("pick", [64, 128, 256]),
+        "vocabulary": ("pick", [128, 256, 512, 1024]),
+        "days": {"ts": ("pick", [5, 10, 15, 20, 30]),
+                 "cs": ("pick", [1, 3, 5, 10])},
+    },
+}
+
+# `model_size` is a top-level setting; the rest live inside the entry's own block.
+_TOP_LEVEL = {"learning_rate", "model_size"}
+
+
+def _ask(trial, name, rule):
+    kind = rule[0]
+    if kind == "log":
+        return trial.suggest_float(name, rule[1], rule[2], log=True)
+    if kind == "float":
+        return trial.suggest_float(name, rule[1], rule[2])
+    if kind == "pick":
+        return trial.suggest_categorical(name, rule[1])
+    raise ValueError(f"unknown rule {kind!r} for {name!r}")
+
+
+def _settle(settings: dict, entry: str, chosen: dict) -> dict:
+    """A full settings dict with this trial's choices folded in."""
+    out = {**settings, **{k: v for k, v in chosen.items() if k in _TOP_LEVEL}}
+    out[entry] = {**settings[entry],
+                  **{k: v for k, v in chosen.items() if k not in _TOP_LEVEL}}
+    return out
+
+
+def _run_one(entry, chosen, batches, settings, scorer, features, companies, trial=None):
+    """Train one configuration and score it. Returns the scorer's dict."""
+    import optuna
+
+    from bubble_bi.data.tensors import tuning_loaders
+    from bubble_bi.models import VQVAE
+    from bubble_bi.training import train
+
+    live = _settle(settings, entry, chosen)
+    block = live[entry]
+    loaders = tuning_loaders(batches, entry, block["days"], block["batch"])
+
+    model = VQVAE(
+        companies=1 if entry == "ts" else companies,
+        features=features,
+        width=live["model_size"],
+        **block,
+    )
+
+    def watch(step, scored):
+        if trial is None:
+            return
+        # Report the REAL objective, not the rebuild loss -- pruning on a signal we have
+        # already proved misleading would throw away the good trials.
+        trial.report(scorer(model, loaders["tune"], live)["score"], step)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    train(model, loaders, live, steps=live["search"]["steps"],
+          quiet=True, on_check=watch)
+    return scorer(model, loaders["tune"], live)
+
+
+def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
+    """Find good settings for one entry. Returns (best_block, trials_table).
+
+    Two stages: the BALANCE first (learning rate, commitment, diversity, with the sizes
+    held at their defaults), then the SIZES with the winning balance held fixed.
+
+    Coordinate descent assumes the two groups barely interact. They do interact -- the
+    best learning rate genuinely moves with width -- so this is an approximation, and it
+    is the price of a twelve-trial budget. Two things keep it honest: the winner is
+    confirmed head-to-head at FULL budget (see `confirm`), and raising `search["trials"]`
+    narrows the gap with no change to this code.
+    """
+    import optuna
+    import pandas as pd
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    features = len(names())
+    companies = len(settings["tickers"])
+    budget = settings["search"]["trials"]
+    rows, fixed = [], {}
+
+    for stage, knobs in SPACE.items():
+        rules = {name: (rule[entry] if isinstance(rule, dict) else rule)
+                 for name, rule in knobs.items()}
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=settings["seed"], n_startup_trials=4),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=3),
+            storage=_study_path(settings, entry, stage),
+            study_name=f"{entry}-{stage}",
+            load_if_exists=True,                 # <- resume. A disconnect costs one trial.
+        )
+
+        def objective(trial):
+            chosen = {**fixed,
+                      **{name: _ask(trial, name, rule) for name, rule in rules.items()}}
+            scored = _run_one(entry, chosen, batches, settings, scorer,
+                              features, companies, trial=trial)
+            for key, value in scored.items():
+                trial.set_user_attr(key, value)
+            return scored["score"]
+
+        # The study is on disk, so a resumed run must only top up what is missing.
+        done = len([t for t in study.trials
+                    if t.state == optuna.trial.TrialState.COMPLETE])
+        study.optimize(objective, n_trials=max(0, budget // 2 - done))
+
+        for trial in study.trials:
+            if trial.state != optuna.trial.TrialState.COMPLETE:
+                continue
+            rows.append({"stage": stage, **trial.params,
+                         **{k: trial.user_attrs.get(k) for k in
+                            ("score", "direction", "volatility",
+                             "before_quant", "words_used", "why")}})
+
+        alive = [t for t in study.trials
+                 if t.state == optuna.trial.TrialState.COMPLETE and t.value > -math.inf]
+        if alive:
+            fixed.update(max(alive, key=lambda t: t.value).params)
+
+    table = pd.DataFrame(rows).sort_values("score", ascending=False)
+    best = _settle(settings, entry, fixed)
+    return {**best[entry], "learning_rate": best["learning_rate"],
+            "model_size": best["model_size"]}, table
+
+
+def _study_path(settings: dict, entry: str, stage: str) -> str:
+    """Where the study lives. On Colab `data_dir` is Drive, so a disconnect costs one
+    trial rather than the whole session."""
+    from pathlib import Path
+
+    folder = Path(settings["data_dir"]) / "search"
+    folder.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{folder / f'{entry}-{stage}.db'}"

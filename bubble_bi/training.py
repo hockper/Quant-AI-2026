@@ -155,12 +155,16 @@ def train(
     check_every: int | None = None,
     patience: int = 5,
     quiet: bool = False,
+    on_check=None,
 ) -> History:
     """Train one VQ-VAE, and STOP when it starts getting worse.
 
     loaders: {"learn": ..., "tune": ...} — the grids for this entry (TS or CS).
     steps:   the MOST batches to learn from. Defaults to settings["steps"].
     patience: give up after this many checks with no improvement on the held-out days.
+    on_check: called as on_check(step, scored) at every held-out check. A hyperparameter
+              search uses this to give up on a hopeless trial early. It may RAISE to stop
+              training — the exception is deliberately not caught.
 
     ⚠️ Why this exists. CS has ~2,600 grids; TS has ~78,000. They share one `steps`
     setting, so 10,000 steps is 33 passes over the TS data and **243 passes** over the
@@ -231,6 +235,8 @@ def train(
                 words_used=scored["words_used"],
                 revived=revived,
             )
+            if on_check is not None:
+                on_check(step, scored)      # may raise, on purpose: that is how a search prunes
             running, seen = 0.0, 0
             progress.checkpoint(step, scored, model.codebook.words)
 
