@@ -17,6 +17,13 @@ look respectable while this happens. Perplexity is what exposes it:
 
 We fight the collapse by reviving dead words: any word nobody is choosing gets
 dropped onto a real encoder output, so it has somewhere realistic to compete from.
+
+`train()` teaches ONE VQ-VAE (TS or CS) on its own, against a rebuild-the-grid target.
+`train_joint()`, further down, teaches the WHOLE model at once -- both VQ-VAEs, the
+cross-attention between them, and the GPT that reads their words -- against tomorrow's
+candle. There are now TWO dictionaries to watch instead of one, and `train_joint`'s own
+docstring explains why its cold start (perplexity really does start at 1.0 there too)
+is deliberate.
 """
 
 from __future__ import annotations
@@ -71,7 +78,6 @@ class History:
     def frame(self) -> pd.DataFrame:
         return pd.DataFrame(self.rows).set_index("step")
 
-    @property
     def last(self) -> dict:
         return self.rows[-1] if self.rows else {}
 
@@ -375,88 +381,107 @@ def score_predictions(world, loader, where: torch.device, limit: int = 30) -> di
     }
 
 
-def train_world(world, loaders: dict, settings: dict, steps: int | None = None,
+@torch.no_grad()
+def score_joint(world, loader, where: torch.device, limit: int = 30) -> dict:
+    """How the joint model is doing, against its two HONEST floors.
+
+        drawing  vs  shrugging     -- draw tomorrow's candle, vs draw the average candle
+        accuracy vs  persistence   -- name tomorrow's words, vs say today's words again
+
+    Never against zero. This project has had to walk back two numbers that were quoted
+    without their floor.
+    """
+    world.to(where).eval()
+    total = {k: 0.0 for k in ("drawing", "shrugging", "accuracy", "persistence",
+                              "ts_perplexity", "cs_perplexity")}
+    seen = 0
+    for i, batch in enumerate(loader):
+        if i >= limit:
+            break
+        out = world(_to(batch, where))
+        total["drawing"] += float(out["drawing_loss"])
+        total["shrugging"] += float(out["shrugging"])
+        total["accuracy"] += float(out["accuracy"])
+        total["persistence"] += float(out["persistence"])
+        total["ts_perplexity"] += float(out["ts_perplexity"])
+        total["cs_perplexity"] += float(out["cs_perplexity"])
+        seen += 1
+    world.train()
+    return {k: v / max(seen, 1) for k, v in total.items()}
+
+
+def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
                 revive_every: int = 50, check_every: int | None = None,
                 patience: int = 5, quiet: bool = False) -> History:
-    """Train the fusion and the predictor together.
+    """Everything at once: the encoders, BOTH codebooks, the fusion and the GPT.
 
-    The tokens are still moving while the predictor learns to name them — the codebook
-    is being reshaped by this very loss. That is the point (the tokens arrange themselves
-    to be worth predicting), but it means the predictor is chasing a target that is
-    itself still settling. The codebook moves by slow moving averages, which is what
-    keeps that from thrashing.
+    ⚠️ COLD START, on purpose. There is no reconstruction-only warm-up, not even a short
+    one: pretraining would shape the representation for the compress-everything objective
+    this whole design exists to escape.
+
+    The price is that the GPT spends its first steps predicting a vocabulary of roughly
+    one word (perplexity really does start at 1.0). Watch `ts_perplexity` and
+    `cs_perplexity` from step one -- they are printed every check, from the very first
+    one. If they never open, the cold start has dead-locked -- and the fix is a 300-step
+    reconstruction-only warm-up, added WITH EVIDENCE rather than on principle.
     """
     steps = steps or settings["steps"]
     check_every = check_every or max(1, steps // 10)
     where = pick_device(settings)
     world.to(where).train()
 
-    learnable = [p for p in world.parameters() if p.requires_grad]
-    optimiser = torch.optim.AdamW(learnable, lr=settings["learning_rate"],
+    optimiser = torch.optim.AdamW(world.parameters(), lr=settings["learning_rate"],
                                   weight_decay=settings["weight_decay"])
     feed = cycle(loaders["learn"])
     history = History()
     started = time.time()
-
-    if not quiet:
-        print(f"Training on {describe_device(where)} for {steps:,} steps "
-              f"({len(loaders['learn'].dataset):,} sentences)")
-        print(f"\n{'step':>6}  {'names it':>9}  {'persistence':>12}  "
-              f"{'draws it':>9}  {'shrugging':>10}  {'perplexity':>11}")
-        print("  " + "─" * 68)
-
-    revived = 0
     best, best_at, best_weights, stale = float("inf"), 0, None, 0
+    revived = 0
 
     for step in range(1, steps + 1):
-        batch = _to(next(feed), where)
-        out = world(batch)
-
-        optimiser.zero_grad(set_to_none=True)
+        out = world(_to(next(feed), where))
+        optimiser.zero_grad()
         out["loss"].backward()
-        torch.nn.utils.clip_grad_norm_(learnable, 1.0)
+        torch.nn.utils.clip_grad_norm_(world.parameters(), 1.0)
         optimiser.step()
 
+        # Dead words get dropped onto real encoder output, so they have somewhere realistic
+        # to compete from. Both dictionaries -- there is no fused codebook to revive now.
         if step % revive_every == 0:
-            revived += world.tokenizer.codebook.revive_dead_words(
-                out["fused"].detach().reshape(-1, world.tokenizer.width)
-            )
+            revived += world.tokenizer.ts.codebook.revive_dead_words(
+                out["ts_summary"].detach())
+            revived += world.tokenizer.cs.codebook.revive_dead_words(
+                out["cs_summary"].detach())
 
         if step % check_every == 0 or step == steps:
-            scored = score_predictions(world, loaders["tune"], where)
+            scored = score_joint(world, loaders["tune"], where)
             history.add(step=step, revived=revived, **scored)
             if not quiet:
-                print(f"{step:>6}  {scored['accuracy']:>8.1%}  "
-                      f"{scored['persistence']:>11.1%}  "
-                      f"{scored['candle']:>9.3f}  {scored['shrugging']:>10.3f}  "
-                      f"{scored['perplexity']:>11.1f}")
+                print(f"  {step:>6}  candle {scored['drawing']:.3f} "
+                      f"(shrug {scored['shrugging']:.3f})   "
+                      f"words {scored['accuracy']:.1%} "
+                      f"(persist {scored['persistence']:.1%})   "
+                      f"perplexity TS {scored['ts_perplexity']:.0f} "
+                      f"CS {scored['cs_perplexity']:.0f}")
 
-            # The score to keep the best on is how well it DRAWS tomorrow -- accuracy is
-            # the one the model can cheat by collapsing the codebook, so it is not safe
-            # to optimise a checkpoint against.
-            watch = scored["candle"]
-            if watch < best - 1e-4:
-                best, best_at, stale = watch, step, 0
+            # Keep the best model on how well it DRAWS tomorrow -- naming accuracy is the
+            # number that flatters a collapsed codebook, so it must never be what we select on.
+            if scored["drawing"] < best - 1e-4:
+                best, best_at, stale = scored["drawing"], step, 0
                 best_weights = {k: v.detach().cpu().clone()
                                 for k, v in world.state_dict().items()}
             else:
                 stale += 1
                 if stale >= patience:
                     if not quiet:
-                        print(f"\n  ⏹  Stopping at step {step:,}: it has not drawn "
-                              f"tomorrow any better for {patience} checks.")
+                        print(f"\n  ⏹  Stopped at step {step:,} — tomorrow's candle has not "
+                              f"improved for {patience} checks.")
                     break
 
     history.seconds = time.time() - started
     history.best_step = best_at
-    if best_weights is not None and best_at != history.rows[-1]["step"]:
+    if best_weights is not None:
         world.load_state_dict(best_weights)
-        if not quiet:
-            print(f"  ↩︎  Kept the model from step {best_at:,} (drew tomorrow at "
-                  f"{best:.3f}) — everything after it was worse.")
-
-    if not quiet:
-        print(f"\n  {history.seconds:.0f}s, {revived:,} dead words revived")
     return history
 
 

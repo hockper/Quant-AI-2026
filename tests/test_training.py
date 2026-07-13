@@ -7,6 +7,7 @@ import bubble_bi as bb
 from bubble_bi.models import VQVAE
 from bubble_bi.training import (baseline_rebuild, evaluate, pick_device, train,
                                 word_usage)
+from conftest import _tiny_joint
 
 
 class _Grids(Dataset):
@@ -373,3 +374,41 @@ def test_each_entry_can_have_its_own_step_budget():
     history = train(model, _loaders(), settings, entry="cs", check_every=10,
                     patience=99, quiet=True)
     assert history.rows[-1]["step"] == 40         # CS's own budget, not the shared 500
+
+
+# ------------------------------------------------------------- joint training
+
+def test_a_joint_run_keeps_BOTH_dictionaries_alive():
+    """⚠️ THE TEST THAT WOULD HAVE CAUGHT THE FUSION COLLAPSE.
+
+    Perplexity genuinely STARTS at 1.0 -- one word for everything -- and only climbs out via
+    the reconstruction anchor, the diversity loss and dead-word revival. Under joint training
+    the naming loss used to be free to push it straight back down. If either dictionary ends
+    a run near 1, the anchor or the severed naming channel has failed, and the loss curve
+    will look perfectly healthy while it happens.
+    """
+    from bubble_bi.training import train_joint
+
+    # ⚠️ `_tiny_joint()` seeds itself (see its own docstring): this run's cold start is
+    # genuinely bimodal (dead lock vs. escape) on a 60-step budget with only one
+    # dead-word revival in it, so the fixture pins `torch.manual_seed` to a value
+    # measured to escape with a comfortable margin, rather than leaving that to
+    # whatever the global RNG happens to be here.
+    world, loaders, settings = _tiny_joint()
+    history = train_joint(world, loaders, settings, steps=60, quiet=True)
+    last = history.last()
+
+    assert last["ts_perplexity"] > 2.0, f"the TS dictionary collapsed: {last}"
+    assert last["cs_perplexity"] > 2.0, f"the CS dictionary collapsed: {last}"
+
+
+def test_a_joint_run_reports_both_honest_floors():
+    """Persistence for the word, shrugging for the candle. A number without its floor gets
+    quoted, and this project has had to walk back two such numbers already."""
+    from bubble_bi.training import train_joint
+
+    world, loaders, settings = _tiny_joint()
+    last = train_joint(world, loaders, settings, steps=20, quiet=True).last()
+
+    for name in ("drawing", "shrugging", "accuracy", "persistence"):
+        assert name in last, f"{name} is not reported"
