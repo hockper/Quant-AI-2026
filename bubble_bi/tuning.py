@@ -371,20 +371,107 @@ def score_tokenizer(model, loader, settings: dict, quick: bool = False) -> dict:
 #
 # Two stages, because the user asked two different questions -- "get the sizes correct,
 # the balance right" -- and at twelve trials a blind six-knob search is a lottery.
+# ⚠️ THESE RANGES WERE TOO NARROW, AND THE SEARCH SPENT THREE GPU RUNS SAYING SO.
+#
+# A 60-trial run put SIX of its twelve winning values hard against a boundary. An optimum
+# on a boundary means the true optimum is OUTSIDE the box — and no number of trials inside
+# it will ever reach it. Every one of these is widened in the direction a real run asked
+# for, and `boundaries()` below now says it out loud when it happens again:
+#
+#   TS commitment    chose 1.99 of max 2.0    -> wants MORE       -> ceiling 2.0 -> 10
+#   TS days          chose 5, the smallest    -> wants FEWER      -> floor 5     -> 2
+#   CS learning_rate chose 4.1e-5, at the floor -> wants LOWER    -> floor 3e-5  -> 1e-5
+#   CS model_size    chose 256, the largest   -> wants BIGGER     -> ceiling 256 -> 512
+#   CS vocabulary    chose 128, the smallest  -> wants a SMALLER  -> floor 128   -> 32
+#                                                dictionary
+#   CS days          chose 1                  -> a HARD FLOOR, not a bad range. You cannot
+#                                                hand a model zero days. Left alone.
+#
+# CS wanting a *smaller* dictionary and a *bigger* width is worth pausing on: it used only
+# 62 of the 128 words it was given. Its signal is low-dimensional — essentially one number,
+# the market factor — so it does not need many words to say it, but it does want a wide
+# encoder to find it. That is the shape of the thing we measured, not a quirk of the search.
 SPACE = {
     "balance": {
-        "learning_rate": ("log", 3e-5, 3e-3),   # never once tested. It is 1e-4 because
-                                                # somebody typed 1e-4.
-        "commitment": ("log", 0.1, 2.0),        # we ran at 1.0; the standard is 0.25
-        "diversity": ("float", 0.0, 1.0),       # the anti-collapse term
+        "learning_rate": ("log", 1e-5, 3e-3),   # never once tested. It was 1e-4 because
+                                                # somebody typed 1e-4. CS pinned the floor.
+        "commitment": ("log", 0.05, 10.0),      # ⚠️ the literature's 0.25 does NOT hold
+                                                # here: TS pinned the 2.0 ceiling and asked
+                                                # for more. Do not re-narrow this on the
+                                                # strength of a paper about images.
+        "diversity": ("float", 0.0, 1.0),       # the anti-collapse term. Both entries chose
+                                                # ~0.74 — comfortably interior, left alone.
     },
     "sizes": {
-        "model_size": ("pick", [64, 128, 256]),
-        "vocabulary": ("pick", [128, 256, 512, 1024]),
-        "days": {"ts": ("pick", [5, 10, 15, 20, 30]),
-                 "cs": ("pick", [1, 3, 5, 10])},
+        "model_size": ("pick", [64, 128, 256, 512]),
+        "vocabulary": ("pick", [32, 64, 128, 256, 512, 1024]),
+        "days": {"ts": ("pick", [2, 3, 5, 10, 15, 20, 30]),
+                 "cs": ("pick", [1, 2, 3, 5, 10])},
     },
 }
+
+# How close to an end a value has to sit, as a FRACTION OF THE RANGE, to count as "on the
+# edge". Measured on the range's OWN scale -- log for a log knob, linear for a linear one.
+#
+# Getting this wrong is easy and I did: a multiplicative "within 1.5x of the end" test looks
+# reasonable, and on a LOG range it is -- but on the 0..1 linear `diversity` range it flags
+# 0.73 as "at the top", which is nonsense. A warning that fires on a value sitting slap in
+# the middle of its range is worse than no warning, because the reader learns to ignore it.
+_ON_THE_EDGE = 0.10
+
+# Boundaries that CANNOT move, so pinning to them is not a defect. Crying wolf about a
+# floor that physically cannot go lower would train the reader to ignore the warning that
+# matters — and the one that matters is the one telling you your range is wrong.
+_HARD_FLOORS = {("cs", "days"): 1, ("ts", "days"): 1}      # you cannot read zero days
+
+
+def boundaries(entry: str, winner: dict) -> list[str]:
+    """Which of `winner`'s values are sitting ON THE EDGE of what we let it choose from?
+
+    An optimum on a boundary is the search telling you it never got to look far enough. It
+    is not a result — it is a bug report about the range. Three real GPU runs produced one
+    of these on half their knobs and nothing said anything, so the same too-small box got
+    searched over and over.
+    """
+    said = []
+    for stage, knobs in SPACE.items():
+        for name, rule in knobs.items():
+            if name not in winner:
+                continue
+            rule = rule[entry] if isinstance(rule, dict) else rule
+            value = winner[name]
+
+            if rule[0] == "pick":
+                low, high = min(rule[1]), max(rule[1])
+                at_low, at_high = value == low, value == high
+            else:
+                low, high = rule[1], rule[2]
+                # WHERE in the range did it land, as a fraction — on the range's own scale.
+                # A log knob spans decades, so "near the floor" there means a small MULTIPLE
+                # of the floor; a linear knob spans a width, so it means a small share of
+                # that width. Using one rule for both is how `diversity = 0.73` got called
+                # "at the top" of 0..1.
+                if rule[0] == "log":
+                    where = ((math.log(value) - math.log(low))
+                             / (math.log(high) - math.log(low)))
+                else:
+                    where = (value - low) / (high - low)
+                at_low, at_high = where <= _ON_THE_EDGE, where >= 1 - _ON_THE_EDGE
+
+            if _HARD_FLOORS.get((entry, name)) == value:
+                continue                       # a floor that cannot move is not a defect
+
+            if at_low or at_high:
+                edge, want = (("BOTTOM", "lower"), ("TOP", "higher"))[at_high]
+                said.append(
+                    f"⚠️  {entry.upper()} `{name}` = {value:g} is at the {edge} of the range "
+                    f"it was offered ({low:g} … {high:g}).\n"
+                    f"    The search never got to look {want}, so the real best value is "
+                    f"probably OUTSIDE the box\n"
+                    f"    and no number of trials inside it will find it. Widen "
+                    f"`tuning.SPACE['{stage}']['{name}']` and run again."
+                )
+    return said
 
 # `learning_rate` and `model_size` are top-level settings; the rest live inside the
 # entry's own block. PUBLIC on purpose -- this is the one place that knows the split,

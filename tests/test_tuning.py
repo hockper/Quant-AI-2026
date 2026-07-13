@@ -887,8 +887,28 @@ def test_search_ranks_surviving_trials_and_returns_the_highest_scorer(
     than one trial with a FINITE score -- which is what makes "search() ranks its
     survivors correctly" a checkable fact rather than an assumption: with only one
     survivor there would be nothing to rank against.
+
+    ⚠️ It pins its own SPACE, and that is deliberate. This test's claim is "search() RANKS
+    its survivors correctly" -- not "the production ranges happen to yield survivors". Those
+    are different facts, and leaving it on the live `SPACE` welds them together: the moment
+    the real ranges widen (as they just did, after a GPU run pinned six of twelve winners to
+    a boundary), a commitment of 10 collapses the tiny fixture's codebook on nearly every
+    trial and this test fails for a reason that has nothing to do with ranking. A benign,
+    frozen space keeps it testing the one thing it is named for.
     """
-    best, trials = tuning.search("ts", healthy_batches, healthy_settings)
+    import pytest
+
+    gentle = {
+        "balance": {"learning_rate": ("log", 1e-4, 1e-3),
+                    "commitment": ("log", 0.1, 0.5),      # far from anything that collapses
+                    "diversity": ("float", 0.1, 0.5)},
+        "sizes": {"model_size": ("pick", [16]),
+                  "vocabulary": ("pick", [8, 16]),
+                  "days": {"ts": ("pick", [3]), "cs": ("pick", [3])}},
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(tuning, "SPACE", gentle)
+        best, trials = tuning.search("ts", healthy_batches, healthy_settings)
 
     survivors = trials[np.isfinite(trials["score"])]
     assert len(survivors) >= 2, (
@@ -1491,3 +1511,61 @@ def test_a_config_already_tried_is_never_retrained(tiny_batches, tiny_settings, 
     # ...and the duplicates must still SHOW UP in the table, with the score they earned.
     assert len(trials) == 8, "de-duplicating must not lose the trials from the record"
     assert trials["score"].nunique() <= 2
+
+
+# ─────────────────────────────────────── when the winner sits on the EDGE of the box
+#
+# A 60-trial GPU run put SIX of its twelve winning values hard against a boundary:
+# TS commitment 1.99 (max 2.0), TS days 5 (the smallest), CS learning_rate at the floor,
+# CS model_size at the top, CS vocabulary at the bottom, CS days at 1.
+#
+# An optimum on a boundary means the real optimum is OUTSIDE the box, and no number of
+# trials inside it will ever find it. Three GPU runs searched a space that was too small in
+# five directions, and nothing said a word. A search that cannot tell you your range is
+# wrong will happily let you tune forever inside it.
+
+def test_a_winner_pinned_to_the_edge_of_its_range_is_reported():
+    """The search must say 'you did not let me look far enough', or it wastes GPU runs.
+
+    Probed against whatever `SPACE` says TODAY, not against the numbers a past run happened
+    to produce — the whole point is that the ranges move, and a test pinned to yesterday's
+    ranges would go quietly vacuous the moment they did.
+    """
+    top = tuning.SPACE["balance"]["commitment"][2]              # the ceiling, whatever it is
+    bottom_days = min(tuning.SPACE["sizes"]["days"]["ts"][1])   # the smallest TS window
+
+    winner = {"commitment": top * 0.99, "days": bottom_days, "learning_rate": 5e-4,
+              "model_size": 128, "vocabulary": 512, "diversity": 0.5}
+
+    said = tuning.boundaries("ts", winner)
+    joined = "\n".join(said)
+
+    assert any("commitment" in line for line in said), "did not notice commitment at the top"
+    assert any("days" in line for line in said), "did not notice days at the bottom"
+    assert "learning_rate" not in joined, "lr is comfortably interior — do not cry wolf"
+    # ⚠️ `diversity` = 0.5 sits DEAD CENTRE of its 0..1 range. An earlier version of the
+    # edge rule used a multiplicative "within 1.5x of the end" test, which is right for a
+    # LOG knob and nonsense for a linear one -- it flagged 0.73 as "at the top" of 0..1. A
+    # warning that fires in the middle of a range is worse than no warning at all.
+    assert "diversity" not in joined
+
+
+def test_a_hard_floor_is_not_reported_as_a_bad_range():
+    """CS choosing `days = 1` is not the search running out of room -- you cannot hand a
+    model zero days. Crying wolf about a boundary that physically cannot move would train
+    the reader to ignore the warning that matters."""
+    said = tuning.boundaries("cs", {"days": 1, "commitment": 0.5, "learning_rate": 5e-4,
+                                    "model_size": 128, "vocabulary": 512, "diversity": 0.5})
+    assert not any("days" in line for line in said), f"cried wolf about the hard floor: {said}"
+
+
+def test_the_search_space_is_wide_enough_for_what_the_last_run_asked_for():
+    """The five real boundary hits, opened up. Each of these values was CHOSEN by a real
+    run while sitting on the edge -- so each must now be comfortably INSIDE the range."""
+    space = tuning.SPACE
+
+    assert max(space["sizes"]["model_size"][1]) > 256, "CS pinned model_size at 256"
+    assert min(space["sizes"]["vocabulary"][1]) < 128, "CS pinned vocabulary at 128"
+    assert min(space["sizes"]["days"]["ts"][1]) < 5, "TS pinned days at 5"
+    assert space["balance"]["commitment"][2] > 2.0, "TS pinned commitment at 2.0"
+    assert space["balance"]["learning_rate"][1] < 4.1e-05 / 1.5, "CS pinned lr at the floor"
