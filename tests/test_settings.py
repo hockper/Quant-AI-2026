@@ -217,23 +217,23 @@ def test_no_fusion_setting_is_decorative():
     explicit keyword arguments (the same convention as `VQVAE`), the honest
     signature-diff check used for ts/cs above works here too.
 
+    ⚠️ `commitment`/`diversity`/`decay` are gone from `DEFAULTS["fusion"]` on purpose: they
+    used to configure the FUSED codebook, which no longer exists (see
+    `test_there_is_no_fused_codebook_to_configure`). Leaving them in `DEFAULTS["fusion"]`
+    after `Tokenizer` stopped accepting them would have been exactly the decorative-setting
+    trap this test exists to catch -- accepted, validated, handed to nothing.
+
     Kept alongside it: build a Tokenizer with distinctive fusion values and check they
-    actually reached the codebook/fusion modules, not just that they were accepted.
+    actually reached the fusion module, not just that they were accepted.
     """
     from bubble_bi.models import VQVAE
     from bubble_bi.models.world import Tokenizer
 
     ts = VQVAE(companies=1, days=4, features=6, width=16, heads=2)
     cs = VQVAE(companies=3, days=4, features=6, width=16, heads=2)
-    tokenizer = Tokenizer(
-        ts, cs, model_size=16, vocabulary=17, depth=3, attend_to="companies",
-        commitment=0.81, diversity=0.62, decay=0.53,
-    )
+    tokenizer = Tokenizer(ts, cs, model_size=16, depth=3, attend_to="companies")
 
-    assert tokenizer.codebook.words == 17
-    assert tokenizer.codebook.commitment == 0.81
-    assert tokenizer.codebook.diversity == 0.62
-    assert tokenizer.codebook.decay == 0.53
+    assert not hasattr(tokenizer, "codebook") or tokenizer.codebook is None
     assert len(tokenizer.fusion.rounds) == 3
     assert tokenizer.attend_to == "companies"
 

@@ -34,108 +34,100 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from bubble_bi.models.codebook import Codebook
 from bubble_bi.models.fusion import Fusion
 from bubble_bi.models.llama import RMSNorm, Block
+from bubble_bi.models.vqvae import VQVAE
 
 
 class Tokenizer(nn.Module):
-    """Two frozen encoders, a cross-attention, and one codebook. Grids in, tokens out."""
+    """Two words a day: what THIS stock did, and what the MARKET did.
 
-    def __init__(
-        self,
-        ts,
-        cs,
-        *,
-        vocabulary: int = 512,
-        depth: int = 2,
-        attend_to: str = "days",
-        commitment: float = 0.25,
-        diversity: float = 0.1,
-        decay: float = 0.99,
-        model_size: int = 128,
-        batch: int | None = None,
-        heads: int = 4,
-        dropout: float = 0.1,
-    ):
-        # `batch` is not a model setting -- it belongs to the data loader that builds
-        # sentences (see data/sentences.py, which reads `settings["fusion"]["batch"]`
-        # directly). It is accepted and ignored here purely so the notebook can hand
-        # over the whole `fusion` block in one go, the same way VQVAE takes and drops
-        # `batch`/`steps` so `VQVAE(**settings["ts"])` can splat cleanly.
+    ⚠️ There is no fused codebook here any more, and its absence is the design.
+
+    Every codebook in this project that was anchored by a reconstruction loss stayed
+    healthy — TS reached perplexity 157. The one that was not (the fused codebook, asked
+    only to draw tomorrow's candle) collapsed to 10 words out of 512, on every loss balance
+    we tried. Under joint training that would get worse, not better, because the naming loss
+    is then free to pull on the encoders too.
+
+    So TS and CS keep their OWN codebooks and their OWN decoders, each anchored by rebuilding
+    its own grid, and the predictor reads both words. It is also far cheaper: the CS grid is
+    identical for every company on a day, so it is encoded once per DAY rather than once per
+    company-day.
+
+    The cross-attention sits INSIDE the TS path, before the TS codebook quantises:
+
+        ts_token  =  "what this stock did, GIVEN what the market was doing"
+        cs_token  =  "what the market did"
+
+    It has to be there. After a 9-bit quantisation the fine detail the attention needs is
+    already gone. Reconstruction keeps the token honest; PREDICTION is what pays for the
+    market context, because rebuilding the TS grid does not need CS at all.
+    """
+
+    def __init__(self, ts: VQVAE, cs: VQVAE, *, model_size: int, depth: int = 2,
+                 attend_to: str = "companies", heads: int = 4, dropout: float = 0.1,
+                 batch: int | None = None):
+        # `batch` belongs to the data loader, not the model. Accepted and ignored purely so
+        # the notebook can splat `**settings["fusion"]` in one go -- the same convention
+        # VQVAE follows for its own `batch`/`steps`.
         del batch
         super().__init__()
-        if ts.features != cs.features:
-            raise ValueError("TS and CS must have been trained on the same features.")
-
         self.ts, self.cs = ts, cs
         self.attend_to = attend_to
         self.width = ts.read.out_features
-
-        # The fusion is built from the encoders' ACTUAL width; the codebook below is
-        # built from `model_size`, a setting typed in by hand. Today the two always
-        # match, but nothing forces them to -- and if they ever drift apart, torch would
-        # report a cryptic shape mismatch deep in the cross-attention instead of telling
-        # you which setting to fix. Say it plainly, now, while we still know why.
         if model_size != self.width:
             raise ValueError(
                 f"`model_size` is {model_size} but the TS/CS encoders were built "
-                f"{self.width} wide. The cross-attention needs both sides the same "
-                "width, so these must agree."
+                f"{self.width} wide. The cross-attention needs both sides the same width, "
+                "so these must agree."
             )
-
-        # Frozen: they already learned to describe a company and a market. Letting them
-        # drift now would mean re-learning what we just spent two sections teaching them.
-        for encoder in (self.ts, self.cs):
-            encoder.eval()
-            for weight in encoder.parameters():
-                weight.requires_grad = False
-
         self.fusion = Fusion(self.width, depth=depth, heads=heads, dropout=dropout)
-        self.codebook = Codebook(
-            words=vocabulary,
-            width=model_size,
-            commitment=commitment,
-            diversity=diversity,
-            decay=decay,
-        )
 
-    @torch.no_grad()
-    def look(self, stock_grid: torch.Tensor, market_grid: torch.Tensor,
-             market_present: torch.Tensor | None = None):
-        """The FROZEN half: grids in, latents out.
+    def forward(self, ts_grid: torch.Tensor, cs_grid: torch.Tensor,
+                cs_present: torch.Tensor | None = None) -> dict:
+        # --- CS: an ordinary VQ-VAE pass. Its codebook is anchored by rebuilding its grid.
+        # read_grid gives BOTH the summary (for the codebook) and the cells (for the
+        # fusion), so the biggest encoder in the model runs exactly once.
+        cs_summary, cs_cells = self.cs.read_grid(cs_grid, cs_present)
+        cs_chosen = self.cs.codebook(cs_summary)
+        cs_recon = _rebuild_loss(self.cs, cs_chosen["snapped"], cs_grid, cs_present)
+        market = self.cs.keys_from_cells(cs_cells, cs_present, self.attend_to)
 
-        Because these encoders never change, their answers never change either — so this
-        is run exactly once over the whole history and cached. Training then never has
-        to push thirty companies through a transformer again; it just looks the answer
-        up. That is what freezing actually buys us.
+        # --- TS: encode, THEN read the market, THEN quantise.
+        ts_summary, _ = self.ts.read_grid(ts_grid)
+        fused, attention = self.fusion(ts_summary, market)
+        ts_chosen = self.ts.codebook(fused)
+        ts_recon = _rebuild_loss(self.ts, ts_chosen["snapped"], ts_grid, None)
 
-            z_ts    [B, width]          what this company is doing
-            market  [B, keys, width]    what the market is offering to be read
-        """
-        return (
-            self.ts.summarise(stock_grid),
-            self.cs.context(market_grid, market_present, self.attend_to),
-        )
-
-    def speak(self, z_ts: torch.Tensor, market: torch.Tensor) -> dict:
-        """The TRAINABLE half: latents in, one token out."""
-        fused, attention = self.fusion(z_ts, market)
-        chosen = self.codebook(fused)
         return {
-            "token": chosen["ids"],                 # [B] -- the word for this company-day
-            "vector": chosen["snapped"],            # [B, width] -- and its meaning
-            "attention": attention,                 # [B, keys] -- what it read
-            "commitment_loss": chosen["commitment_loss"],
-            "diversity_loss": chosen["diversity_loss"],
-            "perplexity": chosen["perplexity"],
+            "ts_token": ts_chosen["ids"],
+            "cs_token": cs_chosen["ids"],
+            "ts_vector": ts_chosen["snapped"],
+            "cs_vector": cs_chosen["snapped"],
+            "attention": attention,
+            "recon_loss": ts_recon + cs_recon,
+            "commitment_loss": ts_chosen["commitment_loss"] + cs_chosen["commitment_loss"],
+            "diversity_loss": ts_chosen["diversity_loss"] + cs_chosen["diversity_loss"],
+            "ts_perplexity": ts_chosen["perplexity"],
+            "cs_perplexity": cs_chosen["perplexity"],
+            "ts_summary": fused,          # pre-quantisation, for reviving dead words
+            "cs_summary": cs_summary,
         }
 
-    def forward(self, stock_grid: torch.Tensor, market_grid: torch.Tensor,
-                market_present: torch.Tensor | None = None) -> dict:
-        """Grids all the way to a token. Convenient, but slow — prefer look() + speak()."""
-        z_ts, market = self.look(stock_grid, market_grid, market_present)
-        return self.speak(z_ts, market)
+
+def _rebuild_loss(model: VQVAE, snapped: torch.Tensor, grid: torch.Tensor,
+                  present: torch.Tensor | None) -> torch.Tensor:
+    """Rebuild the grid from the snapped word and score it. THE ANCHOR.
+
+    Only companies that actually traded are scored -- rewarding the model for "rebuilding" a
+    company that did not trade would be meaningless.
+    """
+    error = (model.rebuild(snapped) - grid).pow(2)
+    if present is None:
+        return error.mean()
+    weight = present.unsqueeze(-1).unsqueeze(-1).to(error.dtype)
+    return (error * weight).sum() / weight.expand_as(error).sum().clamp(min=1)
 
 
 # The four numbers that ARE a candle. Given yesterday's close they rebuild

@@ -107,38 +107,76 @@ def test_a_company_that_did_not_trade_is_left_out_of_the_market():
 
 
 # ------------------------------------------------------------------ the tokenizer
-
-def test_the_encoders_are_frozen_and_stay_frozen():
-    ts, cs = _pair()
-    tok = Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs())
-
-    assert not any(p.requires_grad for p in tok.ts.parameters())
-    assert not any(p.requires_grad for p in tok.cs.parameters())
-    assert any(p.requires_grad for p in tok.fusion.parameters())
-
-    before = ts.read.weight.clone()
-    out = tok(torch.randn(4, 1, 4, FEATURES), torch.randn(4, COMPANIES, 3, FEATURES))
-    (out["commitment_loss"] + out["vector"].sum()).backward()
-    assert ts.read.weight.grad is None                  # no gradient reached them
-    assert torch.equal(ts.read.weight, before)          # and they did not move
+#
+# ⚠️ These tests describe TWO anchored codebooks (TS + CS), not the old fused-codebook
+# design. The fused codebook was the ONE we watched collapse -- 10 words of 512, while TS
+# (which rebuilds its own grid) sat at 157. It is deleted, not patched, and so are the old
+# tests that asserted its existence (`tok.codebook`), a single `token`/`vector` per
+# company-day, and encoders frozen into scaffolding -- under joint training nothing is
+# frozen any more, that is the entire point of training everything against one loss.
+#
+# `_tokenizer_pair()` is a SEPARATE fixture from the top-level `_pair()` above (which the
+# "what CS offers" tests still rely on, at its own companies/features/vocabulary): giving
+# it a different name avoids a silent module-level shadowing bug, where the second
+# `def _pair():` would win for every caller regardless of where in the file it sits.
 
 
-def test_one_token_per_company_day():
-    ts, cs = _pair()
-    tok = Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs())
-    out = tok(torch.randn(9, 1, 4, FEATURES), torch.randn(9, COMPANIES, 3, FEATURES))
-    assert out["token"].shape == (9,)
-    assert out["token"].max() < 32
+def _tokenizer_pair():
+    ts = VQVAE(companies=1, days=2, features=26, width=32, heads=2, vocabulary=16)
+    cs = VQVAE(companies=4, days=1, features=26, width=32, heads=2, vocabulary=16)
+    return ts, cs
 
 
 def test_a_mismatched_model_size_is_rejected_with_a_useful_message():
-    """The fusion is built from the encoders' ACTUAL width; the fusion codebook is built
-    from `model_size`, a number typed in by hand. If they ever disagreed, the failure
-    used to be a bare tensor-shape error deep inside the cross-attention. Catch it at
-    the door instead, with a message that names the setting to fix."""
-    ts, cs = _pair(width=32)
+    """The fusion is built from the encoders' ACTUAL width; `model_size` is a number typed
+    in by hand. If they ever disagreed, the failure used to be a bare tensor-shape error
+    deep inside the cross-attention. Catch it at the door instead, with a message that
+    names the setting to fix."""
+    ts, cs = _tokenizer_pair()
     with pytest.raises(ValueError, match="TS/CS encoders were built 32 wide"):
-        Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs(model_size=16))
+        Tokenizer(ts, cs, model_size=16, heads=2, dropout=0.0)
+
+
+def test_the_tokenizer_has_no_codebook_of_its_own():
+    """The fused codebook is the ONE we watched collapse -- 10 words of 512, while TS (which
+    rebuilds its own grid) sat at 157. We delete it rather than keep patching it. TS and CS
+    keep theirs, and theirs are ANCHORED."""
+    ts, cs = _tokenizer_pair()
+    tok = Tokenizer(ts, cs, model_size=32, attend_to="companies")
+
+    assert not hasattr(tok, "codebook") or tok.codebook is None
+    assert tok.ts.codebook is ts.codebook
+    assert tok.cs.codebook is cs.codebook
+
+
+def test_it_speaks_TWO_words_a_day_and_anchors_both():
+    ts, cs = _tokenizer_pair()
+    tok = Tokenizer(ts, cs, model_size=32, attend_to="companies")
+    out = tok(torch.randn(5, 1, 2, 26), torch.randn(5, 4, 1, 26))
+
+    assert out["ts_token"].shape == (5,)
+    assert out["cs_token"].shape == (5,)
+    assert torch.isfinite(out["recon_loss"])          # rebuilds BOTH grids
+    assert out["attention"].shape[1] == 4             # one key per company
+
+
+def test_the_ts_token_actually_READS_the_market():
+    """The cross-attention must sit BEFORE the TS codebook. After a 9-bit quantisation the
+    detail it needs is already destroyed, so this is the only place it can happen -- and if
+    changing the market does not change the TS vector, the fusion is decorative."""
+    torch.manual_seed(0)
+    ts, cs = _tokenizer_pair()
+    tok = Tokenizer(ts, cs, model_size=32, attend_to="companies").eval()
+
+    stock = torch.randn(4, 1, 2, 26)
+    with torch.no_grad():
+        calm = tok(stock, torch.zeros(4, 4, 1, 26))["ts_vector"]
+        panic = tok(stock, torch.randn(4, 4, 1, 26) * 5)["ts_vector"]
+
+    assert not torch.allclose(calm, panic, atol=1e-4), (
+        "the same stock, in two completely different markets, produced the same TS vector — "
+        "the cross-attention is doing nothing"
+    )
 
 
 # ------------------------------------------------------------------ the predictor
@@ -295,39 +333,9 @@ def test_without_a_candle_the_model_still_runs_but_says_so():
     assert torch.isfinite(out["loss"])
 
 
-def test_the_fusion_codebook_carries_the_diversity_penalty():
-    # The anti-collapse term must be on the FUSION's codebook, not just TS and CS.
-    ts, cs = _pair()
-    tok = Tokenizer(ts, cs, heads=2, dropout=0.0,
-                    **_fusion_kwargs(commitment=1.0, diversity=0.5))
-    assert tok.codebook.commitment == 1.0
-    assert tok.codebook.diversity == 0.5
-
-    world = WorldModel(tok, sentence=8, depth=2, heads=2, dropout=0.0)
-    out = world(_sentence())
-    assert float(out["diversity_loss"]) != 0.0
-
-    out["diversity_loss"].backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0
-               for p in tok.fusion.parameters())
-
-
-def test_the_fusion_codebook_gets_its_own_knobs():
-    """The fusion codebook is the one that COLLAPSES to ~12 words. It had been running on
-    class defaults, unexamined, because nothing passed it anything."""
-    from bubble_bi.models.world import Tokenizer
-    from bubble_bi.settings import DEFAULTS
-
-    settings = {
-        **{k: v for k, v in DEFAULTS.items() if k != "tickers"},
-        "tickers": ["AAA"],
-        "model_size": 16,       # must match the encoders' width below, or Tokenizer rejects it
-        "fusion": {**DEFAULTS["fusion"], "commitment": 0.8, "diversity": 0.6, "decay": 0.5},
-    }
-    ts = VQVAE(companies=1, days=4, features=6, width=16, heads=2)
-    cs = VQVAE(companies=3, days=4, features=6, width=16, heads=2)
-    tokenizer = Tokenizer(ts, cs, model_size=settings["model_size"], **settings["fusion"])
-
-    assert tokenizer.codebook.commitment == 0.8
-    assert tokenizer.codebook.diversity == 0.6
-    assert tokenizer.codebook.decay == 0.5
+# The two tests that used to live here (`test_the_fusion_codebook_carries_the_diversity_
+# penalty`, `test_the_fusion_codebook_gets_its_own_knobs`) asserted `tok.codebook` /
+# `tokenizer.codebook` directly -- the fused codebook itself. There is no such attribute
+# any more (see `test_the_tokenizer_has_no_codebook_of_its_own` above): TS and CS carry
+# their OWN commitment/diversity/decay knobs, already covered by
+# `test_the_codebook_knobs_actually_reach_the_codebook` in tests/test_settings.py.

@@ -69,17 +69,17 @@ DEFAULTS: dict = {
     #                                                    which makes the attention a no-op
     #                                                    (see `check()` below)
     #
-    # TS and CS still keep their OWN codebooks (each anchored by rebuilding its own grid,
-    # see `loss['recon']`) -- `commitment`/`diversity`/`decay` below tune those, same as
-    # in the `ts`/`cs` blocks. There is no THIRD, fused codebook any more: that was the one
-    # the predictor ever saw, and the one we watched collapse to 10 words of 512.
+    # TS and CS still keep their OWN codebooks, each anchored by rebuilding its own grid
+    # (see `loss['recon']`) -- their `commitment`/`diversity`/`decay` live in the `ts`/`cs`
+    # blocks above. There is no THIRD, fused codebook any more: that was the one the
+    # predictor ever saw, and the one we watched collapse to 10 words of 512. `Tokenizer`
+    # therefore has no codebook knobs of its own to configure -- putting `commitment`/
+    # `diversity`/`decay` here would be exactly the decorative setting this project keeps
+    # tripping over: accepted, validated, and handed to nothing.
     "fusion": {
         "depth": 2,
         "attend_to": "companies",
         "batch": 32,
-        "commitment": 0.25,
-        "diversity": 0.1,
-        "decay": 0.99,
     },
     # The GPT that reads sentences of tokens.
     "predictor": {
@@ -242,7 +242,7 @@ def check(settings: dict) -> dict:
                 f"`loss['{name}']` must be a number of 0 or more, got {weight!r}."
             )
 
-    for entry in ("ts", "cs", "fusion"):
+    for entry in ("ts", "cs"):          # `fusion` has no codebook of its own to tune
         for knob in ("commitment", "diversity", "decay"):
             value = out[entry][knob]
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
