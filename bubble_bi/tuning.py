@@ -23,6 +23,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 from bubble_bi.autopsy import _probe
@@ -425,7 +426,6 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     straight to `settings.check()`.
     """
     import optuna
-    import pandas as pd
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -477,6 +477,54 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     settled = settle(settings, entry, fixed)
     return {**settled[entry], "learning_rate": settled["learning_rate"],
             "model_size": settled["model_size"]}, table
+
+
+def disagreements(trials: pd.DataFrame) -> list[str]:
+    """Per entry, is the top-SCORING trial also the one that kept the most DIRECTION?
+
+    This is the load-bearing warning of the whole tuning section. Direction is the
+    SCARCE quantity in this project -- the tokenizer keeps roughly half of volatility
+    but only a sliver of direction, and the open question this search exists to answer
+    is whether any configuration keeps more of it. If the best-scoring trial is not the
+    best-direction trial, that is a genuine choice for the user to make -- keep the
+    higher score, or keep more direction -- not a detail to bury.
+
+    TS and CS are tuned SEPARATELY (see `search()`): they are two different models, so
+    "the best trial across both" is not a meaningful thing to ask for -- it would just
+    be whichever of the two trials tables happened to be listed first. This checks each
+    entry's OWN top-score row against its OWN top-direction row, one entry at a time.
+
+    ⚠️ `trials` may carry a duplicate index: `search()` returns each entry's table
+    freshly sorted but NEVER re-indexed, so a caller who `pd.concat`s a TS table and a
+    CS table (as the notebook does, to show both at once) ends up with row labels
+    0..n-1 appearing TWICE -- once for TS, once for CS. Comparing rows by their index
+    label on that combined frame silently compares whichever row of the two happens to
+    share a label, not necessarily the row you meant. `reset_index(drop=True)` below
+    gives every row now in front of us a label that cannot collide, so the comparison
+    means what it says regardless of what the caller did upstream.
+
+    Returns the warning lines to print, one per entry that disagrees, each naming the
+    entry and BOTH configs' direction scores so the user can see what they would be
+    giving up. Empty when every entry's best score is also its best direction -- i.e.
+    nothing to warn about.
+    """
+    trials = trials.reset_index(drop=True)
+    lines = []
+    for entry, group in trials.groupby("entry", sort=False):
+        by_score = group.loc[group["score"].idxmax()]
+        by_direction = group.loc[group["direction"].idxmax()]
+        if by_score.name == by_direction.name:
+            continue
+        lines.append(
+            f"⚠️  {entry}: the best-scoring config is NOT the one that kept the most "
+            f"DIRECTION.\n"
+            f"    best score      → direction {by_score['direction']:.3f} "
+            f"(score {by_score['score']:.3f})\n"
+            f"    best direction  → direction {by_direction['direction']:.3f} "
+            f"(score {by_direction['score']:.3f})\n"
+            f"    Direction is the scarce quantity here — this is a choice, not a detail."
+        )
+    return lines
 
 
 def _study_path(settings: dict, entry: str, stage: str) -> str:

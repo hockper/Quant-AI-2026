@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -205,6 +206,42 @@ def test_the_balance_comes_before_the_sizes():
     assert list(tuning.SPACE) == ["balance", "sizes"]
     assert set(tuning.SPACE["balance"]) == {"learning_rate", "commitment", "diversity"}
     assert set(tuning.SPACE["sizes"]) == {"model_size", "vocabulary", "days"}
+
+
+def test_disagreements_fires_when_the_best_score_is_not_the_best_direction():
+    """The reviewer's exact repro. `search()` returns each entry's trials table sorted
+    but NOT re-indexed (0..n-1 for TS, 0..n-1 again for CS), so a naive `pd.concat` of
+    the two gives a combined frame with the SAME row label appearing twice. Comparing
+    `.name` on that frame compares whichever row happens to share a label -- two
+    completely different rows can compare equal, and the warning silently fails to
+    fire even when it is true. This trials frame reproduces that exact collision (both
+    entries indexed 0, 1) AND makes TS's top-scoring row genuinely NOT its
+    top-direction row, so it demands `disagreements()` still catches it."""
+    trials = pd.DataFrame({
+        "entry":     ["TS", "TS", "CS", "CS"],
+        "score":     [0.90, 0.80, 0.50, 0.40],
+        "direction": [0.01, 0.05, 0.10, 0.02],   # TS: best score (row 0) != best direction (row 1)
+    }, index=[0, 1, 0, 1])                        # <- the exact collision pd.concat causes
+
+    lines = tuning.disagreements(trials)
+
+    assert len(lines) == 1
+    assert "TS" in lines[0]
+    assert "0.01" in lines[0] and "0.05" in lines[0]   # both direction scores, named
+    assert "CS" not in lines[0]                        # CS agreed: nothing to say about it
+
+
+def test_disagreements_reports_nothing_when_score_and_direction_agree():
+    """The other half of the proof: when the top-scoring trial IS the top-direction
+    trial (for every entry), there is nothing to warn about, and this must say so by
+    returning nothing -- not by returning a reassuring line that says "they agree"."""
+    trials = pd.DataFrame({
+        "entry":     ["TS", "TS", "CS", "CS"],
+        "score":     [0.90, 0.80, 0.50, 0.40],
+        "direction": [0.09, 0.05, 0.10, 0.02],   # top score IS top direction, both entries
+    }, index=[0, 1, 0, 1])
+
+    assert tuning.disagreements(trials) == []
 
 
 def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_settings):
@@ -497,16 +534,22 @@ def test_confirm_trains_at_the_full_budget_not_the_search_sprint(tiny_settings, 
 
 
 def test_a_model_built_before_apply_does_not_get_the_tuned_settings(tmp_path):
-    """The Task 8 bug, reproduced directly. The notebook builds `ts`/`cs` once, early
-    on -- then, much later, `bb.tuning.apply()` folds `tuned.json` into the settings.
-    A model built BEFORE that point never hears about it: it was constructed from the
-    settings dict as it existed at the time, and nothing after can reach back and
-    change it. Only a model built from the SETTLED settings -- the ones `apply()` and
-    `check()` hand back -- actually gets the tuned numbers.
+    """The Task 8 bug's LIBRARY half, reproduced directly -- ⚠️ this test never opens
+    the notebook, and it is NOT a guard against the notebook reverting.
 
-    This is why the notebook fix rebuilds `ts`/`cs` (and `batches`) once tuning
-    settles: skip that step, as the notebook once did, and every tuned setting is
-    silently thrown away. This test is the guard against reverting to that shape.
+    What it DOES prove: a model built from settings taken BEFORE `apply()` folds in
+    `tuned.json` carries the OLD (default) numbers, and a model built from the SETTLED
+    settings that `apply()` + `check()` hand back afterwards carries the TUNED ones.
+    That is the composition the notebook's rebuild-after-settle step relies on, and if
+    it ever broke -- say `apply()` stopped changing anything, or `check()` dropped a
+    tuned key -- this test would catch it.
+
+    What it does NOT prove: that the notebook itself still calls its rebuild cells.
+    Nothing in this suite executes the notebook, so a reviewer who deletes those cells
+    (leaving the notebook training the STALE `ts`/`cs` built earlier, tuning silently
+    inert) would sail straight past this test, and past everything else here too --
+    there is no notebook-execution test in this suite. That gap is real; do not let
+    this test's name talk you out of noticing it.
     """
     import json
 
