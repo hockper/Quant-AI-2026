@@ -642,6 +642,16 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
     ts_block = found.get("ts") or {}
     cs_block = found.get("cs") or {}
 
+    # ⚠️ THE TRAP THIS WHOLE FUNCTION EXISTS TO NAME. Precedence puts what you typed
+    # above the tuning ON PURPOSE -- a deliberate choice must stand -- but that means a
+    # setting typed BEFORE the tuning ever ran (the notebook's shipped `SETTINGS`, say)
+    # silently throws its own answer away, for every knob it happens to type. Twelve
+    # trials plus four full-budget confirm runs spent, and the search's own settings
+    # cell can discard two thirds of the answer without a single word said about it.
+    # We collect every (label, your value, the tuned value) triple where that happened,
+    # and the note below names them all -- loud is the whole fix; see CRITICAL 1.
+    overruled: list[tuple[str, object, object]] = []
+
     for entry, tuned_block in (("ts", ts_block), ("cs", cs_block)):
         if not tuned_block:
             continue
@@ -652,7 +662,11 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
         # leaving `learning_rate` stranded inside `settings["ts"]`, where `check()` rejects
         # it as an unknown setting and the notebook dies on its first cell.
         block = {k: v for k, v in tuned_block.items() if k not in TOP_LEVEL}
-        merged[entry] = {**block, **typed.get(entry, {})}       # typed wins
+        entry_typed = typed.get(entry, {})
+        for key, tuned_value in block.items():
+            if key in entry_typed and entry_typed[key] != tuned_value:
+                overruled.append((f"{entry}.{key}", entry_typed[key], tuned_value))
+        merged[entry] = {**block, **entry_typed}       # typed wins
 
     # TS and CS are searched SEPARATELY, so a TOP_LEVEL setting they both propose can
     # genuinely disagree. The old code here just looped ts-then-cs and let whichever ran
@@ -669,9 +683,15 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
     # overrules this (checked first, below, so a deliberate choice is never second-guessed).
     conflicts = []
     for shared in TOP_LEVEL:
-        if shared in typed:
-            continue   # you wrote it yourself: nothing left to settle
         ts_value, cs_value = ts_block.get(shared), cs_block.get(shared)
+        if shared in typed:
+            # You wrote it yourself: nothing left to settle between TS and CS. But if
+            # the tuning found something ELSE for this key, typing it still overruled
+            # that answer -- name it, the same as any other overruled setting.
+            resolved = ts_value if ts_value is not None else cs_value
+            if resolved is not None and typed[shared] != resolved:
+                overruled.append((shared, typed[shared], resolved))
+            continue
         if ts_value is not None and cs_value is not None and ts_value != cs_value:
             conflicts.append(
                 f"⚠️  TS and CS disagree on `{shared}` (TS wants {ts_value}, CS wants "
@@ -703,4 +723,27 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
 
     if conflicts:
         note = "\n".join(conflicts) + "\n" + note
+
+    if overruled:
+        plural = "s" if len(overruled) != 1 else ""
+        lines = "\n".join(f"        {label:<15} you {_fmt(you)}    (tuned {_fmt(tuned)})"
+                          for label, you, tuned in overruled)
+        warning = (
+            f"⚠️  You typed {len(overruled)} setting{plural} that the tuning also found, "
+            "so YOURS win and the tuned\n"
+            "    values are being discarded:\n"
+            f"{lines}\n"
+            "    Delete those lines from SETTINGS to inherit the tuning instead."
+        )
+        note = warning + "\n" + note
+
     return merged, note
+
+
+def _fmt(value: object) -> str:
+    """A human-readable number for the overrule warning -- `str()` alone renders a
+    small learning rate as `0.00042`, which is harder to eyeball against `4.2e-05` than
+    it needs to be."""
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)

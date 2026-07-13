@@ -436,6 +436,72 @@ def test_a_typed_top_level_setting_beats_the_tuned_one(tmp_path):
     assert merged["learning_rate"] == 1e-4        # you typed it: you win, even at the top
 
 
+def test_apply_names_every_typed_setting_that_overruled_a_tuned_one(tmp_path):
+    """CRITICAL 1's exact repro: the shipped notebook's `SETTINGS` cell types four of the
+    six knobs the search tunes (`ts.days`, `ts.vocabulary`, `model_size`,
+    `learning_rate`), so a user who runs the search on Colab gets a `tuned.json` whose
+    answer for every one of those four is silently thrown away the moment `apply()`
+    folds it in -- and the note used to print a cheerful ✅ with no hint that had
+    happened. Typing beating tuning is correct and stays correct (see the precedence
+    tests above); staying SILENT about it is the bug. Every overruled setting must be
+    named in the note, with both numbers, so nobody has to notice the trap on their own.
+    """
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {},
+        "ts": {"vocabulary": 1024, "days": 15, "learning_rate": 4.2e-4, "model_size": 256,
+               "commitment": 0.31},
+        "cs": {},
+    }))
+
+    # Exactly the shape of the notebook's shipped SETTINGS: four of the searched knobs
+    # typed by hand, `commitment` left alone to inherit the tuning.
+    typed = {"tickers": ["AAA"], "ts": {"vocabulary": 512, "days": 4},
+             "model_size": 128, "learning_rate": 1e-4}
+    merged, note = tuning.apply(typed, path=path)
+
+    # Precedence is unchanged: what you typed still wins.
+    assert merged["ts"]["vocabulary"] == 512
+    assert merged["ts"]["days"] == 4
+    assert merged["model_size"] == 128
+    assert merged["learning_rate"] == 1e-4
+    assert merged["ts"]["commitment"] == 0.31      # untyped: the tuning still reaches this
+
+    # But the note must say so, loudly, naming every overruled setting and BOTH values.
+    assert "discarded" in note.lower()
+    for needle in ("ts.vocabulary", "512", "1024",
+                  "ts.days", "4", "15",
+                  "model_size", "128", "256",
+                  "learning_rate"):
+        assert needle in note, f"{needle!r} missing from the overrule note:\n{note}"
+    # `commitment` was never typed, so it must not be reported as overruled.
+    assert "commitment" not in note.lower()
+
+
+def test_apply_says_nothing_extra_when_nothing_was_overruled(tmp_path):
+    """The other half of the proof: typing a setting that happens to match what the
+    tuning ALSO found is not an overrule (nothing was discarded), and typing nothing at
+    all in an entry block must not produce a false alarm either."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {}, "ts": {"vocabulary": 512}, "cs": {},
+    }))
+
+    merged, note = tuning.apply({"tickers": ["AAA"], "ts": {"vocabulary": 512}}, path=path)
+
+    assert merged["ts"]["vocabulary"] == 512
+    assert "discarded" not in note.lower()
+    assert "you typed" not in note.lower()
+
+
 def test_a_disagreement_on_a_shared_setting_is_reported_not_swallowed(tmp_path):
     """TS and CS are searched SEPARATELY (see `search()`), and can come back wanting
     different values for a TOP_LEVEL setting. The reviewer's exact repro: TS wants
