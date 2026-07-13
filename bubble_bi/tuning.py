@@ -20,6 +20,7 @@ information destroyed at the tokenizer can NEVER be recovered by any predictor d
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -469,8 +470,110 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
 def _study_path(settings: dict, entry: str, stage: str) -> str:
     """Where the study lives. On Colab `data_dir` is Drive, so a disconnect costs one
     trial rather than the whole session."""
-    from pathlib import Path
-
     folder = Path(settings["data_dir"]) / "search"
     folder.mkdir(parents=True, exist_ok=True)
     return f"sqlite:///{folder / f'{entry}-{stage}.db'}"
+
+
+# ------------------------------------------------------------------- the artifact
+
+TUNED = Path(__file__).resolve().parent.parent / "tuned.json"
+
+
+def fingerprint(settings: dict) -> dict:
+    """What the tuning was found ON. Hyperparameters are only valid for their data."""
+    return {
+        "tickers": len(settings.get("tickers") or []),
+        "features": len(names()),
+        "start": settings.get("start"),
+        "search_steps": settings.get("search", {}).get("steps"),
+    }
+
+
+def confirm(entry: str, winner: dict, batches, settings: dict, scorer=score_tokenizer):
+    """Train the winner AND the incumbent at FULL budget and let the data decide.
+
+    ⚠️ This is the transfer guard, and it exists because we have been fooled by exactly
+    this. A configuration that wins a 600-step sprint can lose the real run: CS's held-out
+    error bottomed out at step 1,000 and then climbed for nine thousand more, 0.90 -> 1.03,
+    while its codebook decayed from 187 words to 141. A short search would have crowned it.
+
+    If the winner does not beat the incumbent here, we KEEP THE INCUMBENT.
+    """
+    features, companies = len(names()), len(settings["tickers"])
+    full = {**settings, "search": {**settings["search"], "steps": settings["steps"]}}
+
+    incumbent = {**settings[entry], "learning_rate": settings["learning_rate"],
+                 "model_size": settings["model_size"]}
+
+    scored = {}
+    for label, block in (("winner", winner), ("incumbent", incumbent)):
+        scored[label] = _run_one(entry, block, batches, full, scorer,
+                                 features, companies)["score"]
+
+    kept = "winner" if scored["winner"] > scored["incumbent"] else "incumbent"
+    return {"kept": kept, "winner": scored["winner"], "incumbent": scored["incumbent"],
+            "settings": winner if kept == "winner" else incumbent}
+
+
+def save(found: dict, settings: dict, path: Path = TUNED) -> Path:
+    """Write the answer, and what it was found on. Committed to the repo, not Drive --
+    Drive is private to whoever ran it, and the next person must get this by cloning."""
+    import datetime
+    import json
+
+    path.write_text(json.dumps({
+        "found_on": datetime.date.today().isoformat(),
+        "trials": settings["search"]["trials"],
+        "fingerprint": fingerprint(settings),
+        **found,
+    }, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
+    """Fold `tuned.json` into the settings the notebook typed. Returns (settings, note).
+
+    Precedence, most specific wins:
+
+        DEFAULTS  <  tuned.json  <  what you typed in the notebook
+
+    A tuned value replaces a default. A value you DELIBERATELY wrote stands. `check()` only
+    ever sees the keys actually typed, so it can tell the two apart without guessing.
+    """
+    import json
+
+    if not path.exists():
+        return typed, ("ℹ️  No tuned.json — running on defaults. "
+                       "Set search['run'] = True to search for better ones.")
+
+    found = json.loads(path.read_text())
+    merged = dict(typed)
+    for entry in ("ts", "cs"):
+        tuned_block = found.get(entry) or {}
+        if not tuned_block:
+            continue
+        # `tuned.json` stores each entry's block FLAT — the way `search()` returns it — so
+        # `learning_rate` and `model_size` are sitting in there even though they are
+        # top-level settings, not members of the entry's block. Split on TOP_LEVEL, the one
+        # place that knows which is which. Hand-picking the keys here is how you end up
+        # leaving `learning_rate` stranded inside `settings["ts"]`, where `check()` rejects
+        # it as an unknown setting and the notebook dies on its first cell.
+        block = {k: v for k, v in tuned_block.items() if k not in TOP_LEVEL}
+        merged[entry] = {**block, **typed.get(entry, {})}       # typed wins
+        for shared in TOP_LEVEL:
+            if shared in tuned_block and shared not in typed:
+                merged[shared] = tuned_block[shared]
+
+    was, now = found["fingerprint"], fingerprint({**typed, "search": {"steps": None}})
+    drifted = [f"{k}: tuned on {was[k]}, running {now[k]}"
+               for k in ("tickers", "features")
+               if was.get(k) != now.get(k) and now.get(k)]
+    if drifted:
+        note = ("⚠️  tuned.json is STALE — " + "; ".join(drifted) + ".\n"
+                "    Using it anyway (half-stale beats untuned), but set "
+                "search['run'] = True to re-tune.")
+    else:
+        note = (f"✅  Using tuned settings — found {found['found_on']} over "
+                f"{found['trials']} trials, on this same data.")
+    return merged, note

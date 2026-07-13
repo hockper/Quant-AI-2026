@@ -257,6 +257,103 @@ def test_a_killed_search_resumes_instead_of_starting_over(tiny_batches, tiny_set
     assert len(again) == 2, "the resumed search re-ran trials it had already completed"
 
 
+def test_apply_leaves_no_top_level_key_stranded_in_an_entry_block(tmp_path):
+    """`tuned.json` stores each entry FLAT, so `learning_rate` and `model_size` are sitting
+    inside the "ts" object even though they are top-level settings. Filter them out by hand
+    and you WILL forget one — then `check()` rejects it and the notebook dies on cell one."""
+    import json
+
+    from bubble_bi.settings import check as bb_check
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {},
+        "ts": {"vocabulary": 1024, "learning_rate": 4.2e-4, "model_size": 256},
+        "cs": {},
+    }))
+
+    merged, _ = tuning.apply({"tickers": ["AAA"]}, path=path)
+
+    assert not (tuning.TOP_LEVEL & set(merged["ts"])), (
+        "a top-level setting was left inside the entry block — check() will reject it"
+    )
+    assert merged["learning_rate"] == 4.2e-4      # lifted OUT, not dropped
+    assert merged["model_size"] == 256
+    assert merged["ts"]["vocabulary"] == 1024
+    bb_check(merged)                               # from bubble_bi.settings import check
+
+
+def test_precedence_defaults_then_tuned_then_what_you_typed(tmp_path):
+    """Three layers, most specific wins. A tuned value replaces a default, but a value you
+    DELIBERATELY typed in the notebook stands."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {}, "ts": {"vocabulary": 1024, "commitment": 0.31}, "cs": {},
+    }))
+
+    typed = {"tickers": ["AAA"], "ts": {"vocabulary": 256}}
+    merged, note = tuning.apply(typed, path=path)
+
+    assert merged["ts"]["vocabulary"] == 256      # you typed it: you win
+    assert merged["ts"]["commitment"] == 0.31     # you did not: the tuning wins
+    assert "✅" in note
+
+
+def test_a_stale_tuning_warns_and_does_not_pretend(tmp_path):
+    """We have already changed the feature count twice (10 -> 22 -> 26). Silently reusing
+    hyperparameters tuned on different data is the exact class of bug we keep catching."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-01-01", "trials": 12,
+        "fingerprint": {"tickers": 30, "features": 22, "start": None, "search_steps": 600},
+        "score": {}, "ts": {"vocabulary": 1024}, "cs": {},
+    }))
+
+    merged, note = tuning.apply({"tickers": ["AAA"]}, path=path)
+
+    assert "STALE" in note
+    assert "22" in note and "26" in note           # says WHAT changed, not just "stale"
+    assert merged["ts"]["vocabulary"] == 1024      # still used: half-stale beats untuned
+
+
+def test_no_tuning_file_says_so_plainly(tmp_path):
+    merged, note = tuning.apply({"tickers": ["AAA"]}, path=tmp_path / "absent.json")
+    assert "No tuned.json" in note
+    assert merged == {"tickers": ["AAA"]}
+
+
+def test_the_confirm_keeps_the_incumbent_when_the_winner_does_not_beat_it(
+        tiny_batches, tiny_settings):
+    """The transfer guard. A config that wins a 600-step sprint can lose the real run: CS
+    did exactly that, its held-out error climbing while its codebook decayed.
+
+    `confirm` scores the winner first, then the incumbent — so a scorer that hands out a
+    poor score and then a good one is a winner that flattered to deceive.
+    """
+    scores = iter([
+        {"score": 0.1, "direction": 0.0, "volatility": 0.1, "words_used": 9,
+         "before_quant": 0.0, "why": ""},         # the winner,    at FULL budget
+        {"score": 0.9, "direction": 0.4, "volatility": 0.5, "words_used": 9,
+         "before_quant": 0.0, "why": ""},         # the incumbent, at FULL budget
+    ])
+
+    out = tuning.confirm("ts", {**tiny_settings["ts"], "learning_rate": 1e-3,
+                                "model_size": 16},
+                         tiny_batches, tiny_settings, scorer=lambda *a, **k: next(scores))
+
+    assert out["kept"] == "incumbent"
+    assert out["winner"] == 0.1 and out["incumbent"] == 0.9
+    assert out["settings"]["vocabulary"] == tiny_settings["ts"]["vocabulary"]
+
+
 def test_the_probe_target_is_TODAY_and_never_tomorrow():
     """TS and CS are autoencoders. The target is the LAST DAY of the window they were just
     handed — read straight out of the grid, so nothing from the future can reach it."""
