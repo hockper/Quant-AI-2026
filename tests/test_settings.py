@@ -132,17 +132,46 @@ def test_no_loss_weight_is_decorative():
     )
 
 
-def test_the_optimiser_uses_the_weight_decay_setting():
-    """It was hardcoded to 0.01 while STORM uses 0.05, and no setting existed at all."""
-    import inspect as _inspect
+def test_the_optimiser_uses_the_weight_decay_setting(monkeypatch):
+    """It was hardcoded to 0.01 while STORM uses 0.05, and no setting existed at all.
+
+    The old version of this test only grepped `training.py`'s SOURCE TEXT for the exact
+    string `"weight_decay=0.01"` -- it would have passed just as happily on
+    `weight_decay = 0.01` (extra spaces) or any other number quietly hardcoded in its
+    place, and it never once checked that the optimiser `train()` actually BUILDS
+    receives the number `settings` asked for. This builds a real optimiser through the
+    real training path and reads the number back off the object itself.
+    """
+    import torch
+    from torch.utils.data import DataLoader
 
     from bubble_bi import training
 
-    source = _inspect.getsource(training)
-    assert "weight_decay=0.01" not in source, (
-        "training.py still hardcodes weight_decay=0.01 — it must come from settings."
-    )
     assert DEFAULTS["weight_decay"] == 0.05
+
+    settings = bb.check({"tickers": ["AAPL"], "weight_decay": 0.37})
+    model = VQVAE(companies=1, days=4, features=6, vocabulary=8, width=16, heads=2)
+    grids = [{"grid": torch.randn(1, 4, 6)} for _ in range(16)]
+    loaders = {"learn": DataLoader(grids, batch_size=8, shuffle=True),
+               "tune": DataLoader(grids, batch_size=8)}
+
+    captured = {}
+    real_adamw = torch.optim.AdamW
+
+    def spying_adamw(*args, **kwargs):
+        optimiser = real_adamw(*args, **kwargs)
+        captured["optimiser"] = optimiser
+        return optimiser
+
+    monkeypatch.setattr(torch.optim, "AdamW", spying_adamw)
+
+    training.train(model, loaders, settings, steps=1, quiet=True)
+
+    assert "optimiser" in captured, "train() never built an optimiser at all"
+    assert captured["optimiser"].param_groups[0]["weight_decay"] == 0.37, (
+        "the optimiser's own weight_decay does not match settings['weight_decay'] -- "
+        "it is not actually reaching the optimiser"
+    )
 
 
 def test_no_fusion_setting_is_decorative():

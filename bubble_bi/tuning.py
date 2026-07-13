@@ -493,6 +493,13 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     The one correct move is `tuning.settle(settings, entry, best)`: it returns a
     complete settings dict with `best` folded into the right places -- ready to hand
     straight to `settings.check()`.
+
+    The returned TABLE carries an `entry` column (this function's own `entry` argument,
+    on every row) so `disagreements()` -- which groups by `entry` -- works on this
+    table directly. Do not rely on a caller to bolt that column on afterwards (the
+    notebook used to, via `.assign(entry="TS")`): every test of `disagreements()` used
+    to hand it a table built by hand, already carrying `entry`, so the real
+    `search() → disagreements()` composition was never actually run.
     """
     import optuna
 
@@ -501,6 +508,13 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     features = len(names())
     companies = len(settings["tickers"])
     budget = settings["search"]["trials"]
+    if budget < 2:
+        raise ValueError(
+            f"`search['trials']` must be at least 2, got {budget!r}. The search runs in "
+            "TWO stages (balance, then sizes) -- `budget // 2` trials go to each -- so a "
+            "budget of 1 runs NO trials in either stage, and there would be nothing to "
+            "report. Raise `search['trials']` to at least 2."
+        )
     rows, fixed = [], {}
 
     for stage, knobs in SPACE.items():
@@ -532,7 +546,15 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
         for trial in study.trials:
             if trial.state != optuna.trial.TrialState.COMPLETE:
                 continue
-            rows.append({"stage": stage, **trial.params,
+            # `fixed` first, `trial.params` second: on a Stage B row, `trial.params` is
+            # ONLY this trial's own sizes knobs (model_size, vocabulary, days) -- the
+            # balance knobs it trained WITH (learning_rate, commitment, diversity) live
+            # in `fixed`, carried over from Stage A's winner. Recording `trial.params`
+            # alone left those columns NaN on every Stage B row, and
+            # `plots.tuning_importance` silently drops any column that is not a number
+            # -- so half the trial table's own knobs never even got a chance to show up
+            # as mattering.
+            rows.append({"entry": entry, "stage": stage, **fixed, **trial.params,
                          **{k: trial.user_attrs.get(k) for k in
                             ("score", "direction", "volatility",
                              "before_quant", "words_used", "why")}})

@@ -248,6 +248,18 @@ def test_the_balance_comes_before_the_sizes():
     assert set(tuning.SPACE["sizes"]) == {"model_size", "vocabulary", "days"}
 
 
+def test_search_refuses_a_budget_that_cannot_cover_both_stages(tiny_batches, tiny_settings):
+    """`search()` runs in TWO stages, `budget // 2` trials each. At `trials=1`,
+    `budget // 2` is 0 -- no trial ever runs, `rows` stays empty, and
+    `pd.DataFrame([]).sort_values("score")` used to raise an opaque `KeyError: 'score'`.
+    `settings.check()` allows `trials=1` (it only checks that it is positive), so this
+    has to be caught here, with a message a human can actually act on.
+    """
+    broken = {**tiny_settings, "search": {**tiny_settings["search"], "trials": 1}}
+    with pytest.raises(ValueError, match="at least 2"):
+        tuning.search("ts", tiny_batches, broken)
+
+
 def test_disagreements_fires_when_the_best_score_is_not_the_best_direction():
     """The reviewer's exact repro. `search()` returns each entry's trials table sorted
     but NOT re-indexed (0..n-1 for TS, 0..n-1 again for CS), so a naive `pd.concat` of
@@ -369,6 +381,57 @@ def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_setting
     assert len(trials) == 2
     assert {"score", "direction", "volatility", "words_used"} <= set(trials.columns)
     check(tuning.settle(tiny_settings, "ts", best))
+
+
+def test_search_emits_the_entry_column_that_disagreements_actually_groups_by(
+        tiny_batches, tiny_settings):
+    """The real composition, exercised for once. Before this fix, `search()` never put
+    an `entry` column on its own table at all -- only the NOTEBOOK did, via
+    `.assign(entry="TS")` after the fact -- so every test of `disagreements()` (all of
+    them above) fed it a table built by hand that already had the column, and the
+    actual `search() → disagreements()` pipeline was never run together, not even once.
+    """
+    _, ts_trials = tuning.search("ts", tiny_batches, tiny_settings)
+    _, cs_trials = tuning.search("cs", tiny_batches, tiny_settings)
+
+    assert "entry" in ts_trials.columns and "entry" in cs_trials.columns
+    assert set(ts_trials["entry"]) == {"ts"}
+    assert set(cs_trials["entry"]) == {"cs"}
+
+    trials = pd.concat([ts_trials, cs_trials], ignore_index=True)
+    lines = tuning.disagreements(trials)          # must not raise -- this is the point
+    assert isinstance(lines, list)
+
+
+def test_search_carries_the_winning_balance_onto_every_sizes_stage_row(
+        tiny_batches, tiny_settings, monkeypatch):
+    """Stage B's own `trial.params` are ONLY the sizes knobs (model_size, vocabulary,
+    days) -- the balance it trained WITH (learning_rate, commitment, diversity) lives in
+    `fixed`, carried over from Stage A's winner, and used to never make it into the
+    recorded row at all. That left every sizes-stage row showing NaN for the balance
+    knobs, and `plots.tuning_importance` silently drops any column that is not a number
+    for at least 3 trials -- so it looked, wrongly, like the balance never mattered.
+
+    `_run_one` is stubbed to a fixed, healthy score: this test is about the ROW-MERGING
+    logic in `search()` alone, not about whether this fixture's tiny synthetic model
+    happens to collapse its codebook (it can, deterministically, now that training is
+    seeded -- a collapsed Stage A leaves `fixed` empty for a real reason, which is a
+    different thing entirely from the bug this test guards against).
+    """
+    def fake_run_one(entry, chosen, batches, settings, scorer, features, companies, trial=None):
+        return {"score": 1.0, "direction": 0.1, "volatility": 0.5, "words_used": 9,
+                "before_quant": 0.2, "why": ""}
+
+    monkeypatch.setattr(tuning, "_run_one", fake_run_one)
+
+    _, trials = tuning.search("ts", tiny_batches, tiny_settings)
+    sizes_rows = trials[trials["stage"] == "sizes"]
+    assert not sizes_rows.empty
+    for knob in ("learning_rate", "commitment", "diversity"):
+        assert sizes_rows[knob].notna().all(), (
+            f"{knob} is NaN on a sizes-stage row -- Stage A's winning balance was not "
+            "carried onto Stage B's own rows"
+        )
 
 
 def test_settle_splits_a_flat_search_result_back_apart():
@@ -641,6 +704,50 @@ def test_save_round_trips_through_apply(tmp_path):
     bb_check(merged)                               # what comes back is a valid settings dict
 
 
+def test_tuned_json_is_strict_json_even_when_confirm_kept_the_incumbent(tmp_path):
+    """The old notebook cell recorded `"score": {"ts": ts_trials.iloc[0].to_dict()}` --
+    always the best SEARCH trial, even on the runs where `confirm()` rejected it and
+    kept the incumbent instead, so the saved score described a config that had just
+    been thrown out. And `iloc[0]` is one STAGE's row, so the other stage's own knobs
+    came back as `NaN` -- which `json.dumps` writes as a bare, non-standard `NaN`
+    literal. Python's own `json.loads` reads that back without complaint (which is
+    exactly why a naive round-trip test would never catch this), but it is not valid
+    JSON by the spec, and no other parser has to accept it.
+
+    This writes `tuned.json` the way the FIXED notebook does -- `confirm()`'s own
+    `kept`/`winner`/`incumbent`, plain floats describing what was actually saved -- and
+    demands the file parse under a STRICT reader that refuses `NaN`/`Infinity`.
+    """
+    import json
+
+    from bubble_bi.settings import DEFAULTS
+
+    settings = {**DEFAULTS, "tickers": ["AAA", "BBB"]}
+    # Shaped exactly like the notebook's fixed cell: `confirm()` kept the INCUMBENT for
+    # TS (the search's own winner lost the head-to-head), and the winner for CS.
+    found = {
+        "ts": {"vocabulary": 512, "commitment": 0.25, "learning_rate": 1e-4,
+               "model_size": 128},
+        "cs": {"vocabulary": 256, "commitment": 0.31, "learning_rate": 1e-4,
+               "model_size": 128},
+        "score": {"ts": {"kept": "incumbent", "winner": 0.10, "incumbent": 0.42},
+                  "cs": {"kept": "winner", "winner": 0.55, "incumbent": 0.20}},
+    }
+
+    path = tuning.save(found, settings, path=tmp_path / "tuned.json")
+    text = path.read_text()
+
+    def _no_constants(token):
+        raise ValueError(f"non-standard JSON constant found: {token!r}")
+
+    # The strict check the standard library's own loader skips by default -- pass
+    # `parse_constant` and `NaN`/`Infinity`/`-Infinity` become a hard error instead of
+    # silently parsing.
+    parsed = json.loads(text, parse_constant=_no_constants)   # raises if not strict JSON
+    assert parsed["score"]["ts"]["kept"] == "incumbent"
+    assert parsed["score"]["ts"]["incumbent"] == 0.42
+
+
 def test_run_one_seeds_training_so_the_same_config_scores_the_same_way_twice(
         tiny_batches, tiny_settings):
     """`_run_one` is called back to back -- twelve times over a search, twice more in
@@ -909,3 +1016,37 @@ def test_the_probe_target_is_TODAY_and_never_tomorrow():
     body = tuning.names().index("body")
     expected = np.array([float(g[0, -1, body]) for g in grids])   # last day, `body`
     assert np.allclose(direction[:, 0], expected, atol=1e-5)
+
+
+def test_corrupting_tomorrows_return_leaves_every_trial_score_bit_for_bit_identical(
+        tiny_batches, tiny_settings, tmp_path):
+    """The spec's own promised proof that the search is blind to the future.
+    `arrays.y` IS tomorrow's return -- if the search's score depended on it even a
+    little, scrambling it would move the score. It does not, because the probe's own
+    target never comes from `arrays.y` at all: it comes from the LAST DAY of the grid
+    itself (`look()`), read straight out of `arrays.x`. Two full searches, same seed,
+    one on the real data and one on data where tomorrow's return has been shuffled
+    against the wrong day -- their trial scores must match, bit for bit.
+
+    Each run gets its OWN `data_dir`, so the second search cannot just resume the
+    first's on-disk study (same entry, same stage names) and silently skip actually
+    running on the corrupted data at all.
+    """
+    import dataclasses
+
+    honest_settings = {**tiny_settings, "data_dir": str(tmp_path / "honest")}
+    blind_settings = {**tiny_settings, "data_dir": str(tmp_path / "blind")}
+
+    rng = np.random.default_rng(0)
+    scrambled_y = tiny_batches.arrays.y[rng.permutation(len(tiny_batches.arrays.y))]
+    blind_arrays = dataclasses.replace(tiny_batches.arrays, y=scrambled_y)
+    blind_batches = dataclasses.replace(tiny_batches, arrays=blind_arrays)
+
+    _, honest_trials = tuning.search("ts", tiny_batches, honest_settings)
+    _, blind_trials = tuning.search("ts", blind_batches, blind_settings)
+
+    pd.testing.assert_series_equal(
+        honest_trials["score"].reset_index(drop=True),
+        blind_trials["score"].reset_index(drop=True),
+        check_names=False,
+    )
