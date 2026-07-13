@@ -2,6 +2,53 @@
 
 **Taken deliberately. Do not "fix" this without reading it first.**
 
+---
+
+## ⚠️ UPDATE, 2026-07-13 — THE REGIME PIVOT IS OFF. Read this before the rest.
+
+Everything below was measured on an **untuned, collapsing CS**. The first real
+hyperparameter search (`bb.tuning`, on a T4) changed the answer, and it changed it in the
+half of the model nobody was watching.
+
+Scored against the noise floor of the measurement itself:
+
+| | rows to probe on | noise floor (sd) | best `direction` | verdict |
+|---|---|---|---|---|
+| **TS** (one stock) | 78,000 | 0.006 | **0.030** | at the noise floor — **nil** |
+| **CS** (whole market) | ~600 | 0.046 | **0.989** | **21 standard errors clear** |
+
+**The candle is noise at the STOCK level and signal at the MARKET level.**
+
+- **TS** sees fifteen days of *one* company's candles: fifteen independent random numbers,
+  incompressible. It throws direction away. **Everything below still holds for TS.**
+- **CS** sees thirty companies on the *same day*. They all move together — the **market
+  factor** is the single highest-variance, most compressible thing in that grid, and one
+  number explains a great deal of it. So CS spends its words on it, and **today's market
+  direction survives the bottleneck almost perfectly.**
+
+That is textbook finance falling out of a compression argument, and nobody told it:
+**idiosyncratic direction is noise; systematic direction is not.**
+
+So the claim below — *"both halves independently kept the regime and discarded the
+direction"* — **is false for CS.** The token does carry direction: the market's. The
+proposed pivot (retarget the prediction and the RL agent onto volatility/regime) is
+therefore **not** justified, and is off.
+
+**What this does NOT say.** This is today's direction *surviving the bottleneck*, not
+tomorrow's direction being *predictable*. The tokenizer keeping it is necessary, not
+sufficient. Whether it is forecastable is the **predictor's** question, and is measured
+when the predictor is tuned — not here.
+
+**A caution about the numbers.** `before_quant` in the same table is not to be trusted and
+is now suppressed: with ~600 CS rows and a 256-wide dense probe it had as many free
+parameters as data, and it printed an impossible −4.164 against a token, quantised *from
+that very vector*, scoring +0.561. Quantising cannot add information. See
+`_score_and_floor` in `bubble_bi/tuning.py`.
+
+---
+
+## The original decision, and the evidence it was taken on (now superseded for CS)
+
 ## What we found
 
 Given the candle — the gap, the body, the two wicks, all handed to it explicitly — the

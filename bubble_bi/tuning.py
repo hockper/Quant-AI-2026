@@ -36,6 +36,12 @@ DIRECTION = ["body", "log_return"]
 # A codebook using fewer than this share of its words has collapsed.
 ALIVE = 0.05
 
+# How many rows a DENSE probe needs per column before we will believe its answer.
+# Below this it has as many free parameters as data and is fitting noise: see
+# `_score_and_floor`. (The one-hot token probe is exempt -- it has only `words_used`
+# free parameters however many columns its vocabulary nominally gives it.)
+ENOUGH_ROWS_PER_COLUMN = 5
+
 
 def _columns(settings: dict) -> dict[str, list[int]]:
     """Which columns of the grid are 'direction' and which are 'volatility'."""
@@ -185,6 +191,31 @@ def _score_and_floor(x: np.ndarray, y: np.ndarray, seed: int) -> tuple[float, fl
     """
     if _is_onehot(x):
         return _score_and_floor_ids(x.argmax(axis=1), x.shape[1], y, seed)
+
+    # ⚠️ A DENSE design needs rows to fit its columns on, and CS does not have them.
+    #
+    # CS produces ONE grid per DAY -- about 600 tune rows, so ~420 to fit on -- while its
+    # continuous `summary` is up to 256 wide. That probe has as many free parameters as it
+    # has rows. Handed a target it knows NOTHING about it scores R² = -2.38: it is not
+    # measuring information, it is measuring its own overfitting.
+    #
+    # And it printed an IMPOSSIBLE number because of it. The first real GPU run reported CS
+    # `direction` +0.561 from the TOKEN against `before_quant` -4.164 from the continuous
+    # vector THE TOKEN WAS QUANTISED FROM. Quantising can only ever destroy information, so
+    # a token beating its own source by 4.7 R² is not a finding, it is a broken probe.
+    #
+    # No ridge saves this honestly -- it would only move the arbitrariness into a knob. A
+    # number we cannot support is worse than no number, because it gets quoted. So we say
+    # we cannot answer, and the caller says WHY.
+    #
+    # (This does NOT silence the token probe. A 1024-word one-hot has 1024 columns but only
+    # `words_used` free parameters -- ~90 on the real CS run -- so it stays well posed where
+    # a 256-wide dense vector does not. That is exactly why CS's `direction` is trustworthy
+    # and its `before_quant` never was.)
+    fitting_rows = int(len(x) * 0.7)                 # `_probe` splits 70/30, chronologically
+    if fitting_rows < ENOUGH_ROWS_PER_COLUMN * x.shape[1]:
+        return float("nan"), float("nan"), float("nan")
+
     rng = np.random.default_rng(seed)
     real = _probe(x, y)
     draws = np.array([_probe(x[rng.permutation(len(x))], y) for _ in range(_FLOOR_REPS)])
@@ -575,9 +606,15 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
             # `plots.tuning_importance` silently drops any column that is not a number
             # -- so half the trial table's own knobs never even got a chance to show up
             # as mattering.
+            # `direction_se` rides along because `direction` is meaningless without it.
+            # The first real GPU run scored TS 0.030 and CS 0.989, and only the error bar
+            # says that the first sits AT its own noise floor (nil) while the second is
+            # twenty-one standard errors clear of it. A number whose noise nobody can see
+            # is a number that gets quoted.
             rows.append({"entry": entry, "stage": stage, **fixed, **trial.params,
                          **{k: trial.user_attrs.get(k) for k in
-                            ("score", "direction", "volatility",
+                            ("score", "direction", "direction_se",
+                             "volatility", "volatility_se",
                              "before_quant", "words_used", "why")}})
 
         alive = [t for t in study.trials

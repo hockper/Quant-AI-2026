@@ -1277,3 +1277,53 @@ def test_a_collapsed_check_reports_nothing_rather_than_minus_infinity(monkeypatc
         f"reported non-finite values to the pruner: {reported}. np.nanpercentile turns "
         "those into NaN and the pruner stops working for every trial in the study."
     )
+
+
+# ──────────────────────────────────────── a probe that refuses to answer
+#
+# The first real GPU run reported, for CS:
+#
+#     direction (token)      +0.561
+#     before_quant (source)  -4.164
+#
+# That is IMPOSSIBLE. `before_quant` probes the CONTINUOUS vector the token was quantised
+# FROM, and quantising can only ever destroy information -- a token cannot carry more than
+# its own source. The token "beat" the vector it came from by 4.7 R2.
+#
+# The cause is not the model, it is the probe. CS has ONE grid per DAY (~600 tune rows, so
+# ~420 to fit on), and the continuous summary is up to 256 wide. That probe has as many
+# free parameters as it has rows: on a target it knows NOTHING about it scores R2 = -2.38.
+# It was measuring its own overfitting and we were printing it as if it meant something.
+#
+# No choice of ridge honestly rescues that -- it would just move the arbitrariness into a
+# knob. The honest thing is to say "I cannot answer this" and say why.
+
+def test_the_continuous_probe_refuses_to_answer_when_it_has_too_few_rows():
+    """A number we cannot support is worse than no number: it gets quoted."""
+    import math
+
+    rng = np.random.default_rng(0)
+    y = rng.normal(size=(600, 2))
+
+    thin = rng.normal(size=(600, 256))       # CS: 420 fitting rows, 256 columns
+    assert math.isnan(tuning.skill(thin, y)), (
+        "answered with 256 columns and 420 rows to fit them on — that is overfitting, "
+        "not information, and it produced an impossible -4.164 on the real run"
+    )
+
+    fat = rng.normal(size=(600, 16))         # plenty of rows per column: answer away
+    assert math.isfinite(tuning.skill(fat, y))
+
+
+def test_a_one_hot_token_is_still_answered_because_it_is_not_degenerate():
+    """The guard must not silence the token probe. A 1024-word one-hot has 1024 COLUMNS but
+    only `words_used` free parameters -- ~90 on the real CS run -- so it is well posed where
+    a 256-wide dense vector is not. This is why CS's `direction` is trustworthy and its
+    `before_quant` was not."""
+    import math
+
+    rng = np.random.default_rng(1)
+    ids = rng.integers(0, 90, size=600)
+    y = rng.normal(size=(600, 2))
+    answer, _noise = tuning.skill_from_ids(ids, words=1024, y=y)
+    assert math.isfinite(answer)
