@@ -1402,3 +1402,92 @@ def test_a_short_run_is_still_fine_when_the_search_is_OFF():
 
     check({"tickers": ["AAPL"], "steps": 300,
            "search": {"run": False, "trials": 12, "steps": 600}})     # must not raise
+
+
+def test_apply_never_treats_its_OWN_PREVIOUS_OUTPUT_as_something_you_typed(tmp_path):
+    """⚠️ THE BUG THAT THREW AWAY A 60-TRIAL GPU RUN.
+
+    The notebook did `SETTINGS, note = bb.tuning.apply(SETTINGS)` — REASSIGNING the very
+    dict it hands back in. Precedence is DEFAULTS < tuned.json < what you TYPED, so on the
+    next execution the *previous* run's tuned values are sitting in `SETTINGS` and `apply()`
+    reads them as things the user typed. Typed wins. The new tuning is silently discarded.
+
+    Observed for real: a 60-trial search found ts.days=5, model_size=128, wrote them to
+    tuned.json — and the notebook went on to train days=10, width=64, the answer from the
+    PREVIOUS run, because the previous apply() had baked them into SETTINGS.
+
+    A search whose own output overrides its next output is a search that can only ever be
+    run once.
+    """
+    import json
+
+    path = tmp_path / "tuned.json"
+
+    def search_writes(days, size):
+        path.write_text(json.dumps({
+            "found_on": "2026-07-13", "trials": 60,
+            "fingerprint": {"tickers": 1, "features": 26, "start": None,
+                            "search_steps": 600},
+            "score": {}, "ts": {"days": days, "model_size": size}, "cs": {}}))
+
+    typed = {"tickers": ["AAPL"]}          # the user typed NOTHING about days or model_size
+
+    search_writes(10, 64)                  # an earlier run
+    first, _ = tuning.apply(typed, path=path)
+    assert first["ts"]["days"] == 10
+
+    search_writes(5, 128)                  # a NEW, better run
+    second, _ = tuning.apply(typed, path=path)      # `typed` is untouched — as it must be
+
+    assert second["ts"]["days"] == 5, "the new tuning was overridden by the old one"
+    assert second["model_size"] == 128
+
+    # And the reason it works: apply() must not MUTATE what it was given. If it did, the
+    # notebook's `SETTINGS` would quietly accumulate every run's answers as "typed".
+    assert "ts" not in typed, "apply() mutated the caller's settings — that IS the bug"
+
+
+def test_a_config_already_tried_is_never_retrained(tiny_batches, tiny_settings, monkeypatch):
+    """⚠️ 40% OF A 60-TRIAL GPU RUN WAS SPENT RE-TRAINING CONFIGS IT HAD ALREADY TRIED.
+
+    Real numbers: TS produced ELEVEN bit-identical rows (score 0.537, 232 words) and CS
+    produced THIRTEEN (1.846, 62 words). TPE converges on a good region and, in a discrete
+    `sizes` space, simply re-suggests the same corner of it. Optuna does not stop it.
+
+    Seeding the training (so the two sides of a confirm start alike) made this WORSE, not
+    better: the duplicates became bit-identical rather than merely near-identical, so the
+    same GPU minutes bought a number we already had, to the last decimal.
+
+    We do not leave this to chance in the test: the sampler is pinned so EVERY trial asks
+    for the same configuration. Without de-duplication that is N trainings for one answer.
+    """
+    trained = []
+    real_run_one = tuning._run_one
+
+    def counting(entry, chosen, batches, settings, scorer, features, companies, trial=None):
+        trained.append(1)
+        return real_run_one(entry, chosen, batches, settings, scorer,
+                            features, companies, trial)
+
+    # Pin the sampler: every trial asks for the SAME thing, so every trial after the first
+    # is a duplicate. This is the pathological case the real run kept walking into.
+    def always_the_same(trial, name, rule):
+        kind = rule[0]
+        if kind == "pick":
+            return rule[1][0]
+        return float(rule[1])
+
+    monkeypatch.setattr(tuning, "_run_one", counting)
+    monkeypatch.setattr(tuning, "_ask", always_the_same)
+
+    settings = {**tiny_settings, "search": {**tiny_settings["search"], "trials": 8}}
+    _best, trials = tuning.search("ts", tiny_batches, settings)
+
+    # Two stages, one distinct configuration each -> at most two trainings, ever.
+    assert len(trained) <= 2, (
+        f"trained {len(trained)} times for 2 distinct configurations — "
+        f"{len(trained) - 2} of those bought a score we already had"
+    )
+    # ...and the duplicates must still SHOW UP in the table, with the score they earned.
+    assert len(trials) == 8, "de-duplicating must not lose the trials from the record"
+    assert trials["score"].nunique() <= 2

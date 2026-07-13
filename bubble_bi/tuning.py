@@ -584,6 +584,29 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
         def objective(trial):
             chosen = {**fixed,
                       **{name: _ask(trial, name, rule) for name, rule in rules.items()}}
+
+            # ⚠️ NEVER TRAIN THE SAME CONFIGURATION TWICE.
+            #
+            # TPE converges on a good region and then, in a discrete space like `sizes`,
+            # simply keeps re-suggesting the same corner of it. Optuna does not stop it, and
+            # a real 60-trial GPU run spent about FORTY PERCENT of its budget re-training
+            # configurations it had already evaluated: TS produced eleven bit-identical rows
+            # (score 0.537, 232 words), CS produced thirteen (1.846, 62 words).
+            #
+            # Seeding the training made this WORSE, not better. Before, a duplicate at least
+            # landed somewhere slightly different and told you a little about the noise. Now
+            # it is bit-identical — the same GPU minutes buying a number we already had, to
+            # the last decimal.
+            #
+            # The trial still goes into the record with the score it earned; it just costs
+            # nothing to put it there.
+            for earlier in trial.study.trials:
+                if (earlier.state == optuna.trial.TrialState.COMPLETE
+                        and earlier.params == trial.params):
+                    for key, value in earlier.user_attrs.items():
+                        trial.set_user_attr(key, value)
+                    return earlier.value
+
             scored = _run_one(entry, chosen, batches, settings, scorer,
                               features, companies, trial=trial)
             for key, value in scored.items():

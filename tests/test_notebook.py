@@ -83,3 +83,49 @@ def test_the_notebook_is_committed_unrun():
     dirty = [i for i, c in enumerate(_cells())
              if c.get("outputs") or c.get("execution_count")]
     assert not dirty, f"cells {dirty} have stored output — clear them before committing"
+
+
+def test_only_the_settings_cell_is_allowed_to_assign_SETTINGS():
+    """⚠️ THE BUG THAT THREW AWAY A 60-TRIAL GPU RUN.
+
+    The search cell did `SETTINGS, note = bb.tuning.apply(SETTINGS)` — reassigning the very
+    dict it feeds back in. Precedence is DEFAULTS < tuned.json < what you TYPED, so on the
+    next execution the PREVIOUS run's tuned values sit in `SETTINGS` and `apply()` reads
+    them as things the user typed. Typed wins, and the new tuning is silently discarded.
+
+    Observed for real: a 60-trial search found ts.days=5 / model_size=128, wrote them to
+    tuned.json, and the notebook then trained days=10 / width=64 — the answer from the run
+    BEFORE, because the previous apply() had baked it into SETTINGS.
+
+    A search whose own output overrides its next output can only ever be run once. `SETTINGS`
+    is what the HUMAN typed; nothing else may ever write to it.
+    """
+    import ast
+
+    offenders = []
+    for cell in _cells():
+        if cell["cell_type"] != "code":
+            continue
+        source = "".join(cell["source"])
+        if source.lstrip().startswith("SETTINGS = dict("):
+            continue                       # the one cell that is allowed to
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign))
+                       else [])
+            for t in targets:
+                for name in ast.walk(t):
+                    if isinstance(name, ast.Name) and name.id == "SETTINGS":
+                        offenders.append(source.splitlines()[node.lineno - 1].strip())
+
+    assert not offenders, (
+        "a cell other than the SETTINGS cell writes to SETTINGS:\n    "
+        + "\n    ".join(offenders)
+        + "\n\nSETTINGS is what the HUMAN typed. If the tuning writes back into it, then on "
+          "the next run its own previous answer masquerades as a typed value, beats the new "
+          "tuning, and the search silently discards its own result."
+    )
