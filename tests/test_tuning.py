@@ -244,6 +244,72 @@ def test_disagreements_reports_nothing_when_score_and_direction_agree():
     assert tuning.disagreements(trials) == []
 
 
+def test_disagreements_names_the_entry_when_every_trial_collapsed():
+    """The crash this finding is about: `score_tokenizer` marks a collapsed trial
+    `score = -inf, direction = NaN`. If EVERY trial for an entry collapsed, `direction`
+    is all-NaN, and the old `group["direction"].idxmax()` raised `ValueError:
+    Encountered all NA values` -- an opaque pandas error that told a non-programmer
+    nothing, and that fired BEFORE the notebook's "N trials is a SCREEN" banner. This
+    is the test that would have caught it: `disagreements()` must not raise, and must
+    say plainly that TS collapsed entirely, naming TS."""
+    trials = pd.DataFrame({
+        "entry":     ["TS", "TS", "TS"],
+        "score":     [-math.inf, -math.inf, -math.inf],
+        "direction": [float("nan"), float("nan"), float("nan")],
+    })
+
+    lines = tuning.disagreements(trials)
+
+    assert len(lines) == 1
+    assert "TS" in lines[0]
+    assert "collapsed" in lines[0].lower()
+    assert "commitment" in lines[0] and "diversity" in lines[0]
+
+
+def test_disagreements_reports_the_healthy_entry_even_when_the_other_fully_collapsed():
+    """The whole point of not crashing: one entry's total collapse must not silence a
+    genuine disagreement in the OTHER entry. TS collapses completely here; CS has a
+    real, disagreeing result. Both lines must come back -- CS's disagreement is not
+    allowed to go missing just because TS blew up."""
+    trials = pd.DataFrame({
+        "entry":     ["TS", "TS", "CS", "CS"],
+        "score":     [-math.inf, -math.inf, 0.50, 0.40],
+        "direction": [float("nan"), float("nan"), 0.02, 0.10],
+        # CS: best score (row 2, score 0.50) has direction 0.02; best direction (row 3,
+        # direction 0.10) has the lower score 0.40 -- a genuine disagreement.
+    })
+
+    lines = tuning.disagreements(trials)
+
+    assert len(lines) == 2
+    ts_line = next(line for line in lines if "collapsed" in line.lower())
+    cs_line = next(line for line in lines if line is not ts_line)
+    assert "TS" in ts_line
+    assert "CS" in cs_line
+    assert "0.02" in cs_line and "0.10" in cs_line
+
+
+def test_disagreements_never_reports_a_collapsed_trial_as_the_winner():
+    """Some trials collapsed, some survived, for the SAME entry. `idxmax()` skipping
+    NaN already gets this right today, but that must not be an accident of pandas
+    behaviour -- a rejected (`score = -inf`) trial must be explicitly excluded before
+    comparison, never eligible to be reported as a best-score or best-direction row."""
+    trials = pd.DataFrame({
+        "entry":     ["TS", "TS", "TS"],
+        "score":     [-math.inf, 0.90, 0.30],
+        "direction": [float("nan"), 0.01, 0.05],
+        # Row 0 collapsed (-inf) but would be the numeric max of nothing -- it must
+        # never win. Row 1 is the real best score; row 2 is the real best direction.
+    })
+
+    lines = tuning.disagreements(trials)
+
+    assert len(lines) == 1
+    assert "0.01" in lines[0] and "0.05" in lines[0]
+    assert "inf" not in lines[0].lower()
+    assert "nan" not in lines[0].lower()
+
+
 def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_settings):
     """End-to-end on a 2-trial synthetic run: whatever the search hands back must be a
     settings dict the project will actually accept.

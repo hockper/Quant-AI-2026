@@ -503,16 +503,46 @@ def disagreements(trials: pd.DataFrame) -> list[str]:
     gives every row now in front of us a label that cannot collide, so the comparison
     means what it says regardless of what the caller did upstream.
 
-    Returns the warning lines to print, one per entry that disagrees, each naming the
-    entry and BOTH configs' direction scores so the user can see what they would be
-    giving up. Empty when every entry's best score is also its best direction -- i.e.
-    nothing to warn about.
+    ⚠️ COLLAPSE. `score_tokenizer` marks a collapsed-codebook trial `score = -inf,
+    direction = NaN` -- REJECTED, not ranked (see its own docstring). `idxmax()` skips
+    NaN happily when at least one real row is left, but when EVERY trial for an entry
+    collapsed, `direction` is all-NaN and `idxmax()` raises `ValueError: Encountered
+    all NA values`. That is not a corner case here: this project has hit codebook
+    collapse repeatedly (the fusion codebook once fell to ~12 words of 512), and a
+    12-trial screen searching `commitment` and `diversity` together can plausibly wipe
+    out every trial for one entry. A crash here is worse than it looks, too: it happens
+    BEFORE the notebook prints its "N trials is a SCREEN" banner, and before any real
+    disagreement in the OTHER entry gets reported -- one entry collapsing would
+    silently swallow the other entry's genuine result as well. So we filter to the
+    SURVIVORS (`score` finite) before ever calling `idxmax()`, entry by entry, and
+    handle the entry with no survivors explicitly instead of letting pandas crash.
+
+    Returns the warning lines to print: one per entry whose best-scoring trial is not
+    its best-direction trial, PLUS one per entry where every trial collapsed (there is
+    no result to compare for that entry at all). Empty only when every entry has a
+    result and it agrees with itself -- i.e. nothing to warn about.
     """
     trials = trials.reset_index(drop=True)
     lines = []
     for entry, group in trials.groupby("entry", sort=False):
-        by_score = group.loc[group["score"].idxmax()]
-        by_direction = group.loc[group["direction"].idxmax()]
+        # A rejected trial (`score = -inf`) must never be compared or reported as a
+        # winner -- drop it BEFORE idxmax() ever sees it, rather than relying on NaN
+        # skipping to do the right thing by accident.
+        survivors = group[np.isfinite(group["score"])]
+        if survivors.empty:
+            lines.append(
+                f"⚠️  {entry}: EVERY trial in this search collapsed the codebook -- "
+                f"there is no result for {entry}, and its settings are unchanged.\n"
+                f"    Every configuration tried destroyed the codebook (down to a "
+                f"handful of words, carrying almost no information).\n"
+                f"    That usually means the balance was wrong for {entry} across the "
+                f"whole search: `commitment` too high, or `diversity` too low, is what "
+                f"kills a codebook.\n"
+                f"    Widen the search or hand-pick a gentler balance and try again."
+            )
+            continue
+        by_score = survivors.loc[survivors["score"].idxmax()]
+        by_direction = survivors.loc[survivors["direction"].idxmax()]
         if by_score.name == by_direction.name:
             continue
         lines.append(
