@@ -313,8 +313,12 @@ SPACE = {
     },
 }
 
-# `model_size` is a top-level setting; the rest live inside the entry's own block.
-_TOP_LEVEL = {"learning_rate", "model_size"}
+# `learning_rate` and `model_size` are top-level settings; the rest live inside the
+# entry's own block. PUBLIC on purpose -- this is the one place that knows the split,
+# and `settle()` below is the one place that uses it. Anyone folding a `search()` result
+# back into a settings dict should use `settle()`, not re-derive this set by hand (see
+# `search()`'s docstring for the trap that happens when someone does).
+TOP_LEVEL = frozenset({"learning_rate", "model_size"})
 
 
 def _ask(trial, name, rule):
@@ -328,11 +332,19 @@ def _ask(trial, name, rule):
     raise ValueError(f"unknown rule {kind!r} for {name!r}")
 
 
-def _settle(settings: dict, entry: str, chosen: dict) -> dict:
-    """A full settings dict with this trial's choices folded in."""
-    out = {**settings, **{k: v for k, v in chosen.items() if k in _TOP_LEVEL}}
+def settle(settings: dict, entry: str, chosen: dict) -> dict:
+    """A full settings dict with `chosen` folded into the right places.
+
+    `chosen` is FLAT -- exactly the shape `search()` hands back: some of its keys
+    (`TOP_LEVEL`) belong at the top of the settings dict, and the rest belong inside
+    `settings[entry]`. This function is the one place that knows how to sort them, so
+    it is also the one and only correct way to turn a `search()` result into something
+    `bubble_bi.settings.check()` will accept. Do not re-split `chosen` by hand elsewhere
+    -- see `search()`'s docstring for the bug that causes.
+    """
+    out = {**settings, **{k: v for k, v in chosen.items() if k in TOP_LEVEL}}
     out[entry] = {**settings[entry],
-                  **{k: v for k, v in chosen.items() if k not in _TOP_LEVEL}}
+                  **{k: v for k, v in chosen.items() if k not in TOP_LEVEL}}
     return out
 
 
@@ -344,7 +356,7 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
     from bubble_bi.models import VQVAE
     from bubble_bi.training import train
 
-    live = _settle(settings, entry, chosen)
+    live = settle(settings, entry, chosen)
     block = live[entry]
     loaders = tuning_loaders(batches, entry, block["days"], block["batch"])
 
@@ -370,7 +382,7 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
 
 
 def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
-    """Find good settings for one entry. Returns (best_block, trials_table).
+    """Find good settings for one entry. Returns (best, trials_table).
 
     Two stages: the BALANCE first (learning rate, commitment, diversity, with the sizes
     held at their defaults), then the SIZES with the winning balance held fixed.
@@ -380,6 +392,24 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     is the price of a twelve-trial budget. Two things keep it honest: the winner is
     confirmed head-to-head at FULL budget (see `confirm`), and raising `search["trials"]`
     narrows the gap with no change to this code.
+
+    ⚠️ `best` IS FLAT, AND THAT IS ON PURPOSE -- READ THIS BEFORE YOU USE IT.
+    `best` mixes two different kinds of key, because that is exactly what `SPACE` tunes:
+    most keys (`vocabulary`, `days`, `commitment`, `diversity`, ...) belong INSIDE this
+    entry's own block (`settings["ts"]` or `settings["cs"]`), but `learning_rate` and
+    `model_size` are TOP-LEVEL settings (see `TOP_LEVEL`) -- they live once at the top of
+    the settings dict, shared by both entries, not inside either block.
+
+    So you CANNOT do `settings["ts"] = best`. `settings.check()` will reject the result
+    with "Unknown setting(s)" the moment `learning_rate` or `model_size` shows up inside
+    `settings["ts"]`, where neither belongs. And do not "fix" that by deleting the two
+    keys before you assign the rest into the block -- that throws away the very values
+    the search just spent a budget finding, and you would ship with whatever
+    `learning_rate`/`model_size` the settings dict already had, silently.
+
+    The one correct move is `tuning.settle(settings, entry, best)`: it returns a
+    complete settings dict with `best` folded into the right places -- ready to hand
+    straight to `settings.check()`.
     """
     import optuna
     import pandas as pd
@@ -431,9 +461,9 @@ def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
             fixed.update(max(alive, key=lambda t: t.value).params)
 
     table = pd.DataFrame(rows).sort_values("score", ascending=False)
-    best = _settle(settings, entry, fixed)
-    return {**best[entry], "learning_rate": best["learning_rate"],
-            "model_size": best["model_size"]}, table
+    settled = settle(settings, entry, fixed)
+    return {**settled[entry], "learning_rate": settled["learning_rate"],
+            "model_size": settled["model_size"]}, table
 
 
 def _study_path(settings: dict, entry: str, stage: str) -> str:

@@ -207,8 +207,10 @@ def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_setting
     `best` is a FLAT dict: it mixes the entry's own knobs (commitment, diversity,
     vocabulary, days, ...) with the two top-level ones the search also tunes
     (learning_rate, model_size) -- because that is what `SPACE` actually searches.
-    Applying it back means sorting each key into where `check()` expects it, exactly
-    as a notebook cell would.
+    `tuning.settle()` is the one documented way to fold that flat dict back into a full
+    settings dict -- see `test_settle_splits_a_flat_search_result_back_apart` for the
+    round trip this relies on, and `search()`'s own docstring for why hand-splitting it
+    (as this test used to) is exactly the mistake that function exists to prevent.
     """
     from bubble_bi.settings import check
 
@@ -216,10 +218,34 @@ def test_a_search_returns_a_config_that_check_accepts(tiny_batches, tiny_setting
 
     assert len(trials) == 2
     assert {"score", "direction", "volatility", "words_used"} <= set(trials.columns)
-    top, block = {"learning_rate", "model_size"}, {k: v for k, v in best.items()
-                                                    if k not in ("learning_rate", "model_size")}
-    check({**tiny_settings, **{k: best[k] for k in top},
-          "ts": {**tiny_settings["ts"], **block}})
+    check(tuning.settle(tiny_settings, "ts", best))
+
+
+def test_settle_splits_a_flat_search_result_back_apart():
+    """`settle()` is the ONE place a caller should turn a `search()` result back into a
+    full settings dict -- this is the test that makes it safe to trust.
+
+    `search()` hands back a FLAT dict on purpose (see its docstring), which means a
+    caller who does not know about `settle()` is one keystroke from the Task 7 bug: filter
+    out `model_size` before assigning the rest into `settings["ts"]` and forget
+    `learning_rate` too, and a stray `learning_rate` is left sitting inside `settings["ts"]`
+    -- where `check()` does not expect it and raises "Unknown setting(s)". `settle()` makes
+    that mistake structurally impossible: nobody hand-picks which keys are top-level ever
+    again, because there is exactly one function that knows, and everybody calls it.
+    """
+    from bubble_bi.settings import DEFAULTS, check
+
+    # Shaped exactly like a `search()` return: the entry's own knobs plus the two
+    # top-level ones, all in one flat dict.
+    flat = {"commitment": 0.31, "diversity": 0.5, "vocabulary": 512, "days": 10,
+            "learning_rate": 5e-4, "model_size": 256}
+
+    settled = tuning.settle({**DEFAULTS, "tickers": ["AAA"]}, "ts", flat)
+
+    check(settled)                                        # (a) check() accepts it
+    assert settled["learning_rate"] == 5e-4                # (b) top-level keys land...
+    assert settled["model_size"] == 256                    #     ...at the TOP level
+    assert not (tuning.TOP_LEVEL & set(settled["ts"]))     # (c) never inside the block
 
 
 def test_a_killed_search_resumes_instead_of_starting_over(tiny_batches, tiny_settings):
