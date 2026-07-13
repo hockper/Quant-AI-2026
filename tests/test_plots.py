@@ -149,3 +149,44 @@ def test_tuning_importance_ranks_the_knob_that_actually_moved_the_score():
     })
     ranked = plots.tuning_importance(trials)
     assert ranked.index[0] == "learning_rate"
+
+
+def test_tuning_importance_only_ever_ranks_ACTUAL_KNOBS():
+    """⚠️ THE BUG THIS EXISTS FOR.
+
+    `tuning_importance` used a BLOCKLIST -- "any column not in this hardcoded set is a
+    knob". So the moment `direction_se` and `volatility_se` were added to the trials table
+    (they are OUTPUTS -- the error bars on the score), the chart cheerfully ranked them as
+    the second and third most important KNOBS in the search, above `diversity` and
+    `learning_rate`. It was correlating an output with the score and calling it a cause.
+
+    The knobs are exactly the keys of `tuning.SPACE`. That is the only source of truth,
+    and an allowlist cannot drift the way a blocklist did.
+    """
+    import matplotlib
+    import numpy as np
+    import pandas as pd
+
+    matplotlib.use("Agg")
+    from bubble_bi import plots, tuning
+
+    rng = np.random.default_rng(0)
+    lr = rng.random(20)
+    trials = pd.DataFrame({
+        "entry": "ts", "stage": "balance",
+        "learning_rate": lr,
+        "commitment": rng.random(20),
+        "score": 5 * lr + 0.01 * rng.random(20),
+        # the outputs that used to masquerade as knobs -- deliberately made to correlate
+        # PERFECTLY with the score, so a blocklist implementation must rank them first
+        "direction": 5 * lr,
+        "direction_se": 5 * lr,
+        "volatility_se": 5 * lr,
+        "words_used": (500 * lr).astype(int),
+    })
+    ranked = plots.tuning_importance(trials)
+
+    knobs = {k for stage in tuning.SPACE.values() for k in stage}
+    strays = set(ranked.index) - knobs
+    assert not strays, f"ranked things that are NOT knobs: {sorted(strays)}"
+    assert ranked.index[0] == "learning_rate"

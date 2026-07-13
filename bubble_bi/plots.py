@@ -356,13 +356,23 @@ def tuning_importance(trials):
     Rank correlation, not Optuna's fANOVA: at a dozen trials fANOVA fits a forest to
     almost no data and reports confident nonsense. A rank correlation over twelve points is
     crude, and it is honest about being crude.
+
+    ⚠️ The knobs are read from `tuning.SPACE` — an ALLOWLIST, and deliberately so. This
+    used to be a blocklist ("any column not in this hardcoded set is a knob"), and the
+    moment `direction_se`/`volatility_se` were added to the trials table the chart ranked
+    them as the second and third most important KNOBS in the whole search. They are not
+    knobs. They are the ERROR BARS ON THE SCORE — outputs, perfectly correlated with the
+    thing they measure — and the chart was reporting an output as a cause. A blocklist has
+    to be updated every time a column is added, and nothing makes anyone do it. An
+    allowlist cannot drift: `SPACE` is what the search actually turns.
     """
     import matplotlib.pyplot as plt
 
+    from bubble_bi.tuning import SPACE
+
     usable = trials[np.isfinite(trials["score"])]
-    knobs = [c for c in usable.columns
-             if c not in {"stage", "score", "direction", "volatility",
-                          "before_quant", "words_used", "why"}]
+    turned = {name for stage in SPACE.values() for name in stage}
+    knobs = [c for c in usable.columns if c in turned]
     strength = {}
     for knob in knobs:
         column = pd.to_numeric(usable[knob], errors="coerce")
