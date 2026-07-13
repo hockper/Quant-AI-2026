@@ -601,6 +601,66 @@ def test_save_round_trips_through_apply(tmp_path):
     bb_check(merged)                               # what comes back is a valid settings dict
 
 
+def test_run_one_seeds_training_so_the_same_config_scores_the_same_way_twice(
+        tiny_batches, tiny_settings):
+    """`_run_one` is called back to back -- twelve times over a search, twice more in
+    `confirm` -- on ONE advancing global torch RNG. Without a reseed, the SECOND call
+    with an identical config would start from wherever training the FIRST one left the
+    RNG, a different weight initialisation that has nothing to do with the config being
+    tested -- so 'the same config twice' would only agree by luck. Seeding from
+    `settings["seed"]` at the top of `_run_one` makes it a fact instead: same config,
+    same seed, same score.
+    """
+    config = {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16}
+    features, companies = len(tuning.names()), len(tiny_settings["tickers"])
+
+    first = tuning._run_one("ts", config, tiny_batches, tiny_settings,
+                            tuning.score_tokenizer, features, companies)
+    second = tuning._run_one("ts", config, tiny_batches, tiny_settings,
+                             tuning.score_tokenizer, features, companies)
+
+    assert first["score"] == second["score"], (
+        "the same config and the same seed produced two different scores -- training "
+        "is still drawing from wherever the global torch RNG happened to be left, not "
+        "from a fresh, reproducible seed"
+    )
+
+
+def test_confirm_seeds_the_winner_and_the_incumbent_to_identical_starting_weights(
+        tiny_batches, tiny_settings, monkeypatch):
+    """The transfer guard's own correctness. `confirm()` trains the winner, THEN the
+    incumbent, back to back -- so without a reseed in between, the incumbent would
+    start from whatever random state the winner's training left behind: a different
+    initialisation that has nothing to do with which config is actually better, on the
+    ONE comparison that is allowed to overrule the entire search. This intercepts
+    `training.train` before it ever takes a step, and demands the model hand to it is
+    bit-for-bit identical both times when the two configs are the same shape.
+    """
+    from bubble_bi import training as training_module
+
+    captured = []
+
+    def fake_train(model, loaders, settings, **kwargs):
+        captured.append({k: v.clone() for k, v in model.state_dict().items()})
+        return None
+
+    monkeypatch.setattr(training_module, "train", fake_train)
+
+    config = {**tiny_settings["ts"], "learning_rate": tiny_settings["learning_rate"],
+              "model_size": tiny_settings["model_size"]}
+
+    tuning.confirm("ts", config, tiny_batches, tiny_settings)
+
+    assert len(captured) == 2, "confirm() must train exactly two models: winner, incumbent"
+    winner_weights, incumbent_weights = captured
+    assert winner_weights.keys() == incumbent_weights.keys()
+    for key in winner_weights:
+        assert torch.equal(winner_weights[key], incumbent_weights[key]), (
+            f"{key!r} differed at INIT between the winner and the incumbent -- confirm() "
+            "is not reseeding between its two _run_one calls"
+        )
+
+
 def test_the_confirm_keeps_the_incumbent_when_the_winner_does_not_beat_it(
         tiny_batches, tiny_settings):
     """The transfer guard. A config that wins a 600-step sprint can lose the real run: CS

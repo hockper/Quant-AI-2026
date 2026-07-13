@@ -370,6 +370,17 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
     from bubble_bi.models import VQVAE
     from bubble_bi.training import train
 
+    # ⚠️ Reseed HERE, not once at the top of the notebook. `_run_one` is called back to
+    # back -- twelve times over a search, twice more in `confirm` -- on ONE advancing
+    # global torch RNG. Without this, the second of `confirm`'s two calls (the one
+    # comparison that is allowed to overrule the whole search) starts from whatever
+    # random state training the FIRST one left behind: a different weight
+    # initialisation that has nothing to do with which config is actually better. Every
+    # call now starts from the exact same place, so a trial's score is a property of
+    # its SETTINGS, not of when it happened to run -- and the same config scores the
+    # same way twice, which is what makes a trial reproducible at all.
+    torch.manual_seed(settings["seed"])
+
     live = settle(settings, entry, chosen)
     block = live[entry]
     loaders = tuning_loaders(batches, entry, block["days"], block["batch"])
