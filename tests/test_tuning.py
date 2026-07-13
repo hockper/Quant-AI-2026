@@ -522,7 +522,9 @@ def test_settle_splits_a_flat_search_result_back_apart():
     flat = {"commitment": 0.31, "diversity": 0.5, "vocabulary": 512, "days": 10,
             "learning_rate": 5e-4, "model_size": 256}
 
-    settled = tuning.settle({**DEFAULTS, "tickers": ["AAA"]}, "ts", flat)
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settled = tuning.settle({**DEFAULTS, "tickers": ["AAA", "BBB"]}, "ts", flat)
 
     check(settled)                                        # (a) check() accepts it
     assert settled["learning_rate"] == 5e-4                # (b) top-level keys land...
@@ -550,13 +552,15 @@ def test_apply_leaves_no_top_level_key_stranded_in_an_entry_block(tmp_path):
     path = tmp_path / "tuned.json"
     path.write_text(json.dumps({
         "found_on": "2026-07-12", "trials": 12,
-        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "fingerprint": {"tickers": 2, "features": 26, "start": None, "search_steps": 600},
         "score": {},
         "ts": {"vocabulary": 1024, "learning_rate": 4.2e-4, "model_size": 256},
         "cs": {},
     }))
 
-    merged, _ = tuning.apply({"tickers": ["AAA"]}, path=path)
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    merged, _ = tuning.apply({"tickers": ["AAA", "BBB"]}, path=path)
 
     assert not (tuning.TOP_LEVEL & set(merged["ts"])), (
         "a top-level setting was left inside the entry block — check() will reject it"
@@ -1185,11 +1189,15 @@ def test_a_model_built_before_apply_does_not_get_the_tuned_settings(tmp_path):
     path = tmp_path / "tuned.json"
     path.write_text(json.dumps({
         "found_on": "2026-07-12", "trials": 12,
-        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "fingerprint": {"tickers": 2, "features": 26, "start": None, "search_steps": 600},
         "score": {}, "ts": {"vocabulary": 1024}, "cs": {},
     }))
 
-    typed = {"tickers": ["AAA"]}
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it. (The VQVAE below
+    # is still built with companies=1 -- it's testing which vocabulary a model picks
+    # up, not the fusion.)
+    typed = {"tickers": ["AAA", "BBB"]}
     features = len(tuning.names())
 
     # What the notebook has BEFORE the tuning section runs -- and the model it builds
@@ -1409,8 +1417,10 @@ def test_a_confirm_shorter_than_the_sprint_is_rejected():
 
     from bubble_bi.settings import check
 
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
     with pytest.raises(ValueError, match="(?i)shorter than the sprint"):
-        check({"tickers": ["AAPL"],
+        check({"tickers": ["AAPL", "MSFT"],
                "steps": 300,                                     # the real run
                "search": {"run": True, "trials": 12, "steps": 600}})   # the sprint. LONGER.
 
@@ -1420,7 +1430,9 @@ def test_a_short_run_is_still_fine_when_the_search_is_OFF():
     search is on, because only then does anything claim to validate against it."""
     from bubble_bi.settings import check
 
-    check({"tickers": ["AAPL"], "steps": 300,
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    check({"tickers": ["AAPL", "MSFT"], "steps": 300,
            "search": {"run": False, "trials": 12, "steps": 600}})     # must not raise
 
 

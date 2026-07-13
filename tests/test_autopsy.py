@@ -123,7 +123,10 @@ def test_the_table_names_all_four_things_we_want_to_know():
 # ------------------------------------------------------------------ keeping
 
 def test_a_saved_model_comes_back(tmp_path):
-    settings = bb.check({"tickers": ["AAA"], "data_dir": str(tmp_path)})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it. (The model
+    # below is still built with companies=1 -- it's testing save/load, not fusion.)
+    settings = bb.check({"tickers": ["AAA", "BBB"], "data_dir": str(tmp_path)})
     model = bb.models.VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32)
 
     assert bb.keep.load(model, "ts", settings) is None      # nothing saved yet
@@ -138,7 +141,9 @@ def test_a_saved_model_comes_back(tmp_path):
 def test_loading_weights_that_do_not_fit_is_refused_not_fudged(tmp_path):
     """Silently loading a mismatched model would give you something subtly, invisibly
     wrong -- far worse than an error."""
-    settings = bb.check({"tickers": ["AAA"], "data_dir": str(tmp_path)})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "data_dir": str(tmp_path)})
     bb.keep.save(bb.models.VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32),
                  "ts", settings)
 
@@ -148,7 +153,9 @@ def test_loading_weights_that_do_not_fit_is_refused_not_fudged(tmp_path):
 
 
 def test_forgetting_a_model_makes_it_train_again(tmp_path):
-    settings = bb.check({"tickers": ["AAA"], "data_dir": str(tmp_path)})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "data_dir": str(tmp_path)})
     model = bb.models.VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32)
     bb.keep.save(model, "ts", settings)
     bb.keep.forget("ts", settings)

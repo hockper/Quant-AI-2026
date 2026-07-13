@@ -40,7 +40,11 @@ def _loaders(**kw):
 
 
 def _settings():
-    return bb.check({"tickers": ["AAA"], "learning_rate": 3e-3})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it. This helper
+    # only feeds `train()` a learning rate/step budget -- the models built in these
+    # tests set their own `companies=` directly, so this does not change any shape.
+    return bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3})
 
 
 def _where():
@@ -307,7 +311,9 @@ def test_it_gives_up_when_the_held_out_error_stops_improving():
 
 def test_each_entry_can_have_its_own_step_budget():
     # CS needs far fewer steps than TS, because it has far less data.
-    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
                          "steps": 500, "cs": {"steps": 40}})
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
@@ -357,7 +363,9 @@ def test_it_gives_up_when_the_held_out_error_stops_improving():
 
 def test_each_entry_can_have_its_own_step_budget():
     # CS needs far fewer steps than TS, because it has far less data to learn from.
-    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
                          "steps": 500, "cs": {"steps": 40}})
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)

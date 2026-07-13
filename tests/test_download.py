@@ -43,8 +43,12 @@ def test_one_row_per_company_per_day(fake_market):
 
 
 def test_target_is_tomorrows_return_not_todays(fake_market):
-    s = bb.check({"tickers": ["AAA"], "data_dir": fake_market})
-    table = bb.data.download(s).droplevel("ticker")
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it. We still isolate
+    # a single company's series below with `.xs`, so the target math stays exact --
+    # dropping the ticker level with two companies would interleave two calendars.
+    s = bb.check({"tickers": ["AAA", "BBB"], "data_dir": fake_market})
+    table = bb.data.download(s).xs("AAA", level="ticker")
     close = table["close"]
     expected = close.shift(-1) / close - 1.0          # tomorrow / today - 1
     assert np.allclose(table["target"].dropna(), expected.dropna())
@@ -55,9 +59,11 @@ def test_target_is_tomorrows_return_not_todays(fake_market):
 def test_narrowing_the_start_date_actually_narrows_the_data(fake_market):
     # The cache can hold MORE history than you asked for. Asking for less must give
     # you less -- otherwise a user who narrows the window silently gets the old one.
-    wide = bb.data.download(bb.check({"tickers": ["AAA"], "data_dir": fake_market}))
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    wide = bb.data.download(bb.check({"tickers": ["AAA", "BBB"], "data_dir": fake_market}))
     narrow = bb.data.download(
-        bb.check({"tickers": ["AAA"], "start": "2011-01-01", "data_dir": fake_market})
+        bb.check({"tickers": ["AAA", "BBB"], "start": "2011-01-01", "data_dir": fake_market})
     )
     assert wide.index.get_level_values("date").min() < pd.Timestamp("2011-01-01")
     assert narrow.index.get_level_values("date").min() >= pd.Timestamp("2011-01-01")
@@ -65,7 +71,9 @@ def test_narrowing_the_start_date_actually_narrows_the_data(fake_market):
 
 
 def test_rerunning_is_cached_and_gives_the_same_table(fake_market):
-    s = bb.check({"tickers": ["AAA"], "data_dir": fake_market})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    s = bb.check({"tickers": ["AAA", "BBB"], "data_dir": fake_market})
     first = bb.data.download(s)
     second = bb.data.download(s)          # now served from the parquet cache
     pd.testing.assert_frame_equal(first, second)
