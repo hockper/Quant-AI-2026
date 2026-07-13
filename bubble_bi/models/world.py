@@ -102,14 +102,26 @@ class Tokenizer(nn.Module):
         self.fusion = Fusion(self.width, depth=depth, heads=heads, dropout=dropout)
 
     def forward(self, ts_grid: torch.Tensor, cs_grid: torch.Tensor,
-                cs_present: torch.Tensor | None = None) -> dict:
+                cs_present: torch.Tensor | None = None, per_company: int = 1) -> dict:
         # --- CS: an ordinary VQ-VAE pass. Its codebook is anchored by rebuilding its grid.
         # read_grid gives BOTH the summary (for the codebook) and the cells (for the
-        # fusion), so the biggest encoder in the model runs exactly once.
+        # fusion), so the biggest encoder in the model runs exactly once -- on `cs_grid`'s
+        # own B*T rows, never once per company. Everything the CS codebook produces here
+        # (cs_token, cs_vector, cs_perplexity and its half of the three losses) stays at
+        # that same B*T -- it must NEVER be duplicated per company below, or the CS losses
+        # would be counted `per_company` times over.
         cs_summary, cs_cells = self.cs.read_grid(cs_grid, cs_present)
         cs_chosen = self.cs.codebook(cs_summary)
         cs_recon = _rebuild_loss(self.cs, cs_chosen["snapped"], cs_grid, cs_present)
         market = self.cs.keys_from_cells(cs_cells, cs_present, self.attend_to)
+        # ⚠️ The market spoke ONCE for the day, and every company reading that day reads the
+        # SAME menu. This is a reshape, not a second encoder pass -- which is the whole reason
+        # the two-token design is affordable (the CS grid is identical for every company on a
+        # day, so encoding it per company-day would run the biggest encoder in the model ~30x
+        # more often than necessary). `per_company=1` is the plain single-company case; a
+        # caller reading many companies against one day's market (`WorldModel`) passes the
+        # real count so each of THEIR queries below finds the market repeated to meet it.
+        market = market.repeat_interleave(per_company, dim=0)
 
         # --- TS: encode, THEN read the market, THEN quantise.
         ts_summary, _ = self.ts.read_grid(ts_grid)
@@ -233,43 +245,46 @@ class WorldModel(nn.Module):
         b, t, n = batch["ts_grid"].shape[:3]
         tokenizer = self.tokenizer
 
-        # ---- CS: encode the market ONCE per (batch, day) -- never once per company.
+        # `ts_grid`'s company axis (N) and `cs_present`'s company axis (C) describe two
+        # DIFFERENT universes -- "companies with a stock" and "companies in the market" --
+        # that only happen to be named the same size in this design. Reshaping `cs_present`
+        # using N (as if the two were interchangeable) is silent until they disagree, and
+        # then it fails as a bare tensor-shape error deep inside a reshape. Check it here,
+        # by name, against the universe the CS model was actually built for.
+        cs_present = batch.get("cs_present")
+        if cs_present is not None:
+            if cs_present.shape[-1] != tokenizer.cs.companies:
+                raise ValueError(
+                    f"`cs_present` lists {cs_present.shape[-1]} companies but the CS model "
+                    f"was built for {tokenizer.cs.companies}. The market grid and the "
+                    "market model must describe the same universe."
+                )
+            cs_present = cs_present.reshape(b * t, -1)
+
+        # ---- Flatten to the shapes `Tokenizer.forward` expects: CS once per (batch, day),
+        # TS once per (batch, day, company). `Tokenizer` does the encode -> fuse -> quantise
+        # chain for both -- this is the ONLY place that chain is implemented, so a test that
+        # exercises `Tokenizer` directly (Task 3) is also exercising the real model, not a
+        # parallel copy of it.
         cs_grid = batch["cs_grid"].reshape(b * t, *batch["cs_grid"].shape[2:])
-        cs_present = (batch["cs_present"].reshape(b * t, n)
-                      if batch.get("cs_present") is not None else None)
-
-        cs_summary, cs_cells = tokenizer.cs.read_grid(cs_grid, cs_present)
-        cs_chosen = tokenizer.cs.codebook(cs_summary)
-        cs_recon = _rebuild_loss(tokenizer.cs, cs_chosen["snapped"], cs_grid, cs_present)
-        # The menu the market offers, ONE PER DAY: [B*T, keys, width].
-        market = tokenizer.cs.keys_from_cells(cs_cells, cs_present, tokenizer.attend_to)
-
-        # ---- TS: one grid per company per day -- B*T*N of them.
         ts_grid = batch["ts_grid"].reshape(b * t * n, *batch["ts_grid"].shape[3:])
-        ts_summary, _ = tokenizer.ts.read_grid(ts_grid)
 
-        # Every company reading a given day's market reads the SAME menu. Repeating an
-        # already-computed tensor costs nothing -- no encoder runs a second time -- and
-        # this is the ONLY place N re-enters the computation. Losing this line does not
-        # break correctness, only the saving: the CS encoder would silently go back to
-        # running B*T*N times instead of B*T, and nothing would say so.
-        market = market.repeat_interleave(n, dim=0)                    # [B*T*N, keys, W]
+        out = tokenizer(ts_grid, cs_grid, cs_present, per_company=n)
 
-        fused, attention = tokenizer.fusion(ts_summary, market)
-        ts_chosen = tokenizer.ts.codebook(fused)
-        ts_recon = _rebuild_loss(tokenizer.ts, ts_chosen["snapped"], ts_grid, None)
-
-        recon_loss = ts_recon + cs_recon
-        commitment_loss = ts_chosen["commitment_loss"] + cs_chosen["commitment_loss"]
-        diversity_loss = ts_chosen["diversity_loss"] + cs_chosen["diversity_loss"]
+        recon_loss = out["recon_loss"]
+        commitment_loss = out["commitment_loss"]
+        diversity_loss = out["diversity_loss"]
+        attention = out["attention"]
 
         # ---- Build the sentence. The GPT reads one sequence per (batch, company): T
         # days, two words each. Every company of a given day gets the SAME cs_token --
         # broadcast here, not learned separately, because the market only spoke once.
-        ts_ids = ts_chosen["ids"].view(b, t, n)
-        cs_ids = cs_chosen["ids"].view(b, t, 1).expand(b, t, n)
-        ts_vectors = ts_chosen["snapped"].view(b, t, n, -1)
-        cs_vectors = cs_chosen["snapped"].view(b, t, 1, -1).expand(b, t, n, -1)
+        # `out["cs_token"]`/`out["cs_vector"]` are still [B*T] -- ONE per day -- and this
+        # is the only place N re-enters: broadcasting, never re-encoding.
+        ts_ids = out["ts_token"].view(b, t, n)
+        cs_ids = out["cs_token"].view(b, t, 1).expand(b, t, n)
+        ts_vectors = out["ts_vector"].view(b, t, n, -1)
+        cs_vectors = out["cs_vector"].view(b, t, 1, -1).expand(b, t, n, -1)
 
         # Sum the two words into one vector per day, so the GPT's sequence length stays
         # T rather than 2T. Then move the company axis next to batch, so each company
@@ -337,10 +352,10 @@ class WorldModel(nn.Module):
             "shrugging": shrugging,
             "accuracy": accuracy,
             "persistence": persistence,
-            "ts_perplexity": ts_chosen["perplexity"],
-            "cs_perplexity": cs_chosen["perplexity"],
-            "ts_summary": fused,             # pre-quantisation, for reviving dead words
-            "cs_summary": cs_summary,         # pre-quantisation, for reviving dead words
+            "ts_perplexity": out["ts_perplexity"],
+            "cs_perplexity": out["cs_perplexity"],
+            "ts_summary": out["ts_summary"],  # pre-quantisation, for reviving dead words
+            "cs_summary": out["cs_summary"],  # pre-quantisation, for reviving dead words
             "attention": attention.view(b, t, n, -1),
         }
 

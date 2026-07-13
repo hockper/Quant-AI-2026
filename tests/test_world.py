@@ -350,6 +350,43 @@ def test_the_market_is_encoded_once_per_day_not_once_per_company_day():
     )
 
 
+def test_a_mismatched_market_universe_is_rejected_with_a_useful_message():
+    """`ts_grid`'s company axis (N -- companies WITH A STOCK) and `cs_present`'s company
+    axis (C -- companies IN THE MARKET) are two different universes that only happen to
+    be the same size in this design. Reshaping `cs_present` as if N and C were always
+    interchangeable used to fail as a bare `RuntimeError` deep inside `.reshape()` the
+    moment they disagreed -- a shape error, not a sentence a non-programmer could act
+    on. It must be caught at the door, by name, instead."""
+    world, batch = _tiny_world(companies=4)
+    b, t, _ = batch["ts_grid"].shape[:3]
+    batch["cs_present"] = torch.ones(b, t, 3, dtype=torch.bool)   # wrong universe: 3, not 4
+    with pytest.raises(ValueError, match="CS model was built for 4"):
+        world(batch)
+
+
+def test_world_model_delegates_to_tokenizer_forward_not_a_parallel_copy():
+    """`Tokenizer.forward` is the ONLY place the encode -> fuse -> quantise chain is
+    implemented. If `WorldModel.forward` ever goes back to reimplementing that chain
+    inline (calling `tokenizer.cs`/`tokenizer.ts`/`tokenizer.fusion` directly instead of
+    `tokenizer(...)`), every tokenizer test in this file -- the no-fused-codebook test,
+    the anchor tests, `test_the_ts_token_actually_READS_the_market` -- would keep passing
+    while guarding a copy of the model that nothing in production actually runs."""
+    world, batch = _tiny_world()
+    calls = []
+    real_forward = world.tokenizer.forward
+
+    def spy(*args, **kwargs):
+        calls.append(True)
+        return real_forward(*args, **kwargs)
+
+    world.tokenizer.forward = spy
+    world(batch)
+    assert calls, (
+        "WorldModel.forward never called Tokenizer.forward -- it may be reimplementing "
+        "the encode -> fuse -> quantise chain inline again"
+    )
+
+
 def test_the_loss_weights_are_obeyed():
     """`predict`/`naming`/`recon` must actually reach the total, not just be accepted."""
     world, batch = _tiny_world(predict=2.0, naming=0.3, recon=0.5)

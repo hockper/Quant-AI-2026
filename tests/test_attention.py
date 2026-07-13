@@ -114,6 +114,23 @@ def test_every_company_is_measured_not_just_the_first_few():
     What replaces it: `gather()` must actually READ that axis correctly, rather than
     silently mislabelling it. This builds a tiny multi-company sentence loader (raw
     grids, the new batch shape) and checks every company comes back finite.
+
+    ⚠️ Two things this test used to miss entirely, both now closed:
+
+    1. `isfinite` alone can basically never fail any more -- the NaN-for-unmeasured-
+       company path this test was ORIGINALLY written to catch is gone. It stayed green
+       out of habit, not because it was still checking anything.
+    2. The old fixture used `attend_to="companies"`, where `keys == companies` by
+       construction -- so the attention map came back perfectly SQUARE. A `gather()`
+       that silently swapped the company and key axes (mislabelling "who reads whom",
+       the one thing this diagnostic exists to produce) would have passed unchanged:
+       same shape, still finite.
+
+    So this uses `attend_to="cells"` (`keys = companies * cs_days`, deliberately NOT
+    equal to `companies`) and checks that every company's row of the map sums to 1
+    across the KEY axis -- true of a real softmax output, and false of one whose axes
+    have been swapped. With `companies != keys`, a literal axis transpose is not even
+    shape-compatible any more: it fails loudly instead of quietly mislabelling.
     """
     import torch
     from torch.utils.data import DataLoader, Dataset
@@ -145,13 +162,21 @@ def test_every_company_is_measured_not_just_the_first_few():
     cs = bb.models.VQVAE(companies=companies, days=cs_days, features=features,
                          vocabulary=16, width=width, heads=2)
     tokenizer = bb.models.Tokenizer(ts, cs, model_size=width, heads=2,
-                                    attend_to="companies")
+                                    attend_to="cells")
     world = bb.models.WorldModel(tokenizer, sentence=sentence, depth=1, heads=2)
 
     book = {"loaders": {"test": DataLoader(_Sentences(), batch_size=3, shuffle=False)}}
     settings = bb.check({"tickers": [f"T{i}" for i in range(companies)]})
 
     read = gather(world, book, None, settings)
-    assert read["attention"].shape == (companies, companies)     # attend_to="companies"
+    keys = companies * cs_days                       # attend_to="cells", deliberately != companies
+    assert read["attention"].shape == (companies, keys)
     # THE assertion: every company must have been measured, not just the first few.
     assert np.isfinite(read["attention"]).all(), "a company was never reached"
+    # Each row is an average of softmax shares, which sum to 1 across the keys THAT
+    # company read. A company/key axis swap would still be finite, but would no longer
+    # sum to 1 here (a random map is essentially never doubly-stochastic).
+    assert np.allclose(read["attention"].sum(axis=1), 1.0, atol=1e-4), (
+        "a company's row does not sum to 1 across the keys it read -- the company and "
+        "key axes may have been swapped"
+    )

@@ -32,7 +32,7 @@ import torch
 
 
 @torch.no_grad()
-def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
+def gather(world, book, batches: int | None, settings: dict, period: str = "test") -> dict:
     """Average attention, per company, over days the model never trained on.
 
     ⚠️ Under joint training a batch is one time WINDOW across ALL companies at once
@@ -43,10 +43,12 @@ def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
     go wrong is `gather` reading that axis incorrectly, which is what the shape
     check below exists to catch loudly instead of silently.
 
-    `batches` is unused -- kept in the signature for interface stability with
-    earlier callers.
+    Under the old cached-latent design this ran only the fusion, over latents already
+    sitting in memory. Now it runs the WHOLE model -- both encoders included -- over
+    every batch it reads, which is materially more expensive. `batches` is the knob for
+    that cost: how many batches of the loader to read before stopping. `None` reads the
+    whole period.
     """
-    del batches
     from bubble_bi.training import _to, pick_device
 
     where = pick_device(settings)
@@ -54,8 +56,11 @@ def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
 
     companies = len(settings["tickers"])
     total = None
+    seen = 0
 
-    for batch in book["loaders"][period]:
+    for i, batch in enumerate(book["loaders"][period]):
+        if batches is not None and i >= batches:
+            break
         out = world(_to(batch, where))
         attention = out["attention"]                       # [B, T, N, keys]
         b, t, n, keys = attention.shape
@@ -68,7 +73,6 @@ def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
 
         if total is None:
             total = np.zeros((companies, keys))
-            seen = 0
         total += attention.sum(dim=(0, 1)).cpu().numpy()    # sum over batch & days
         seen += b * t
 
