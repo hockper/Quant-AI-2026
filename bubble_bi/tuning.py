@@ -697,18 +697,74 @@ def confirm(entry: str, winner: dict, batches, settings: dict, scorer=score_toke
             "settings": winner if kept == "winner" else incumbent}
 
 
+def confirm_collapsed(verdict: dict) -> bool:
+    """True when BOTH sides of a `confirm()` head-to-head collapsed the codebook.
+
+    `confirm()` trains the winner and the incumbent and keeps whichever scores higher --
+    but a collapsed trial scores `-math.inf` (see `score_tokenizer`: rejected, not ranked),
+    and `-inf > -inf` is `False`, so when EVERY configuration destroyed the codebook,
+    `kept` still comes back `"incumbent"`. That looks exactly like a real win, but it is
+    not one: there was nothing to compare, and the incumbent was kept BY DEFAULT, not
+    because the data said so. This is the one place that tells the two apart, so
+    `save()` (which must record the difference) and the notebook (which must SAY it,
+    loudly) both call this instead of re-deriving the check by hand.
+    """
+    return not math.isfinite(verdict["winner"]) and not math.isfinite(verdict["incumbent"])
+
+
+def _json_safe(value):
+    """Replace a non-finite float -- `-math.inf`, `math.inf`, `nan` -- with JSON `null`,
+    recursively through any dict or list.
+
+    Why this exists at all: a routine failure (every trial in a `confirm()` collapsing
+    the codebook -- see `confirm_collapsed`) leaves a real `-math.inf` sitting in the
+    numbers `save()` is asked to write. `json.dumps` will happily turn that into the bare
+    token `-Infinity`, which Python's own `json.loads` reads back without complaint --
+    but it is not valid JSON by the spec, and the strict parser this project added for
+    exactly this reason rejects it. 'Nothing survived' is a legitimate result to record,
+    not a bug to hide, so it is converted to `null` ON PURPOSE, here, before `save()`
+    ever calls `json.dumps` -- not left for `json.dumps` to paper over silently.
+    """
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def save(found: dict, settings: dict, path: Path = TUNED) -> Path:
     """Write the answer, and what it was found on. Committed to the repo, not Drive --
-    Drive is private to whoever ran it, and the next person must get this by cloning."""
+    Drive is private to whoever ran it, and the next person must get this by cloning.
+
+    ⚠️ A collapsed `confirm()` (see `confirm_collapsed`) hands this `winner`/`incumbent`
+    scores of `-math.inf` -- a real result ("every configuration destroyed the codebook"),
+    not an error, but not a number `json.dumps` can write either (see `_json_safe`). Each
+    entry's score block is stamped with `collapsed: true/false` BEFORE that conversion, so
+    the file itself says which happened: "found nothing, kept the incumbent by default" is
+    never left indistinguishable from "found a real winner, scoring 0.43".
+    """
     import datetime
     import json
 
-    path.write_text(json.dumps({
+    found = dict(found)
+    if "score" in found:
+        found["score"] = {entry: {**verdict, "collapsed": confirm_collapsed(verdict)}
+                          for entry, verdict in found["score"].items()}
+
+    payload = _json_safe({
         "found_on": datetime.date.today().isoformat(),
         "trials": settings["search"]["trials"],
         "fingerprint": fingerprint(settings),
         **found,
-    }, indent=2, sort_keys=True) + "\n")
+    })
+    # `allow_nan=False` is the backstop, not the fix: every non-finite number this
+    # project knows how to produce is already turned into `null` above. If some future
+    # code path hands `save()` a non-finite number `_json_safe` was never taught about,
+    # this makes THAT fail loudly, at the point of writing -- instead of silently
+    # producing another `tuned.json` no conformant parser can read.
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
     return path
 
 
