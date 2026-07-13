@@ -455,9 +455,30 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
         # nobody reads anything from it but `["score"]`. The full scorer's `before_quant`
         # is a genuinely expensive dense probe; `_quick_score` skips it here and asks
         # for it only once, for real, on the FINAL score below.
-        trial.report(_quick_score(model, loaders["tune"], live, scorer)["score"], step)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+        so_far = _quick_score(model, loaders["tune"], live, scorer)["score"]
+
+        # ⚠️ SAY NOTHING RATHER THAN SAY -inf. Two reasons, and both of them bit us on the
+        # first real GPU run.
+        #
+        # 1. It breaks the pruner FOR EVERY OTHER TRIAL. Optuna's MedianPruner prunes by
+        #    comparing a trial against the median of all trials' intermediate values, via
+        #    `np.nanpercentile` -- and a single -inf in there turns that median into -inf
+        #    or NaN ("RuntimeWarning: invalid value encountered in add"). Every comparison
+        #    against NaN is False, so nothing is ever pruned, and every hopeless trial runs
+        #    to full budget on a paid GPU. The pruner was silently dead.
+        #
+        # 2. A collapsed codebook mid-training is NOT A BAD SCORE -- it is NOT YET A SCORE.
+        #    Every run starts collapsed: perplexity begins at 1.0, one word for everything,
+        #    and dead-code revival pulls it back out over the next few hundred steps. So an
+        #    early -inf says nothing about how this configuration ends up. Reporting it as
+        #    if it were a measurement was simply wrong.
+        #
+        # A skipped report is a first-class thing in Optuna: the trial is judged on the
+        # checks where it actually had something to say.
+        if math.isfinite(so_far):
+            trial.report(so_far, step)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
 
     train(model, loaders, live, steps=live["search"]["steps"],
           quiet=True, on_check=watch)

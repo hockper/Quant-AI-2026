@@ -1231,3 +1231,49 @@ def test_corrupting_tomorrows_return_leaves_every_trial_score_bit_for_bit_identi
         blind_trials["score"].reset_index(drop=True),
         check_names=False,
     )
+
+
+# ─────────────────────────────────────────────── the pruner was silently dead
+#
+# Found on the first real GPU run. Optuna's MedianPruner prunes a trial by comparing it
+# against the MEDIAN of every trial's intermediate values, via `np.nanpercentile`. We were
+# reporting `-inf` at a check whose codebook had collapsed:
+#
+#     np.nanpercentile([-inf, nan, 0.9])  ->  RuntimeWarning: invalid value in add  ->  -inf
+#     np.nanpercentile([-inf, -inf, 0.9]) ->  RuntimeWarning                        ->  nan
+#
+# The median it prunes against became -inf or NaN, every comparison against it is False,
+# and NOTHING was ever pruned. Every hopeless trial ran to full budget, on a paid GPU.
+#
+# And the deeper mistake: an early collapse is NORMAL — this project's own notebook says
+# "perplexity STARTS at 1.0", and dead-code revival pulls it back out. A collapsed codebook
+# at step 60 is not a bad score, it is NOT YET A SCORE. Reporting it as a number was the bug.
+
+def test_a_collapsed_check_reports_nothing_rather_than_minus_infinity(monkeypatch,
+                                                                      tiny_batches,
+                                                                      tiny_settings):
+    """-inf poisons the pruner's median for EVERY OTHER TRIAL. Say nothing instead."""
+    import math
+
+    reported = []
+
+    class Spy:
+        def report(self, value, step):
+            reported.append(value)
+
+        def should_prune(self):
+            return False
+
+    # A scorer that always says "collapsed" — exactly what an early check sees.
+    collapsed = {"score": -math.inf, "direction": float("nan"),
+                 "volatility": float("nan"), "before_quant": float("nan"),
+                 "words_used": 1, "why": "codebook collapsed: 1 of 16 words"}
+
+    tuning._run_one("ts", {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16},
+                    tiny_batches, tiny_settings, lambda *a, **k: dict(collapsed),
+                    features=26, companies=3, trial=Spy())
+
+    assert reported == [] or all(math.isfinite(v) for v in reported), (
+        f"reported non-finite values to the pruner: {reported}. np.nanpercentile turns "
+        "those into NaN and the pruner stops working for every trial in the study."
+    )
