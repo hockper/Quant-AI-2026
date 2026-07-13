@@ -32,14 +32,20 @@ def setup(settings: dict) -> None:
     has_torch = kit["torch"] is not None
     tests_pass, tests_summary = run_tests()
 
-    # Say WHICH device, and name it. "GPU" alone hides the thing that actually goes
-    # wrong: a CPU-only build of PyTorch on a machine that has a GPU.
+    # Say WHICH device, and name it. "GPU" alone hides the two different things that go
+    # wrong — no GPU on the machine at all, versus a GPU that PyTorch cannot talk to.
     if kit["gpu"]:
         found = f"{kit['gpu']} — torch {kit['torch']}"
+    elif not kit["gpu present"]:
+        found = f"CPU — torch {kit['torch']}  ⚠️ NO GPU ON THIS MACHINE"
     else:
-        found = f"CPU — torch {kit['torch']}"
-        if kit["built for cuda"] is None and kit["torch"]:
-            found += "  ⚠️ CPU-ONLY BUILD"
+        found = f"CPU — torch {kit['torch']}  ⚠️ GPU PRESENT BUT UNREACHABLE"
+
+    # ⚠️ This used to be hardcoded `True`, so falling back to a CPU earned a green tick and
+    # the notebook went cheerfully on to train — for hours — on a CPU. We train on Colab
+    # now, so a silent CPU fallback is a FAILURE. It is tolerated (a CPU run is a fine way
+    # to read the notebook) but it is never again reported as a pass.
+    on_real_hardware = kit["where"] in ("gpu", "tpu")
 
     ts, cs = settings["ts"], settings["cs"]
     report(
@@ -48,7 +54,7 @@ def setup(settings: dict) -> None:
             ("Settings understood", True, f"{n} companies, no typos"),
             ("Data folder writable", writable, f"{data_dir}/"),
             ("PyTorch available", has_torch, "required to train"),
-            ("Hardware", True, found),
+            ("Hardware", on_real_hardware, found),
             ("Project's own tests", tests_pass, tests_summary),
         ],
         have=f"""
@@ -57,6 +63,11 @@ def setup(settings: dict) -> None:
         whole market, then merge them into 1 token out of {settings['fusion']['vocabulary']}.
         No prices downloaded, no model trained.
         """,
+        known_problem=(
+            None if on_real_hardware else
+            "There is no GPU. The notebook still runs — but on a CPU it is a toy, and "
+            "nothing it trains should be believed. See the note below."
+        ),
     )
     if kit["why"]:
         print(f"\n  ⚠️  {kit['why']}")

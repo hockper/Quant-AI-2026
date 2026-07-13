@@ -97,19 +97,27 @@ def test_the_hardware_report_spots_a_cpu_only_torch_build(monkeypatch):
 
     Colab ships a CUDA build of PyTorch, but a careless pip install can replace it with a
     CPU-only wheel. Then `cuda.is_available()` is False on a machine with a perfectly
-    good GPU sitting idle, and "Hardware: CPU" tells you nothing about WHY. The tell is
-    `torch.version.cuda` being None.
+    good GPU sitting idle, and "Hardware: CPU" tells you nothing about WHY.
+
+    ⚠️ `torch.version.cuda is None` is NOT the tell, and believing it was cost us an
+    afternoon. A Colab CPU runtime ALSO ships a CPU-only wheel — identical symptom, and
+    nothing is wrong with it. The tell is a CPU-only wheel on a machine that HAS a GPU,
+    which is why this test now pins `gpu_present`. Without that pin it was asserting we
+    blame a pip install having never checked whether a GPU exists at all.
     """
     import torch
 
+    from bubble_bi import settings as settings_module
     from bubble_bi.settings import hardware
 
+    monkeypatch.setattr(settings_module, "gpu_present", lambda: True)   # a GPU IS here
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.version, "cuda", None)
 
     kit = hardware()
     assert kit["where"] == "cpu"
     assert kit["built for cuda"] is None
+    assert kit["gpu present"] is True
     assert "CPU-only wheel" in kit["why"]
     assert "not let anything install `torch`" in kit["why"]
 
@@ -119,11 +127,17 @@ def test_the_hardware_report_distinguishes_no_gpu_from_no_cuda_torch(monkeypatch
     # different fix — turn the runtime on, rather than reinstall everything.
     import torch
 
+    from bubble_bi import settings as settings_module
     from bubble_bi.settings import hardware
 
+    monkeypatch.setattr(settings_module, "gpu_present", lambda: False)  # no GPU here
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.version, "cuda", "12.1")
 
     kit = hardware()
     assert "Change runtime type" in kit["why"]
+    # Must not mention the wheel at all. This torch is perfectly CUDA-capable — saying
+    # "CPU-only" here would be false, and it would send the reader off to reinstall
+    # PyTorch when all they need is to tick a different runtime.
     assert "CPU-only" not in kit["why"]
+    assert "install `torch`" not in kit["why"]

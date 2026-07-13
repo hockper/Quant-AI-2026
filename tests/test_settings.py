@@ -208,3 +208,78 @@ def test_no_fusion_setting_is_decorative():
         f"DEFAULTS['fusion'] contains settings Tokenizer never reads: {sorted(unread)}. "
         "Either wire them up or delete them -- a setting that does nothing is a lie."
     )
+
+
+# ─────────────────────────────────────────────────────────── telling the truth about the GPU
+#
+# The bug these exist for. A Colab CPU runtime ships a CPU-ONLY torch. So does a machine
+# whose CUDA torch a stray `pip install` overwrote. To `torch.version.cuda` the two look
+# IDENTICAL -- it is None either way -- and we used to blame the pip install every time,
+# sending people off to delete a runtime that was never broken.
+#
+# One is a wrong menu choice. The other is a wrecked environment. Only the MACHINE can
+# tell them apart, so we have to ask it.
+
+def test_hardware_asks_the_machine_whether_a_gpu_exists_at_all():
+    """Independent of torch. This is the question torch.version.cuda cannot answer."""
+    facts = bb.settings.hardware()
+    assert "gpu present" in facts
+    assert isinstance(facts["gpu present"], bool)
+
+
+def test_a_cpu_runtime_is_not_blamed_on_a_pip_install(monkeypatch):
+    """No GPU on the machine + a CPU-only torch = you picked a CPU runtime. Nothing broke.
+
+    Telling this user to 'delete the runtime because a pip install replaced your CUDA
+    build' is worse than saying nothing: it is confident, it is wrong, and it sends them
+    to fix a machine that is working exactly as configured.
+    """
+    import torch
+
+    monkeypatch.setattr(bb.settings, "gpu_present", lambda: False)
+    monkeypatch.setattr(torch.version, "cuda", None)          # a CPU-only wheel
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    why = bb.settings.hardware()["why"]
+    assert why
+    assert "pip" not in why.lower(), f"blamed pip when there is no GPU at all:\n{why}"
+    assert "runtime type" in why.lower(), f"must say how to GET a GPU:\n{why}"
+
+
+def test_a_cpu_only_wheel_on_a_machine_that_HAS_a_gpu_does_blame_the_install(monkeypatch):
+    """The other half. A GPU is sitting right there and torch cannot see it -> something
+    really did replace the CUDA build, and now the pip advice is the correct advice."""
+    import torch
+
+    monkeypatch.setattr(bb.settings, "gpu_present", lambda: True)
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    why = bb.settings.hardware()["why"]
+    assert why
+    assert "pip" in why.lower(), f"a GPU is present and torch cannot use it — say why:\n{why}"
+
+
+def test_the_hardware_check_can_actually_fail(monkeypatch):
+    """It was hardcoded True. So falling back to CPU was blessed with a green tick and the
+    notebook went on to train -- for hours -- on a CPU. We only train on Colab now, so a
+    silent CPU fallback is a FAILURE, not a pass."""
+    from bubble_bi import verify
+
+    monkeypatch.setattr(verify, "hardware", lambda: {
+        "where": "cpu", "torch": "2.11.0+cpu", "built for cuda": None,
+        "cuda available": False, "gpu": None, "gpu present": False,
+        "why": "no GPU on this runtime",
+    })
+    monkeypatch.setattr(verify, "run_tests", lambda: (True, "ok"))
+
+    seen = {}
+    monkeypatch.setattr(verify, "report",
+                        lambda title, checks, have, known_problem=None: seen.update(
+                            checks={label: ok for label, ok, _ in checks},
+                            known_problem=known_problem))
+
+    verify.setup(bb.check({"tickers": ["AAPL"]}))
+
+    assert seen["checks"]["Hardware"] is False, "the Hardware check can never fail"
+    assert seen["known_problem"], "a CPU run must be TOLERATED, not raise -- but not hidden"

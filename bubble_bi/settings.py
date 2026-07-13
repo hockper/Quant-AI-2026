@@ -10,6 +10,10 @@ notebook is exactly what runs.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+from pathlib import Path
+
 # Every setting the project understands, with its default.
 # Nested blocks mirror the two entries the tokenizer reads a day through.
 DEFAULTS: dict = {
@@ -258,17 +262,34 @@ def device() -> str:
     return "gpu" if torch.cuda.is_available() else "cpu"
 
 
-def hardware() -> dict:
-    """Everything about the hardware, so nobody has to guess why it is slow.
+def gpu_present() -> bool:
+    """Does this MACHINE have an NVIDIA GPU — whatever PyTorch believes?
 
-    ⚠️ The trap this exists to catch: **a CPU-only build of PyTorch.** Colab ships a CUDA
-    build, but a careless `pip install` can quietly replace it with a CPU one — and then
-    `torch.cuda.is_available()` is False on a machine with a perfectly good GPU sitting
-    idle. The tell is `torch.version.cuda` being None: the library was never built to talk
-    to a GPU at all, so no amount of Runtime → GPU will help.
+    ⚠️ The question we spent an afternoon not asking. A Colab **CPU runtime** ships a
+    CPU-only torch. So does a machine whose CUDA torch a stray `pip install` overwrote.
+    To `torch.version.cuda` the two look IDENTICAL — it is `None` either way — so we
+    blamed the pip install every time and sent people off to delete a runtime that was
+    never broken.
+
+    One is a wrong menu choice. The other is a wrecked environment. They have completely
+    different fixes, and **only the machine can tell them apart.** So we ask it, not torch:
+    the driver either exists or it does not.
+    """
+    if Path("/proc/driver/nvidia/gpus").is_dir():
+        return any(Path("/proc/driver/nvidia/gpus").iterdir())
+    if shutil.which("nvidia-smi"):
+        found = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
+        return found.returncode == 0 and "GPU" in found.stdout
+    return False                    # no driver and no tool: there is no NVIDIA GPU here
+
+
+def hardware() -> dict:
+    """Everything about the hardware, so nobody has to guess why it is slow — or why it
+    cannot see the GPU. See `gpu_present()` for the distinction that matters most.
     """
     facts = {"where": "cpu", "torch": None, "built for cuda": None,
-             "cuda available": False, "gpu": None, "why": None}
+             "cuda available": False, "gpu": None, "gpu present": gpu_present(),
+             "why": None}
     try:
         import torch
     except ImportError:
@@ -285,17 +306,37 @@ def hardware() -> dict:
             facts["gpu"] = torch.cuda.get_device_name(0)
         except Exception:
             pass
-    elif facts["built for cuda"] is None:
+    elif not facts["gpu present"]:
+        # THE COMMON CASE, and the one we used to misdiagnose. There is no GPU on this
+        # machine at all. Nothing is broken; you are simply on a CPU runtime.
+        #
+        # Say ONLY what is true here. Whether the wheel happens to be a CPU one is beside
+        # the point and is not always so — a perfectly good CUDA build finds no GPU on a
+        # CPU runtime either. Naming the wheel would send the reader off to reinstall
+        # PyTorch, which is the exact wrong turn this branch exists to stop them taking.
         facts["why"] = (
-            "This PyTorch was built WITHOUT CUDA — a CPU-only wheel. It cannot use a GPU "
-            "whatever runtime you pick. Something (usually a pip install) replaced Colab's "
-            "CUDA build. Fix: Runtime → Disconnect and delete runtime, start again, and do "
-            "not let anything install `torch`."
+            "There is NO GPU on this machine — nothing is broken, you are simply on a CPU "
+            "runtime.\n"
+            "     Fix: Runtime → Change runtime type → T4 GPU, then Runtime → Restart "
+            "session.\n"
+            "     The restart matters: a kernel that is already running keeps the PyTorch "
+            "it started with."
         )
-    elif facts["where"] == "cpu":
+    elif facts["built for cuda"] is None:
+        # A GPU is sitting RIGHT THERE and torch cannot talk to it. NOW the pip advice is
+        # the correct advice.
         facts["why"] = (
-            "PyTorch has CUDA support but finds no GPU. Turn one on: Runtime → Change "
-            "runtime type → T4 GPU, then Runtime → Restart session."
+            "This machine HAS a GPU, but this PyTorch was built without CUDA — a CPU-only "
+            "wheel. It cannot use that GPU whatever runtime you pick. Something (usually a "
+            "pip install) replaced the CUDA build.\n"
+            "     Fix: Runtime → Disconnect and delete runtime, start again, and do not "
+            "let anything install `torch`."
+        )
+    else:
+        facts["why"] = (
+            "This machine has a GPU and this PyTorch was built for CUDA, yet it still "
+            "cannot reach it — usually a driver that no longer matches. "
+            "Fix: Runtime → Disconnect and delete runtime, then start again."
         )
     return facts
 
