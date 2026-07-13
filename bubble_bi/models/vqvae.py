@@ -203,7 +203,14 @@ class VQVAE(nn.Module):
         nothing. That is why there is no "one summary" option here.
 
         Cost is linear in the number of keys (our query is a single vector), so even
-        "cells" is cheap. Start with "days"; widen it when tuning.
+        "cells" is cheap.
+
+        ⚠️ Do NOT start with "days". It averages the cells over COMPANIES, so it hands back
+        one key per market DAY — and at `cs["days"] = 1` (which is what the tuning actually
+        chose) that is a SINGLE key. Softmax over one key is identically 1.0: every company
+        then receives the same market vector, and no gradient can ever change it. The
+        attention is not weak; it does not exist. That is why our attention map was flat for
+        weeks while we blamed the training. Use "companies".
 
         Companies that did not trade are left out of the averages, not counted as zeros.
 
