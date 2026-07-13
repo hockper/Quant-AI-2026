@@ -271,7 +271,7 @@ def test_the_hardware_check_can_actually_fail(monkeypatch):
         "cuda available": False, "gpu": None, "gpu present": False,
         "why": "no GPU on this runtime",
     })
-    monkeypatch.setattr(verify, "run_tests", lambda: (True, "ok"))
+    # (no `run_tests` to stub any more — setup() no longer drags the whole suite along.)
 
     seen = {}
     monkeypatch.setattr(verify, "report",

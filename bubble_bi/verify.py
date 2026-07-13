@@ -9,12 +9,25 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from bubble_bi.report import report, run_tests
+from bubble_bi.report import report
 from bubble_bi.settings import device, hardware
 
 
 def setup(settings: dict) -> None:
-    """Section 1-2: the settings are sound and the code runs here."""
+    """Section 1-2: does this ENVIRONMENT work? Settings parse, folder writes, GPU is there.
+
+    ⚠️ It deliberately does NOT run the test suite, and that is a change worth explaining.
+
+    It used to. All 255 tests, every time you touched the setup cell — **112 seconds, and
+    roughly a hundred of them spent TRAINING MODELS** in tests that have nothing whatever
+    to say about whether your install works. On Colab that is two minutes off a paid GPU
+    session, per run, before a single price has been downloaded. Nobody re-asked whether
+    this still made sense as the suite grew from 22 tests to 255.
+
+    "Does this environment work" and "does the science hold" are different questions. Only
+    the first one belongs in a cell you re-run constantly. The second is still one command
+    away — `bb.run_tests()` — and it is printed below so nobody has to go looking for it.
+    """
     n = len(settings["tickers"])
     kit = hardware()
     where = kit["where"]
@@ -30,7 +43,6 @@ def setup(settings: dict) -> None:
         writable = False
 
     has_torch = kit["torch"] is not None
-    tests_pass, tests_summary = run_tests()
 
     # Say WHICH device, and name it. "GPU" alone hides the two different things that go
     # wrong — no GPU on the machine at all, versus a GPU that PyTorch cannot talk to.
@@ -55,13 +67,15 @@ def setup(settings: dict) -> None:
             ("Data folder writable", writable, f"{data_dir}/"),
             ("PyTorch available", has_torch, "required to train"),
             ("Hardware", on_real_hardware, found),
-            ("Project's own tests", tests_pass, tests_summary),
         ],
         have=f"""
         A checked configuration — and nothing else yet.
         The tokenizer will read {ts['days']} days of each stock and {cs['days']} days of the
         whole market, then merge them into 1 token out of {settings['fusion']['vocabulary']}.
         No prices downloaded, no model trained.
+
+        This checked your ENVIRONMENT, not the code. To check the code itself — all of it,
+        including the no-lookahead proofs — run:   bb.run_tests()      (~2 minutes)
         """,
         known_problem=(
             None if on_real_hardware else

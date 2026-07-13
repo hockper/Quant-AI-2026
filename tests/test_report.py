@@ -1,5 +1,6 @@
 import pytest
 
+import bubble_bi as bb
 from bubble_bi.report import CheckFailed, report, run_tests
 
 
@@ -141,3 +142,47 @@ def test_the_hardware_report_distinguishes_no_gpu_from_no_cuda_torch(monkeypatch
     # PyTorch when all they need is to tick a different runtime.
     assert "CPU-only" not in kit["why"]
     assert "install `torch`" not in kit["why"]
+
+
+def test_the_setup_check_does_not_run_the_test_suite(monkeypatch):
+    """It used to run all 255 tests — 112 seconds, ~100 of them TRAINING MODELS — every
+    single time you touched the setup cell, before a single price had been downloaded. On
+    Colab that is two minutes of a paid GPU session, per run.
+
+    The setup check answers "does this environment work". The test suite answers "does the
+    science hold". Those are different questions, and only one of them belongs in a cell
+    you re-run constantly. The suite is still one command away: `bb.run_tests()`.
+    """
+    import importlib
+
+    from bubble_bi import verify
+
+    # NOT `from bubble_bi import report` — the package re-exports the FUNCTION `report`
+    # over its own submodule of the same name, so that would hand us the wrong object.
+    report_module = importlib.import_module("bubble_bi.report")
+
+    def never(*a, **k):
+        raise AssertionError(
+            "setup() ran the whole test suite again — that is 2 minutes per run, and ~90% "
+            "of it is training models that have nothing to do with whether your install works."
+        )
+
+    # Patched at the SOURCE, so it fires however setup() might reach it.
+    monkeypatch.setattr(report_module, "run_tests", never)
+    monkeypatch.setattr(verify, "hardware", lambda: {
+        "where": "gpu", "torch": "2.11.0+cu128", "built for cuda": "12.8",
+        "cuda available": True, "gpu": "Tesla T4", "gpu present": True, "why": None,
+    })
+
+    verify.setup(bb.check({"tickers": ["AAPL"], "data_dir": "artifacts"}))   # must not raise
+
+
+def test_the_setup_check_still_says_HOW_to_check_the_code(capsys):
+    """Dropping the suite from setup buys speed at a cost: someone cloning this repo can
+    now finish the setup cell without ever learning whether the code itself is healthy.
+    So the check has to TELL them, or we have simply hidden the question."""
+    from bubble_bi import verify
+
+    verify.setup(bb.check({"tickers": ["AAPL"], "data_dir": "artifacts"}))
+    said = capsys.readouterr().out
+    assert "run_tests" in said, "never told the reader how to check the code"
