@@ -1044,13 +1044,21 @@ def test_confirm_trains_at_the_full_budget_not_the_search_sprint(tiny_settings, 
     tuning.confirm("ts", {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16},
                    batches=None, settings=tiny_settings)
 
-    # Both the winner and the incumbent must be trained at the FULL budget -- never the
-    # search's short one.
-    assert seen_budgets == [tiny_settings["steps"]] * 2, (
-        f"confirm() handed _run_one a step budget of {seen_budgets}, not the full "
-        f"budget {tiny_settings['steps']!r} twice over -- the transfer guard is not "
-        "actually training at full budget, which is the entire point of confirm()."
+    # ⚠️ THIS ASSERTION USED TO BE WRONG, and it was wrong in the way that matters: it
+    # demanded the SHARED `settings["steps"]`, which is precisely the bug two real GPU runs
+    # exposed. "Full budget" means THE BUDGET THIS ENTRY WILL ACTUALLY BE TRAINED AT --
+    # `settings[entry]["steps"] or settings["steps"]`, the same rule `train()` has always
+    # used -- because CS carries its own (it has ~30x less data and needs the passes). A
+    # confirm run at the shared budget validates a run that never happens.
+    real = tiny_settings["ts"]["steps"] or tiny_settings["steps"]
+    assert seen_budgets == [real] * 2, (
+        f"confirm() handed _run_one a step budget of {seen_budgets}, not {real} twice over "
+        "-- the budget TS is actually trained at. It would be validating a config on a run "
+        "nobody ever makes."
     )
+    # And it must never be the search's short sprint. A guard that re-runs the sprint at
+    # sprint length is not a guard.
+    assert all(b > tiny_settings["search"]["steps"] for b in seen_budgets)
 
 
 def test_the_pruning_check_does_not_pay_for_the_dense_before_quant_probe(
@@ -1327,3 +1335,70 @@ def test_a_one_hot_token_is_still_answered_because_it_is_not_degenerate():
     y = rng.normal(size=(600, 2))
     answer, _noise = tuning.skill_from_ids(ids, words=1024, y=y)
     assert math.isfinite(answer)
+
+
+# ────────────────────────────────── the transfer guard was running BACKWARDS
+#
+# Found by comparing two real GPU runs (steps=300, then steps=600). `confirm()` exists to
+# ask: "this config won a SHORT 600-step sprint -- does it still win the REAL, LONGER run?"
+#
+# It was handing `_run_one` the shared `settings["steps"]`. Two things wrong with that:
+#
+#   1. It IGNORES the entry's own budget. CS is really trained for `cs["steps"]` = 2000
+#      steps -- it has 30x less data than TS and needs them -- while `train()` has always
+#      honoured that. So `confirm()` was validating CS at a SEVENTH of the budget CS is
+#      actually trained at, which is exactly the failure it was built to catch.
+#
+#   2. Nothing stopped it being SMALLER than the sprint. The notebook ships `steps = 300`
+#      against `search["steps"] = 600`, so the "full budget" confirm trained for HALF as
+#      long as the trials it was meant to validate. A guard that re-runs the sprint SHORTER
+#      is not a guard.
+
+def test_confirm_trains_each_entry_at_the_budget_it_will_REALLY_be_trained_at(monkeypatch,
+                                                                              tiny_batches,
+                                                                              tiny_settings):
+    """CS has its own step budget because it has 30x less data. `train()` honours it.
+    `confirm()` must honour the SAME rule, or it is not testing the run that will happen."""
+    seen = []
+
+    def spy(entry, chosen, batches, settings, scorer, features, companies, trial=None):
+        seen.append(settings["search"]["steps"])
+        return {"score": 0.5, "direction": 0.1, "volatility": 0.4, "words_used": 9,
+                "before_quant": 0.0, "why": ""}
+
+    monkeypatch.setattr(tuning, "_run_one", spy)
+
+    settings = {**tiny_settings,
+                "steps": 40,                                   # the shared budget
+                "cs": {**tiny_settings["cs"], "steps": 900},   # ...but CS has its OWN
+                "search": {**tiny_settings["search"], "steps": 10}}
+
+    tuning.confirm("cs", {**settings["cs"], "learning_rate": 1e-3, "model_size": 16},
+                   tiny_batches, settings)
+
+    assert seen == [900, 900], (
+        f"confirm() trained CS at {seen}, not at cs['steps'] = 900 — the budget CS is "
+        "ACTUALLY trained at. It was validating a config on a run that never happens."
+    )
+
+
+def test_a_confirm_shorter_than_the_sprint_is_rejected():
+    """A guard that re-runs the sprint SHORTER than the sprint is not a guard, and shipping
+    one that silently reverses its own meaning is worse than shipping none."""
+    import pytest
+
+    from bubble_bi.settings import check
+
+    with pytest.raises(ValueError, match="(?i)shorter than the sprint"):
+        check({"tickers": ["AAPL"],
+               "steps": 300,                                     # the real run
+               "search": {"run": True, "trials": 12, "steps": 600}})   # the sprint. LONGER.
+
+
+def test_a_short_run_is_still_fine_when_the_search_is_OFF():
+    """steps=300 is a perfectly good laptop read-through. It only becomes a lie when the
+    search is on, because only then does anything claim to validate against it."""
+    from bubble_bi.settings import check
+
+    check({"tickers": ["AAPL"], "steps": 300,
+           "search": {"run": False, "trials": 12, "steps": 600}})     # must not raise

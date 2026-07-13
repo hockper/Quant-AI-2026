@@ -738,9 +738,28 @@ def confirm(entry: str, winner: dict, batches, settings: dict, scorer=score_toke
     while its codebook decayed from 187 words to 141. A short search would have crowned it.
 
     If the winner does not beat the incumbent here, we KEEP THE INCUMBENT.
+
+    ⚠️ "FULL budget" means THIS ENTRY'S budget, not the shared one — and getting that wrong
+    turned the guard around backwards for two whole GPU runs.
+
+    CS is really trained for `cs["steps"]` (2,000) because it has ~30x less data than TS and
+    needs the passes; `train()` has always honoured that. `confirm()` did not — it took the
+    shared `settings["steps"]` for both entries. With the notebook's `steps = 300` that
+    meant CS was "validated at full budget" on a **seventh** of the budget CS is actually
+    trained at, and — since the search's own sprint is 600 steps — on a run only **half as
+    long as the sprint it was supposed to validate**.
+
+    A guard that re-runs the sprint SHORTER than the sprint is not a guard. It is the exact
+    failure it was built to catch, committed by the catcher. (`check()` now refuses to let
+    the two cross: see `settings.py`.)
+
+    It also explains a mystery: the same incumbent config scored 0.296 at steps=300 and
+    1.406 at steps=600. That is not an unstable model. That is CS being starved.
     """
     features, companies = len(names()), len(settings["tickers"])
-    full = {**settings, "search": {**settings["search"], "steps": settings["steps"]}}
+    # The SAME rule `train()` uses. Any other rule tests a run that never happens.
+    real_budget = settings.get(entry, {}).get("steps") or settings["steps"]
+    full = {**settings, "search": {**settings["search"], "steps": real_budget}}
 
     incumbent = {**settings[entry], "learning_rate": settings["learning_rate"],
                  "model_size": settings["model_size"]}

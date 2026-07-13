@@ -228,6 +228,32 @@ def check(settings: dict) -> dict:
             f"`search['run']` must be True or False, got {out['search']['run']!r}."
         )
 
+    # ⚠️ The transfer guard must not run BACKWARDS.
+    #
+    # The search trains each trial for a SHORT sprint (`search['steps']`), then `confirm()`
+    # re-trains the winner and the incumbent at the REAL budget to check the sprint winner
+    # still wins when it actually matters. That only means anything if the real budget is
+    # the LONGER of the two.
+    #
+    # The notebook shipped `steps = 300` against `search['steps'] = 600`, so for two whole
+    # GPU runs the "full budget" confirm trained for HALF as long as the sprint it was
+    # meant to validate. A guard that re-runs the sprint shorter than the sprint is not a
+    # guard — it is the very failure it exists to catch.
+    if out["search"]["run"]:
+        for entry in ("ts", "cs"):
+            real = out[entry]["steps"] or out["steps"]
+            if real < out["search"]["steps"]:
+                raise ValueError(
+                    f"The search would train each {entry.upper()} trial for "
+                    f"{out['search']['steps']:,} steps, then 'confirm at full budget' on "
+                    f"only {real:,} — SHORTER than the sprint it is meant to validate. The "
+                    "transfer guard would run backwards and mean nothing.\n"
+                    f"     Raise `steps` (or `{entry}['steps']`) above "
+                    f"`search['steps']`, or lower `search['steps']`.\n"
+                    "     A short run is fine when you are only reading the notebook — this "
+                    "only bites with `search['run'] = True`."
+                )
+
     if out["weight_decay"] < 0:
         raise ValueError(f"`weight_decay` must be 0 or more, got {out['weight_decay']!r}.")
 
