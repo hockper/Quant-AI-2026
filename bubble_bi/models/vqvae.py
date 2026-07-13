@@ -142,12 +142,49 @@ class VQVAE(nn.Module):
         read = self.encoder(cells, src_key_padding_mask=ignore)
         return read[:, 0], read[:, 1:].reshape(b, c, d, -1)
 
+    def keys_from_cells(self, cells: torch.Tensor, present: torch.Tensor | None = None,
+                        how: str = "companies") -> torch.Tensor:
+        """The menu the market offers the cross-attention — from cells ALREADY encoded.
+
+        `context()` below re-encodes the grid to get these cells. Under joint training the
+        caller already needs `read_grid()`'s summary (for the codebook) AND its cells (for
+        the fusion), so going through `context()` would run the biggest encoder in the model
+        a second time, every step, for a tensor it is already holding.
+        """
+        if how not in ("days", "companies", "cells"):
+            raise ValueError(
+                f"`attend_to` must be 'days', 'companies' or 'cells' — got {how!r}."
+            )
+        b, c, d, w = cells.shape
+
+        if how == "cells":
+            keys = cells.reshape(b, c * d, w)
+        elif how == "companies":                 # average over DAYS -> one per company
+            keys = cells.mean(dim=2)
+        elif present is None:                    # "days": average over COMPANIES
+            keys = cells.mean(dim=1)
+        else:
+            weight = present.to(cells.dtype).unsqueeze(-1).unsqueeze(-1)
+            keys = (cells * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+
+        # ⚠️ A single key is a NO-OP: softmax over one key is identically 1.0, so every
+        # company would receive the same market vector and the attention could never learn
+        # anything. `settings.check()` refuses this combination, but a caller reaching this
+        # function directly must not be able to build an inert model in silence.
+        if keys.shape[1] < 2:
+            raise ValueError(
+                f"`{how}` over a {c}-company, {d}-day market gives the attention exactly "
+                "one key. Softmax over one key is 1.0 — the cross-attention would be a "
+                "NO-OP. Use 'companies'."
+            )
+        return keys
+
     def summarise(self, grid: torch.Tensor, present: torch.Tensor | None = None) -> torch.Tensor:
         """Boil a grid [B, companies, days, features] down to one vector [B, width]."""
         return self.read_grid(grid, present)[0]
 
     def context(self, grid: torch.Tensor, present: torch.Tensor | None = None,
-                how: str = "days") -> torch.Tensor:
+                how: str = "companies") -> torch.Tensor:
         """What CS hands the fusion to attend over: [B, keys, width].
 
         The number of keys is a free choice — cross-attention's output length is set by
@@ -169,24 +206,11 @@ class VQVAE(nn.Module):
         "cells" is cheap. Start with "days"; widen it when tuning.
 
         Companies that did not trade are left out of the averages, not counted as zeros.
+
+        See `keys_from_cells` if you have the cells already.
         """
-        if how not in ("days", "companies", "cells"):
-            raise ValueError(
-                f"`attend_to` must be 'days', 'companies' or 'cells' — got {how!r}."
-            )
-
-        _, cells = self.read_grid(grid, present)                 # [B, C, D, W]
-        b, c, d, w = cells.shape
-
-        if how == "cells":
-            return cells.reshape(b, c * d, w)
-        if how == "companies":                  # average over DAYS -> one per company
-            return cells.mean(dim=2)
-
-        if present is None:                     # "days": average over COMPANIES
-            return cells.mean(dim=1)
-        weight = present.to(cells.dtype).unsqueeze(-1).unsqueeze(-1)     # [B, C, 1, 1]
-        return (cells * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+        _, cells = self.read_grid(grid, present)
+        return self.keys_from_cells(cells, present, how)
 
     def rebuild(self, word: torch.Tensor) -> torch.Tensor:
         """Reconstruct the whole grid from a single vector [B, width]."""

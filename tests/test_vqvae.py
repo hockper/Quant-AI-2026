@@ -211,3 +211,34 @@ def test_the_total_loss_carries_all_three_pressures():
     assert {"rebuild_loss", "commitment_loss", "diversity_loss"} <= set(out)
     total = out["rebuild_loss"] + out["commitment_loss"] + out["diversity_loss"]
     assert torch.allclose(out["loss"], total)
+
+
+def test_the_market_can_be_encoded_once_and_used_twice():
+    """The fusion needs the CS CELLS and the CS codebook needs the CS SUMMARY. `context()`
+    re-encodes to get the cells, so asking for both ran the biggest encoder in the model
+    TWICE every step. `read_grid()` already returns both — use them."""
+    cs = VQVAE(companies=4, days=1, features=6, width=16, heads=2).eval()
+    grid = torch.randn(3, 4, 1, 6)
+
+    with torch.no_grad():
+        summary, cells = cs.read_grid(grid)
+        from_cells = cs.keys_from_cells(cells, None, "companies")
+        from_grid = cs.context(grid, None, "companies")
+
+    assert summary.shape == (3, 16)
+    assert torch.allclose(from_cells, from_grid, atol=1e-6), (
+        "keys_from_cells must build exactly the menu context() builds — it is an "
+        "optimisation of that function, not a different one"
+    )
+
+
+def test_keys_from_cells_never_returns_a_single_key():
+    """One key is a no-op (softmax over it is 1.0). The model must not be able to build
+    one by accident, so this raises rather than silently doing nothing."""
+    cs = VQVAE(companies=30, days=1, features=6, width=16, heads=2).eval()
+    _, cells = cs.read_grid(torch.randn(2, 30, 1, 6))
+
+    with pytest.raises(ValueError, match="one key"):
+        cs.keys_from_cells(cells, None, "days")        # 1 day -> 1 key -> inert
+
+    assert cs.keys_from_cells(cells, None, "companies").shape[1] == 30
