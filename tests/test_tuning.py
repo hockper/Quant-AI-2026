@@ -193,9 +193,10 @@ def tiny_settings(tmp_path):
     }
 
 
-@pytest.fixture
-def tiny_batches(tiny_settings):
-    """A synthetic panel: 3 companies, 600 days, real features.
+def _synthetic_panel(settings):
+    """A synthetic panel: N companies, 600 days, real features -- the data both
+    `tiny_batches` and `healthy_batches` are built from, factored out so the two
+    fixtures cannot silently drift apart on anything but the SETTINGS they are handed.
 
     ⚠️ Sized 600, not the smaller 400 the brief sketched: the slowest feature
     (`amihud`'s year-long normalising window, NORM_WINDOW=252 in microstructure.py)
@@ -212,7 +213,7 @@ def tiny_batches(tiny_settings):
     rng = np.random.default_rng(0)
     days = pd.date_range("2020-01-01", periods=n, freq="B")
     frames = []
-    for ticker in tiny_settings["tickers"]:
+    for ticker in settings["tickers"]:
         close = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, n)))
         one = pd.DataFrame({
             "date": days,
@@ -228,8 +229,76 @@ def tiny_batches(tiny_settings):
         one["target"] = one["close"].shift(-1) / one["close"] - 1.0
         frames.append(one)
     raw = pd.concat(frames, ignore_index=True).set_index(["date", "ticker"]).sort_index()
-    table = add_features(raw, tiny_settings)
-    return make_tensors(table, tiny_settings)
+    table = add_features(raw, settings)
+    return make_tensors(table, settings)
+
+
+@pytest.fixture
+def tiny_batches(tiny_settings):
+    return _synthetic_panel(tiny_settings)
+
+
+@pytest.fixture
+def healthy_settings(tmp_path):
+    """A tiny config that actually SURVIVES -- unlike `tiny_settings` just above, which
+    the whole file inherited without ever checking whether a real (non-stubbed)
+    `search()`/`_run_one()` call could produce anything BUT a collapsed codebook.
+
+    Verified: `tiny_settings` collapses to a single word across 20+ torch seeds, no
+    matter what runs it -- it is a property of its `commitment`/`diversity`/`steps`,
+    not bad luck. That means every non-stubbed `search()`/`_run_one()` test in this
+    file, before this fixture existed, only ever exercised the "every trial collapsed"
+    branch -- `search()`'s actual job, scoring several real survivors and ranking them,
+    was never once demonstrated.
+
+    Tuned by MEASURING -- the discipline this whole module preaches, not by guessing:
+
+      commitment = 0.1     the SPACE's own floor (see `SPACE["balance"]`) -- the
+                            standard 0.25 is already too strong for a codebook this
+                            small and short-lived; too high pins the encoder to a
+                            word it already has before the dictionary has spread out.
+      diversity  = 1.0     the SPACE's own ceiling -- the anti-collapse term; too low
+                            stops fighting the handful of words that win early.
+      vocabulary = 8       small enough that `ALIVE * words` (the bar for "alive") is
+                            trivial to clear even for a short run, keeping this FAST.
+      search.steps = 160   long enough that even a slow draw from SPACE's
+                            learning_rate range (log-uniform 3e-5 .. 3e-3) has time to
+                            convince a few words to stay alive -- measured: shorter
+                            budgets (80, 120) still collapse at the slow end of that
+                            range; 160 is where it stopped.
+
+    `steps` (the FULL, top-level budget `confirm()` uses) is deliberately more than
+    `search.steps` -- the same trap `tiny_settings` guards against, see its own
+    docstring -- so a `confirm()` that used the wrong budget by accident would not be
+    numerically indistinguishable from a correct one.
+    """
+    return {
+        **DEFAULTS,
+        "tickers": ["AAA", "BBB", "CCC"],
+        "data_dir": str(tmp_path),
+        "model_size": 16,
+        "learning_rate": 1e-3,
+        "steps": 320,
+        "ts": {**DEFAULTS["ts"], "days": 3, "batch": 8, "vocabulary": 8,
+               "commitment": 0.1, "diversity": 1.0,
+               "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
+        "cs": {**DEFAULTS["cs"], "days": 3, "batch": 4, "vocabulary": 8,
+               "commitment": 0.1, "diversity": 1.0,
+               "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
+        "search": {"run": True, "trials": 4, "steps": 160},
+    }
+
+
+@pytest.fixture
+def healthy_batches(healthy_settings):
+    """Same kind of synthetic panel as `tiny_batches` -- see `_synthetic_panel` -- built
+    from `healthy_settings` instead. Kept as a SEPARATE fixture rather than parametrising
+    `tiny_batches`, because the two exist to prove opposite things: one that the
+    rejection path is handled correctly, one that the survive-and-rank path works at
+    all. Collapsing them into one parametrised fixture would blur that distinction for
+    no real saving.
+    """
+    return _synthetic_panel(healthy_settings)
 
 
 def test_the_search_space_fixes_the_knobs_we_already_know():
@@ -748,8 +817,107 @@ def test_tuned_json_is_strict_json_even_when_confirm_kept_the_incumbent(tmp_path
     assert parsed["score"]["ts"]["incumbent"] == 0.42
 
 
+def test_save_makes_a_double_collapse_representable_and_strict_json_safe(tmp_path):
+    """IMPORTANT A's exact repro. `confirm()` trains the winner AND the incumbent, and if
+    EVERY configuration destroyed the codebook on both sides, both come back
+    `score = -math.inf` (a collapsed trial is REJECTED, not ranked -- see
+    `score_tokenizer`'s own docstring). The old `save()` handed that straight to
+    `json.dumps`, which writes the bare, non-standard `-Infinity` token: valid to Python's
+    own reader (which is exactly why a naive round-trip test would never catch this), but
+    not to the strict parser `test_tuned_json_is_strict_json_even_when_confirm_kept_the_incumbent`
+    exists to defend against. Same defect the project thought it had closed, reached by a
+    different, entirely plausible route: a routine failure (codebook collapse, which this
+    project hits often) leaves an artifact no conformant parser can read.
+
+    "Nothing survived" is a real, legitimate result to record, not a bug -- so `save()`
+    must turn the non-finite score into JSON `null` deliberately, AND the file must still
+    say so plainly: a reader must be able to tell "this entry's search found nothing, the
+    incumbent was kept by default" apart from "this entry found a real winner". This
+    checks both halves at once, and checks CS (a genuine, non-collapsed result) right next
+    to it, so the fix cannot be "null out everything" -- only the collapsed entry may lose
+    its numbers.
+    """
+    import json
+    import math
+
+    from bubble_bi.settings import DEFAULTS
+
+    settings = {**DEFAULTS, "tickers": ["AAA", "BBB"]}
+    found = {
+        "ts": {"vocabulary": 512, "commitment": 1.7, "learning_rate": 1e-4,
+               "model_size": 128},
+        "cs": {"vocabulary": 256, "commitment": 0.31, "learning_rate": 1e-4,
+               "model_size": 128},
+        # TS: both sides collapsed -- confirm()'s exact shape when nothing survived.
+        # CS: a genuine result, untouched, right alongside it.
+        "score": {"ts": {"kept": "incumbent", "winner": -math.inf, "incumbent": -math.inf},
+                  "cs": {"kept": "winner", "winner": 0.55, "incumbent": 0.20}},
+    }
+
+    path = tuning.save(found, settings, path=tmp_path / "tuned.json")
+    text = path.read_text()
+
+    def _no_constants(token):
+        raise ValueError(f"non-standard JSON constant found: {token!r}")
+
+    parsed = json.loads(text, parse_constant=_no_constants)   # raises if not strict JSON
+
+    # The non-finite numbers are gone -- turned into JSON null, not left as a bare
+    # -Infinity token no other conformant parser would accept.
+    assert parsed["score"]["ts"]["winner"] is None
+    assert parsed["score"]["ts"]["incumbent"] is None
+
+    # And the situation is LEGIBLE, not just silently nulled: a reader (human or program)
+    # can tell TS found nothing, distinctly from CS, which found a real winner.
+    assert parsed["score"]["ts"]["collapsed"] is True
+    assert parsed["score"]["cs"]["collapsed"] is False
+    assert parsed["score"]["cs"]["winner"] == 0.55           # CS's real score is untouched
+    assert parsed["score"]["cs"]["incumbent"] == 0.20
+
+
+def test_search_ranks_surviving_trials_and_returns_the_highest_scorer(
+        healthy_batches, healthy_settings):
+    """The happy path `search()` was entirely missing. Every OTHER test in this file that
+    calls a real (non-stubbed) `search()`/`_run_one()` uses `tiny_settings`, which
+    collapses on every single trial (see `healthy_settings`'s own docstring) -- so none
+    of them ever demonstrated `search()`'s actual job: score several trials for real, and
+    correctly pick the best one. This is that test.
+
+    `healthy_settings` is tuned to survive, so the balance stage genuinely produces more
+    than one trial with a FINITE score -- which is what makes "search() ranks its
+    survivors correctly" a checkable fact rather than an assumption: with only one
+    survivor there would be nothing to rank against.
+    """
+    best, trials = tuning.search("ts", healthy_batches, healthy_settings)
+
+    survivors = trials[np.isfinite(trials["score"])]
+    assert len(survivors) >= 2, (
+        f"expected at least two trials to survive with a finite score, got "
+        f"{len(survivors)} of {len(trials)}:\n{trials[['stage', 'score', 'words_used']]}\n"
+        "If this starts failing, `healthy_settings` needs RETUNING (see its own "
+        "docstring for how it was measured) -- not deleting."
+    )
+
+    balance = survivors[survivors["stage"] == "balance"]
+    assert len(balance) >= 2, (
+        "need at least two survivors in the SAME stage to actually prove ranking "
+        "picked the best one, rather than there only ever being one candidate"
+    )
+
+    # The winner `search()` settles on must be the highest-scoring survivor of the
+    # balance stage -- not whichever trial happened to run first or last.
+    top = balance.loc[balance["score"].idxmax()]
+    assert best["commitment"] == top["commitment"]
+    assert best["diversity"] == top["diversity"]
+    assert best["learning_rate"] == top["learning_rate"]
+
+    # And a codebook that actually survived, not a technicality: comfortably more than
+    # the bare minimum (`max(2, ALIVE * vocabulary)`) of live words.
+    assert (survivors["words_used"] > 2).all()
+
+
 def test_run_one_seeds_training_so_the_same_config_scores_the_same_way_twice(
-        tiny_batches, tiny_settings):
+        healthy_batches, healthy_settings):
     """`_run_one` is called back to back -- twelve times over a search, twice more in
     `confirm` -- on ONE advancing global torch RNG. Without a reseed, the SECOND call
     with an identical config would start from wherever training the FIRST one left the
@@ -757,15 +925,28 @@ def test_run_one_seeds_training_so_the_same_config_scores_the_same_way_twice(
     tested -- so 'the same config twice' would only agree by luck. Seeding from
     `settings["seed"]` at the top of `_run_one` makes it a fact instead: same config,
     same seed, same score.
-    """
-    config = {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16}
-    features, companies = len(tuning.names()), len(tiny_settings["tickers"])
 
-    first = tuning._run_one("ts", config, tiny_batches, tiny_settings,
+    ⚠️ This USED TO run on `tiny_settings`, which collapses every trial to `-inf` no
+    matter what -- so `first["score"] == second["score"]` passed even with the reseed
+    line in `_run_one` deleted outright (`-inf == -inf`), and the test provided zero
+    evidence for the property in its own name. `healthy_settings` gives both calls a
+    FINITE score, which a missing reseed genuinely moves -- verified by deleting the
+    `torch.manual_seed` line from `_run_one` and confirming this test fails (see the
+    branch's own report for the exact numbers and the failure message).
+    """
+    config = {**healthy_settings["ts"], "learning_rate": 1e-3, "model_size": 16}
+    features, companies = len(tuning.names()), len(healthy_settings["tickers"])
+
+    first = tuning._run_one("ts", config, healthy_batches, healthy_settings,
                             tuning.score_tokenizer, features, companies)
-    second = tuning._run_one("ts", config, tiny_batches, tiny_settings,
+    second = tuning._run_one("ts", config, healthy_batches, healthy_settings,
                              tuning.score_tokenizer, features, companies)
 
+    assert math.isfinite(first["score"]) and math.isfinite(second["score"]), (
+        "this fixture is supposed to survive -- got a collapsed (-inf) score, so this "
+        "run proves nothing about reseeding. Retune `healthy_settings`, don't weaken "
+        "this assertion."
+    )
     assert first["score"] == second["score"], (
         "the same config and the same seed produced two different scores -- training "
         "is still drawing from wherever the global torch RNG happened to be left, not "
