@@ -8,17 +8,20 @@ from bubble_bi.settings import DEFAULTS
 
 
 def test_minimal_settings_get_every_default_filled_in():
-    s = bb.check({"tickers": ["AAPL"]})
+    # Two tickers, not one: `fusion['attend_to']` now defaults to "companies", and a
+    # single company would offer the cross-attention exactly one key -- the no-op this
+    # whole spec exists to catch (see test_a_single_market_key_is_rejected... below).
+    s = bb.check({"tickers": ["AAPL", "MSFT"]})
     assert s["ts"]["days"] == 15
     assert s["cs"]["days"] == 5
-    assert s["fusion"]["vocabulary"] == 512
+    assert s["fusion"]["attend_to"] == "companies"
     assert s["predictor"]["sentence_length"] == 64
     assert s["model_size"] == 128
     assert set(s) == set(DEFAULTS)
 
 
 def test_a_partial_block_keeps_the_other_defaults_in_that_block():
-    s = bb.check({"tickers": ["AAPL"], "ts": {"days": 10}})
+    s = bb.check({"tickers": ["AAPL", "MSFT"], "ts": {"days": 10}})
     assert s["ts"]["days"] == 10            # what you set
     assert s["ts"]["vocabulary"] == 512     # what you left out
     assert s["cs"]["days"] == 5             # the other entry is untouched
@@ -26,7 +29,7 @@ def test_a_partial_block_keeps_the_other_defaults_in_that_block():
 
 def test_the_two_entries_are_independent():
     s = bb.check({
-        "tickers": ["AAPL"],
+        "tickers": ["AAPL", "MSFT"],
         "ts": {"days": 4, "vocabulary": 256, "encoder_depth": 5},
         "cs": {"days": 9, "vocabulary": 64, "encoder_depth": 1},
     })
@@ -66,10 +69,42 @@ def test_nonsense_sizes_are_rejected(bad):
         bb.check({"tickers": ["AAPL"], **bad})
 
 
-@pytest.mark.parametrize("block", ["ts", "cs", "fusion"])
+@pytest.mark.parametrize("block", ["ts", "cs"])
 def test_a_vocabulary_below_two_is_rejected(block):
+    """`fusion` no longer has a `vocabulary` at all -- there is no fused codebook to
+    configure any more (see `test_there_is_no_fused_codebook_to_configure` below)."""
     with pytest.raises(ValueError, match="at least 2"):
         bb.check({"tickers": ["AAPL"], block: {"vocabulary": 1}})
+
+
+def test_a_single_market_key_is_rejected_because_the_attention_would_be_a_no_op():
+    """⚠️ THE BUG THAT MADE THE ATTENTION MAP FLAT, and it was arithmetic, not training.
+
+    `attend_to="days"` averages the market's cells over COMPANIES, giving one key per day.
+    At `cs["days"] == 1` that is ONE key — and softmax over one key is identically 1.0.
+    Every company then receives the identical market vector, and no gradient can ever
+    teach it otherwise. The cross-attention is not weak. It does not exist.
+
+    Our tuned settings are exactly this: cs days = 1, attend_to = "days".
+    """
+    with pytest.raises(ValueError, match="one key"):
+        bb.check({"tickers": ["AAPL"], "cs": {"days": 1},
+                  "fusion": {"attend_to": "days"}})
+
+    # A real menu of companies is a different story: a bank can attend to banks.
+    bb.check({"tickers": ["AAPL", "MSFT"], "cs": {"days": 1},
+              "fusion": {"attend_to": "companies"}})           # must not raise
+
+
+def test_the_loss_block_is_the_joint_objective():
+    assert DEFAULTS["loss"] == {"predict": 1.0, "naming": 0.1, "recon": 1.0}
+
+
+def test_there_is_no_fused_codebook_to_configure():
+    """TS and CS keep their own codebooks, each ANCHORED by rebuilding its own grid. The
+    fused codebook — the only one the predictor ever saw — is the one we watched collapse
+    to 10 words of 512. It is deleted, not tuned."""
+    assert "vocabulary" not in DEFAULTS["fusion"]
 
 
 def test_booleans_are_not_accepted_as_sizes():
@@ -149,7 +184,7 @@ def test_the_optimiser_uses_the_weight_decay_setting(monkeypatch):
 
     assert DEFAULTS["weight_decay"] == 0.05
 
-    settings = bb.check({"tickers": ["AAPL"], "weight_decay": 0.37})
+    settings = bb.check({"tickers": ["AAPL", "MSFT"], "weight_decay": 0.37})
     model = VQVAE(companies=1, days=4, features=6, vocabulary=8, width=16, heads=2)
     grids = [{"grid": torch.randn(1, 4, 6)} for _ in range(16)]
     loaders = {"learn": DataLoader(grids, batch_size=8, shuffle=True),
@@ -279,7 +314,7 @@ def test_the_hardware_check_can_actually_fail(monkeypatch):
                             checks={label: ok for label, ok, _ in checks},
                             known_problem=known_problem))
 
-    verify.setup(bb.check({"tickers": ["AAPL"]}))
+    verify.setup(bb.check({"tickers": ["AAPL", "MSFT"]}))
 
     assert seen["checks"]["Hardware"] is False, "the Hardware check can never fail"
     assert seen["known_problem"], "a CPU run must be TOLERATED, not raise -- but not hidden"

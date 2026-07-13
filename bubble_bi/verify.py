@@ -71,7 +71,8 @@ def setup(settings: dict) -> None:
         have=f"""
         A checked configuration — and nothing else yet.
         The tokenizer will read {ts['days']} days of each stock and {cs['days']} days of the
-        whole market, then merge them into 1 token out of {settings['fusion']['vocabulary']}.
+        whole market, then merge them into ONE token, attending to
+        {settings['fusion']['attend_to']}.
         No prices downloaded, no model trained.
 
         This checked your ENVIRONMENT, not the code. To check the code itself — all of it,
