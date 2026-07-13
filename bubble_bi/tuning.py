@@ -156,6 +156,22 @@ def _probe_onehot(x: np.ndarray, y: np.ndarray, train: float = 0.7) -> float:
 _FLOOR_REPS = 64
 
 
+def _score_and_floor_ids(ids: np.ndarray, words: int, y: np.ndarray,
+                         seed: int) -> tuple[float, float, float]:
+    """The one-hot branch of `_score_and_floor`, for a caller that already HAS `ids` and
+    already KNOWS the design is one-hot -- so it never builds the (rows × words) matrix
+    at all, and never spends a pass running `_is_onehot` to rediscover a fact the caller
+    already had for free. `score_tokenizer` is exactly that caller: see `skill_from_ids`.
+    """
+    rng = np.random.default_rng(seed)
+    real = _probe_onehot_ids(ids, words, y)
+    draws = np.array([_probe_onehot_ids(ids[rng.permutation(len(ids))], words, y)
+                       for _ in range(_FLOOR_REPS)])
+    floor = float(draws.mean())
+    se = float(draws.std(ddof=1) / math.sqrt(_FLOOR_REPS))
+    return real, floor, se
+
+
 def _score_and_floor(x: np.ndarray, y: np.ndarray, seed: int) -> tuple[float, float, float]:
     """Returns (the real score, the shuffled floor, the floor's STANDARD ERROR).
 
@@ -167,16 +183,11 @@ def _score_and_floor(x: np.ndarray, y: np.ndarray, seed: int) -> tuple[float, fl
     a fraction of the memory traffic. This is the second half of the speed fix: the
     first half (`_probe_onehot_ids`) made ONE fit cheap; this makes RESHUFFLING it cheap.
     """
-    rng = np.random.default_rng(seed)
     if _is_onehot(x):
-        words = x.shape[1]
-        ids = x.argmax(axis=1)
-        real = _probe_onehot_ids(ids, words, y)
-        draws = np.array([_probe_onehot_ids(ids[rng.permutation(len(ids))], words, y)
-                           for _ in range(_FLOOR_REPS)])
-    else:
-        real = _probe(x, y)
-        draws = np.array([_probe(x[rng.permutation(len(x))], y) for _ in range(_FLOOR_REPS)])
+        return _score_and_floor_ids(x.argmax(axis=1), x.shape[1], y, seed)
+    rng = np.random.default_rng(seed)
+    real = _probe(x, y)
+    draws = np.array([_probe(x[rng.permutation(len(x))], y) for _ in range(_FLOOR_REPS)])
     floor = float(draws.mean())
     se = float(draws.std(ddof=1) / math.sqrt(_FLOOR_REPS))
     return real, floor, se
@@ -211,6 +222,24 @@ def skill_and_noise(x: np.ndarray, y: np.ndarray, seed: int = 0) -> tuple[float,
     — they are noise apart, not a real difference the search should trust.
     """
     real, floor, se = _score_and_floor(x, y, seed)
+    return real - floor, se
+
+
+def skill_from_ids(ids: np.ndarray, words: int, y: np.ndarray, seed: int = 0) -> tuple[float, float]:
+    """The exact number `skill_and_noise()` would return for a one-hot token -- straight
+    from WORD IDS, so the caller never builds the (rows × words) one-hot matrix at all.
+
+    `skill()`/`skill_and_noise()` auto-detect their input's shape (`_is_onehot`) because
+    they are handed either a one-hot TOKEN or a continuous `summary` vector, and cannot
+    assume which. `score_tokenizer` never has that ambiguity -- it already has `ids`,
+    straight from the codebook -- so building `one_hot(ids, words)` just to have
+    `skill()` rediscover, by scanning it, that it IS one-hot, then `argmax` it straight
+    back into the ids it started from, buys nothing. At TS scale with `vocabulary=1024`
+    that one-hot matrix is ~42MB, built twice per trial (direction, then volatility) for
+    no reason at all. This is `score_tokenizer`'s fast path, exposed directly; `skill()`
+    itself is untouched, and every other caller keeps its auto-detecting behaviour.
+    """
+    real, floor, se = _score_and_floor_ids(ids, words, y, seed)
     return real - floor, se
 
 
@@ -250,8 +279,17 @@ def look(model, loader, settings: dict, limit: int = 40):
     return tuple(np.concatenate(part) for part in (ids, summary, direction, volatility))
 
 
-def score_tokenizer(model, loader, settings: dict) -> dict:
-    """The score one trial gets. Higher is better; -inf means 'thrown out'."""
+def score_tokenizer(model, loader, settings: dict, quick: bool = False) -> dict:
+    """The score one trial gets. Higher is better; -inf means 'thrown out'.
+
+    `quick=True` skips `before_quant` -- a DENSE ridge fit on the continuous `summary`
+    vector, 65 fits per call (the real one plus 64 shuffles), because `summary` is not
+    one-hot and cannot take the cheap `_probe_onehot_ids` path the token itself uses.
+    `score` (the number a pruning check actually reads) does not change. This exists so
+    `_run_one`'s mid-training pruning check can ask "is this trial worth continuing?"
+    without paying for a number -- `before_quant` -- that nothing reads until the
+    trial's own FINAL score, where it is computed for real.
+    """
     ids, summary, direction, volatility = look(model, loader, settings)
     words = model.codebook.words
     used = len(np.unique(ids))
@@ -266,9 +304,10 @@ def score_tokenizer(model, loader, settings: dict) -> dict:
                 "before_quant": float("nan"),
                 "words_used": used, "why": f"codebook collapsed: {used} of {words} words"}
 
-    token = one_hot(ids, words)
-    went, went_se = skill_and_noise(token, direction)
-    violent, violent_se = skill_and_noise(token, volatility)
+    # Straight from `ids` -- never builds the (rows × words) one-hot matrix. See
+    # `skill_from_ids`'s own docstring for why that saving matters.
+    went, went_se = skill_from_ids(ids, words, direction)
+    violent, violent_se = skill_from_ids(ids, words, volatility)
     return {
         "score": went + violent,
         "direction": went,
@@ -281,8 +320,9 @@ def score_tokenizer(model, loader, settings: dict) -> dict:
         "volatility": violent,
         "volatility_se": violent_se,
         # The same probe on the CONTINUOUS vector, before the codebook rounded it off. A
-        # big gap means the CODEBOOK is destroying the signal, not the encoder.
-        "before_quant": skill(summary, direction),
+        # big gap means the CODEBOOK is destroying the signal, not the encoder. Skipped
+        # in `quick` mode -- see the docstring above.
+        "before_quant": float("nan") if quick else skill(summary, direction),
         "words_used": used,
         "why": "",
     }
@@ -362,6 +402,20 @@ def settle(settings: dict, entry: str, chosen: dict) -> dict:
     return out
 
 
+def _quick_score(model, loader, live, scorer):
+    """The cheap stand-in for `scorer`, used ONLY by the mid-training pruning check.
+
+    ⚠️ This never changes what `scorer(...)` is called WITH. A custom `scorer` (several
+    tests inject one, and so does `confirm`) is called exactly as before, with no new
+    argument sprung on it -- an arbitrary function cannot be expected to know about
+    `quick=`. Only the project's OWN default, `score_tokenizer`, gets the cheap path,
+    because it is the only one this file knows for certain supports it.
+    """
+    if scorer is score_tokenizer:
+        return score_tokenizer(model, loader, live, quick=True)
+    return scorer(model, loader, live)
+
+
 def _run_one(entry, chosen, batches, settings, scorer, features, companies, trial=None):
     """Train one configuration and score it. Returns the scorer's dict."""
     import optuna
@@ -396,8 +450,12 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
         if trial is None:
             return
         # Report the REAL objective, not the rebuild loss -- pruning on a signal we have
-        # already proved misleading would throw away the good trials.
-        trial.report(scorer(model, loaders["tune"], live)["score"], step)
+        # already proved misleading would throw away the good trials. But this check
+        # runs roughly ten times PER TRIAL, purely to feed `trial.report()` a number --
+        # nobody reads anything from it but `["score"]`. The full scorer's `before_quant`
+        # is a genuinely expensive dense probe; `_quick_score` skips it here and asks
+        # for it only once, for real, on the FINAL score below.
+        trial.report(_quick_score(model, loaders["tune"], live, scorer)["score"], step)
         if trial.should_prune():
             raise optuna.TrialPruned()
 

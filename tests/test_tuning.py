@@ -127,6 +127,46 @@ def test_score_tokenizer_reports_how_noisy_its_own_floor_is():
         assert scored[key] >= 0
 
 
+def test_score_tokenizer_never_builds_the_one_hot_matrix_it_already_has_ids_for(monkeypatch):
+    """`score_tokenizer` already HAS `ids` straight from the codebook. Building
+    `one_hot(ids, words)` just to hand it to `skill_and_noise()`, which would scan it
+    (`_is_onehot`) and `argmax` it straight back into the ids it started from, is pure
+    waste -- ~42MB at TS scale with `vocabulary=1024`, twice per trial. `score_tokenizer`
+    must go through `skill_from_ids` instead, and never call `one_hot` at all.
+    """
+    torch.manual_seed(1)
+    model = VQVAE(companies=1, days=4, features=26, width=16, heads=2, vocabulary=8)
+    grids = [torch.randn(1, 4, 26) for _ in range(300)]
+
+    def forbidden(*a, **k):
+        raise AssertionError("score_tokenizer built a one-hot matrix it did not need")
+
+    monkeypatch.setattr(tuning, "one_hot", forbidden)
+    scored = tuning.score_tokenizer(model, _loader(grids), DEFAULTS)
+    assert scored["words_used"] >= 2                        # took the real path, not collapse
+
+
+def test_score_tokenizer_quick_mode_skips_the_dense_before_quant_probe():
+    """`before_quant` runs a DENSE ridge fit on the continuous `summary` vector -- 65
+    fits (the real one plus 64 shuffles), the expensive kind `_probe_onehot_ids` exists
+    to let the TOKEN avoid. A mid-training pruning check only ever reads `["score"]`, so
+    it has no use for `before_quant` at all. `quick=True` skips it; everything else
+    (`score` itself, most of all) must come out identical either way.
+    """
+    torch.manual_seed(1)
+    model = VQVAE(companies=1, days=4, features=26, width=16, heads=2, vocabulary=8)
+    grids = [torch.randn(1, 4, 26) for _ in range(300)]
+
+    full = tuning.score_tokenizer(model, _loader(grids), DEFAULTS)
+    quick = tuning.score_tokenizer(model, _loader(grids), DEFAULTS, quick=True)
+
+    assert math.isnan(quick["before_quant"])
+    assert not math.isnan(full["before_quant"])
+    assert quick["score"] == full["score"]
+    assert quick["direction"] == full["direction"]
+    assert quick["volatility"] == full["volatility"]
+
+
 @pytest.fixture
 def tiny_settings(tmp_path):
     return {
@@ -723,6 +763,85 @@ def test_confirm_trains_at_the_full_budget_not_the_search_sprint(tiny_settings, 
         f"budget {tiny_settings['steps']!r} twice over -- the transfer guard is not "
         "actually training at full budget, which is the entire point of confirm()."
     )
+
+
+def test_the_pruning_check_does_not_pay_for_the_dense_before_quant_probe(
+        tiny_batches, tiny_settings, monkeypatch):
+    """`watch()` used to call the FULL scorer at every held-out check purely to feed
+    `trial.report()` a number -- and threw away everything but `["score"]`, including
+    `before_quant`, a dense ridge fit (65 fits) that is the exact cost the one-hot fast
+    path exists to avoid paying anywhere it does not have to. This counts how many
+    times that dense probe (`tuning.skill`) actually runs across a WHOLE `_run_one`
+    call -- many held-out checks plus one final score -- and demands it is exactly ONE:
+    the trial's real, final score, never a pruning check along the way.
+
+    `training.train` is stubbed to fire `on_check` a few times without actually
+    training -- this test is about how many times `watch()` pays for the dense probe
+    per check, not about whether this fixture's tiny model happens to train its
+    codebook into collapse (which would hide the waste behind the cheap "rejected"
+    path instead of proving anything about the fix).
+    """
+    from bubble_bi import training as training_module
+
+    def fake_train(model, loaders, settings, steps=None, quiet=False, on_check=None, **kw):
+        for step in range(1, 6):                 # simulate 5 held-out checks
+            on_check(step, {})
+
+    monkeypatch.setattr(training_module, "train", fake_train)
+
+    calls = {"n": 0}
+    real_skill = tuning.skill
+
+    def counting_skill(*a, **k):
+        calls["n"] += 1
+        return real_skill(*a, **k)
+
+    monkeypatch.setattr(tuning, "skill", counting_skill)
+
+    class FakeTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return False
+
+    config = {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16}
+    tuning._run_one("ts", config, tiny_batches, tiny_settings, tuning.score_tokenizer,
+                    len(tuning.names()), len(tiny_settings["tickers"]), trial=FakeTrial())
+
+    assert calls["n"] == 1, (
+        f"the dense before_quant probe ran {calls['n']} times over one trial -- it "
+        "must run exactly once, for the FINAL score, never during a pruning check"
+    )
+
+
+def test_the_pruning_check_still_calls_an_injected_scorer_exactly_as_before(
+        tiny_batches, tiny_settings):
+    """⚠️ The `scorer=` injection point must not break. The quick path exists ONLY for
+    this project's own default (`score_tokenizer`) -- an arbitrary custom `scorer`
+    (several tests inject one) cannot be assumed to accept a `quick=` argument, so it
+    must keep being called exactly as it always was: `scorer(model, loader, live)`,
+    nothing added, nothing assumed.
+    """
+    seen = []
+
+    def custom_scorer(model, loader, live):
+        seen.append(True)
+        return {"score": 0.0, "direction": 0.0, "volatility": 0.0, "words_used": 9,
+                "before_quant": 0.0, "why": ""}
+
+    class FakeTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return False
+
+    config = {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16}
+    tuning._run_one("ts", config, tiny_batches, tiny_settings, custom_scorer,
+                    len(tuning.names()), len(tiny_settings["tickers"]), trial=FakeTrial())
+
+    assert seen, "the custom scorer was never called at all"
 
 
 def test_a_model_built_before_apply_does_not_get_the_tuned_settings(tmp_path):
