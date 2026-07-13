@@ -496,6 +496,53 @@ def test_confirm_trains_at_the_full_budget_not_the_search_sprint(tiny_settings, 
     )
 
 
+def test_a_model_built_before_apply_does_not_get_the_tuned_settings(tmp_path):
+    """The Task 8 bug, reproduced directly. The notebook builds `ts`/`cs` once, early
+    on -- then, much later, `bb.tuning.apply()` folds `tuned.json` into the settings.
+    A model built BEFORE that point never hears about it: it was constructed from the
+    settings dict as it existed at the time, and nothing after can reach back and
+    change it. Only a model built from the SETTLED settings -- the ones `apply()` and
+    `check()` hand back -- actually gets the tuned numbers.
+
+    This is why the notebook fix rebuilds `ts`/`cs` (and `batches`) once tuning
+    settles: skip that step, as the notebook once did, and every tuned setting is
+    silently thrown away. This test is the guard against reverting to that shape.
+    """
+    import json
+
+    from bubble_bi.settings import DEFAULTS, check
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {}, "ts": {"vocabulary": 1024}, "cs": {},
+    }))
+
+    typed = {"tickers": ["AAA"]}
+    features = len(tuning.names())
+
+    # What the notebook has BEFORE the tuning section runs -- and the model it builds
+    # from it, exactly like section 5 of the notebook does.
+    settings = check(typed)
+    stale = VQVAE(companies=1, features=features, width=settings["model_size"], **settings["ts"])
+
+    # `apply()` runs: `tuned.json` changes `vocabulary` to 1024.
+    merged, _ = tuning.apply(typed, path=path)
+    settled = check(merged)                       # the notebook's `settings = bb.check(...)`
+    fresh = VQVAE(companies=1, features=features, width=settled["model_size"], **settled["ts"])
+
+    assert stale.codebook.words == DEFAULTS["ts"]["vocabulary"], (
+        "the model built BEFORE apply() should still carry the untuned default -- "
+        "it has no way to have heard about the tuning"
+    )
+    assert fresh.codebook.words == 1024, (
+        "the model built AFTER apply(), from the settled settings, must carry the "
+        "tuned vocabulary -- this is the whole point of rebuilding"
+    )
+    assert stale.codebook.words != fresh.codebook.words
+
+
 def test_the_probe_target_is_TODAY_and_never_tomorrow():
     """TS and CS are autoencoders. The target is the LAST DAY of the window they were just
     handed — read straight out of the grid, so nothing from the future can reach it."""
