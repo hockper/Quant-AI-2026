@@ -34,12 +34,12 @@ def world():
     prices = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
 
     settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
-                         "ts": {"batch": 32}, "cs": {"batch": 32}})
+                         "ts": {"batch": 32, "heads": 2}, "cs": {"batch": 32, "heads": 2}})
     data = bb.data.add_features(prices, settings)
     batches = bb.data.make_tensors(data, settings)
 
     torch.manual_seed(0)
-    model = VQVAE(companies=1, features=len(bb.data.names()), width=32, heads=2,
+    model = VQVAE(companies=1, features=len(bb.data.names()), width=32,
                   **settings["ts"])
     history = train(model, batches.ts, settings, steps=40, quiet=True)
     return model, batches, prices, settings, history
@@ -127,3 +127,25 @@ def test_the_family_breakdown_shows_what_the_headline_average_is_hiding(world):
     assert "average" in fig.axes[0].get_title(loc="left")
     # every family gets a number, and they are not all the same
     assert frame.notna().all()
+
+
+def test_tuning_importance_ranks_the_knob_that_actually_moved_the_score():
+    """Even twelve near-random trials answer 'is the learning rate dominating everything?'
+    -- which is worth knowing, and is the honest thing a 12-trial screen can tell you."""
+    import matplotlib
+    import numpy as np
+    import pandas as pd
+
+    matplotlib.use("Agg")
+    from bubble_bi import plots
+
+    rng = np.random.default_rng(0)
+    lr = rng.random(20)
+    trials = pd.DataFrame({
+        "stage": "balance",
+        "learning_rate": lr,
+        "commitment": rng.random(20),
+        "score": 5 * lr + 0.01 * rng.random(20),     # score follows lr, and nothing else
+    })
+    ranked = plots.tuning_importance(trials)
+    assert ranked.index[0] == "learning_rate"

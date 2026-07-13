@@ -67,11 +67,11 @@ def trained_cs():
     prices = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
 
     settings = bb.check({"tickers": ["AAA", "BBB", "CCC"], "learning_rate": 3e-3,
-                         "cs": {"batch": 32}, "ts": {"batch": 32}})
+                         "cs": {"batch": 32, "heads": 2}, "ts": {"batch": 32, "heads": 2}})
     batches = bb.data.make_tensors(bb.data.add_features(prices, settings), settings)
 
     torch.manual_seed(0)
-    cs = bb.models.VQVAE(companies=3, features=len(bb.data.names()), width=32, heads=2,
+    cs = bb.models.VQVAE(companies=3, features=len(bb.data.names()), width=32,
                          **settings["cs"])
     bb.train(cs, batches.cs, settings, steps=120, quiet=True)
     return cs, batches, settings

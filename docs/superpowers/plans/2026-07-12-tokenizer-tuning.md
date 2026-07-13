@@ -1286,12 +1286,43 @@ Two things. First, the transfer guard: **a config that wins a 600-step sprint ca
   - `tuning.save(found: dict, settings: dict, path=TUNED) -> Path`
   - `tuning.apply(typed: dict, path=TUNED) -> tuple[dict, str]` → `(settings_with_tuning_folded_in, a_line_to_print)`
   - `tuning.TUNED: Path` — repo-root `tuned.json`
+- Consumes (built in Task 6, use them — do NOT hand-roll the split):
+  - `tuning.TOP_LEVEL: frozenset` — exactly `{"learning_rate", "model_size"}`. These two are **top-level settings**, but `search()` returns them (and `tuned.json` stores them) *inside* the entry's flat block. `TOP_LEVEL` is the one place that knows which keys are which.
+  - `tuning.settle(settings: dict, entry: str, chosen: dict) -> dict` — folds a flat `search()`-shaped dict back into a full settings dict, putting each key where it belongs.
+
+⚠️ **The trap this task exists to walk into.** A caller who filters the flat block by hand — `{k: v for k, v in tuned_block.items() if k != "model_size"}` — forgets `learning_rate`, leaves it stranded inside `settings["ts"]`, and `check()` rejects it as an unknown setting. The notebook then dies on its first cell. **Always filter on `TOP_LEVEL`, never on a hand-picked key name.**
 
 - [ ] **Step 1: Write the failing tests**
 
 Add to `tests/test_tuning.py`:
 
 ```python
+def test_apply_leaves_no_top_level_key_stranded_in_an_entry_block(tmp_path):
+    """`tuned.json` stores each entry FLAT, so `learning_rate` and `model_size` are sitting
+    inside the "ts" object even though they are top-level settings. Filter them out by hand
+    and you WILL forget one — then `check()` rejects it and the notebook dies on cell one."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {},
+        "ts": {"vocabulary": 1024, "learning_rate": 4.2e-4, "model_size": 256},
+        "cs": {},
+    }))
+
+    merged, _ = tuning.apply({"tickers": ["AAA"]}, path=path)
+
+    assert not (tuning.TOP_LEVEL & set(merged["ts"])), (
+        "a top-level setting was left inside the entry block — check() will reject it"
+    )
+    assert merged["learning_rate"] == 4.2e-4      # lifted OUT, not dropped
+    assert merged["model_size"] == 256
+    assert merged["ts"]["vocabulary"] == 1024
+    bb_check(merged)                               # from bubble_bi.settings import check
+
+
 def test_precedence_defaults_then_tuned_then_what_you_typed(tmp_path):
     """Three layers, most specific wins. A tuned value replaces a default, but a value you
     DELIBERATELY typed in the notebook stands."""
@@ -1452,9 +1483,15 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
         tuned_block = found.get(entry) or {}
         if not tuned_block:
             continue
-        block = {k: v for k, v in tuned_block.items() if k != "model_size"}
+        # `tuned.json` stores each entry's block FLAT — the way `search()` returns it — so
+        # `learning_rate` and `model_size` are sitting in there even though they are
+        # top-level settings, not members of the entry's block. Split on TOP_LEVEL, the one
+        # place that knows which is which. Hand-picking the keys here is how you end up
+        # leaving `learning_rate` stranded inside `settings["ts"]`, where `check()` rejects
+        # it as an unknown setting and the notebook dies on its first cell.
+        block = {k: v for k, v in tuned_block.items() if k not in TOP_LEVEL}
         merged[entry] = {**block, **typed.get(entry, {})}       # typed wins
-        for shared in ("learning_rate", "model_size"):
+        for shared in TOP_LEVEL:
             if shared in tuned_block and shared not in typed:
                 merged[shared] = tuned_block[shared]
 

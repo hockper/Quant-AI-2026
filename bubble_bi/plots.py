@@ -308,8 +308,6 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
     """
     import matplotlib.pyplot as plt
 
-    from bubble_bi.data.features import FAMILIES
-
     grids = batches.ts["test"].dataset
     names = batches.arrays.names
     where = next(model.parameters()).device
@@ -329,15 +327,11 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
         (real ** 2).mean(axis=(0, 1)), 1e-9)
 
     # Which feature belongs to which family — ask each family what it produces.
-    import pandas as pd
+    from bubble_bi.data.features import by_family
 
-    fake = pd.DataFrame(
-        {c: np.linspace(1, 2, 400) for c in ("open", "high", "low", "close", "volume")},
-        index=pd.date_range("2020-01-01", periods=400, freq="B"),
-    )
     kept_by = {
-        family: float(np.mean([kept[names.index(n)] for n in module.build(fake, settings)]))
-        for family, module in FAMILIES.items()
+        family: float(np.mean([kept[names.index(n)] for n in columns]))
+        for family, columns in by_family(settings).items()
     }
     frame = pd.Series(kept_by).sort_values()
 
@@ -354,3 +348,37 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
     ax.grid(axis="x", alpha=0.25, linewidth=0.5)
     fig.tight_layout()
     return fig, frame
+
+
+def tuning_importance(trials):
+    """Which knob actually moved the score? Returns the ranking, and draws it.
+
+    Rank correlation, not Optuna's fANOVA: at a dozen trials fANOVA fits a forest to
+    almost no data and reports confident nonsense. A rank correlation over twelve points is
+    crude, and it is honest about being crude.
+    """
+    import matplotlib.pyplot as plt
+
+    usable = trials[np.isfinite(trials["score"])]
+    knobs = [c for c in usable.columns
+             if c not in {"stage", "score", "direction", "volatility",
+                          "before_quant", "words_used", "why"}]
+    strength = {}
+    for knob in knobs:
+        column = pd.to_numeric(usable[knob], errors="coerce")
+        if column.notna().sum() > 2 and column.nunique() > 1:
+            strength[knob] = abs(column.corr(usable["score"], method="spearman"))
+
+    ranked = pd.Series(strength).dropna().sort_values(ascending=False)
+    if ranked.empty:
+        print("Not enough completed trials to say which knob mattered.")
+        return ranked
+
+    fig, ax = plt.subplots(figsize=(8, 0.5 * len(ranked) + 1.5))
+    ax.barh(ranked.index[::-1], ranked.to_numpy()[::-1], color="#26a69a")
+    ax.set_xlabel("how strongly this knob moved the score (rank correlation)")
+    ax.set_title("Which knob actually mattered", loc="left", fontsize=12)
+    ax.set_xlim(0, 1)
+    fig.tight_layout()
+    plt.show()
+    return ranked

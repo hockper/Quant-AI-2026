@@ -42,9 +42,28 @@ from bubble_bi.models.llama import RMSNorm, Block
 class Tokenizer(nn.Module):
     """Two frozen encoders, a cross-attention, and one codebook. Grids in, tokens out."""
 
-    def __init__(self, ts, cs, vocabulary: int = 512, depth: int = 2, heads: int = 4,
-                 dropout: float = 0.1, attend_to: str = "days",
-                 commitment: float = 1.0, diversity: float = 0.1):
+    def __init__(
+        self,
+        ts,
+        cs,
+        *,
+        vocabulary: int = 512,
+        depth: int = 2,
+        attend_to: str = "days",
+        commitment: float = 0.25,
+        diversity: float = 0.1,
+        decay: float = 0.99,
+        model_size: int = 128,
+        batch: int | None = None,
+        heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        # `batch` is not a model setting -- it belongs to the data loader that builds
+        # sentences (see data/sentences.py, which reads `settings["fusion"]["batch"]`
+        # directly). It is accepted and ignored here purely so the notebook can hand
+        # over the whole `fusion` block in one go, the same way VQVAE takes and drops
+        # `batch`/`steps` so `VQVAE(**settings["ts"])` can splat cleanly.
+        del batch
         super().__init__()
         if ts.features != cs.features:
             raise ValueError("TS and CS must have been trained on the same features.")
@@ -52,6 +71,18 @@ class Tokenizer(nn.Module):
         self.ts, self.cs = ts, cs
         self.attend_to = attend_to
         self.width = ts.read.out_features
+
+        # The fusion is built from the encoders' ACTUAL width; the codebook below is
+        # built from `model_size`, a setting typed in by hand. Today the two always
+        # match, but nothing forces them to -- and if they ever drift apart, torch would
+        # report a cryptic shape mismatch deep in the cross-attention instead of telling
+        # you which setting to fix. Say it plainly, now, while we still know why.
+        if model_size != self.width:
+            raise ValueError(
+                f"`model_size` is {model_size} but the TS/CS encoders were built "
+                f"{self.width} wide. The cross-attention needs both sides the same "
+                "width, so these must agree."
+            )
 
         # Frozen: they already learned to describe a company and a market. Letting them
         # drift now would mean re-learning what we just spent two sections teaching them.
@@ -61,8 +92,13 @@ class Tokenizer(nn.Module):
                 weight.requires_grad = False
 
         self.fusion = Fusion(self.width, depth=depth, heads=heads, dropout=dropout)
-        self.codebook = Codebook(words=vocabulary, width=self.width,
-                                 commitment=commitment, diversity=diversity)
+        self.codebook = Codebook(
+            words=vocabulary,
+            width=model_size,
+            commitment=commitment,
+            diversity=diversity,
+            decay=decay,
+        )
 
     @torch.no_grad()
     def look(self, stock_grid: torch.Tensor, market_grid: torch.Tensor,
@@ -135,16 +171,20 @@ class WorldModel(nn.Module):
 
     def __init__(self, tokenizer: Tokenizer, sentence: int = 64, depth: int = 4,
                  heads: int = 4, kv_heads: int | None = None, theta: float = 10000.0,
-                 dropout: float = 0.0, candle_weight: float = 1.0,
-                 naming_weight: float = 0.1):
+                 dropout: float = 0.0, candle: float = 1.0,
+                 naming: float = 0.1):
         super().__init__()
         self.tokenizer = tokenizer
         self.sentence = sentence
         self.words = tokenizer.codebook.words
-        self.candle_weight = candle_weight
+        # Parameters are named `candle`/`naming` (not `candle_weight`/`naming_weight`) so
+        # `WorldModel(..., **settings["loss"])` can splat cleanly, the same way
+        # `VQVAE(**settings["ts"])` already does. The attributes below keep their old,
+        # more descriptive names -- nothing downstream needs to change because of this.
+        self.candle_weight = candle
         # Deliberately small by default. See the `loss` block in settings: this is the
         # weight that rewards cheating, and turning it up collapses the codebook.
-        self.naming_weight = naming_weight
+        self.naming_weight = naming
         width = tokenizer.width
 
         self.blocks = nn.ModuleList(

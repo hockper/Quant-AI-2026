@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import bubble_bi as bb
-from bubble_bi.data.tensors import Scaler, make_tensors, split_days, to_arrays
+from bubble_bi.data.tensors import Scaler, make_tensors, split_days, to_arrays, tuning_loaders
 
 
 @pytest.fixture
@@ -42,6 +42,13 @@ def table():
     raw = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
     settings = bb.check({"tickers": ["AAA", "BBB", "CCC"]})
     return bb.data.add_features(raw, settings), settings
+
+
+@pytest.fixture
+def batches(table):
+    """A real `Batches` built from the small synthetic table above."""
+    data, settings = table
+    return make_tensors(data, settings)
 
 
 def test_the_table_becomes_a_dense_grid(table):
@@ -319,3 +326,35 @@ def test_a_tiny_but_varying_feature_is_not_mistaken_for_a_flat_one(table):
 
     scaled = scaler.apply(a.x)[a.ok]
     assert scaled[:, 5].std() > 0.5                   # and it still varies once scaled
+
+
+# ----------------------------------------------- tuning_loaders: search cannot see test
+
+def test_the_search_cannot_reach_the_test_days(batches):
+    """Not 'does not read test' -- CANNOT. The loader is never built.
+
+    A search that could reach the test period would quietly tune on the answer, and the
+    only defence that actually holds is not constructing the thing.
+    """
+    loaders = tuning_loaders(batches, "ts", days=4, batch=8)
+    assert set(loaders) == {"learn", "tune"}
+    assert "test" not in loaders
+
+
+def test_tuning_loaders_rebuild_at_a_new_window_length(batches):
+    short = tuning_loaders(batches, "ts", days=3, batch=8)
+    long = tuning_loaders(batches, "ts", days=6, batch=8)
+    assert next(iter(short["learn"]))["grid"].shape[2] == 3
+    assert next(iter(long["learn"]))["grid"].shape[2] == 6
+
+
+def test_tuning_loaders_serve_the_market_grid_for_cs(batches):
+    loaders = tuning_loaders(batches, "cs", days=3, batch=4)
+    grid = next(iter(loaders["learn"]))["grid"]
+    assert grid.shape[1] == len(batches.arrays.tickers)   # every company, together
+    assert grid.shape[2] == 3
+
+
+def test_an_unknown_entry_is_rejected(batches):
+    with pytest.raises(ValueError, match="'ts' or 'cs'"):
+        tuning_loaders(batches, "fusion", days=3, batch=8)

@@ -5,6 +5,7 @@ yfinance
 scikit-learn
 matplotlib
 pytest
+optuna
 
 # torch is deliberately NOT listed. Colab already ships a torch matched to its
 # GPU/TPU runtime, and installing one here would replace it with a slower build.

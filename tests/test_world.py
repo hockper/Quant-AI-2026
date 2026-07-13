@@ -14,6 +14,19 @@ def _pair(width=32, heads=2):
     return ts, cs
 
 
+def _fusion_kwargs(vocabulary=32, depth=1, attend_to="days", model_size=32,
+                    commitment=0.25, diversity=0.1, decay=0.99):
+    """The keyword arguments `Tokenizer` takes for its own (fusion) knobs, so a test
+    can override just one and splat the rest -- `Tokenizer(ts, cs, **_fusion_kwargs())`,
+    the same convention as `VQVAE(**settings["ts"])`. `model_size` must match `_pair()`'s
+    `width`, since that is what the fused vector -- and so the codebook -- actually is."""
+    return {
+        "vocabulary": vocabulary, "depth": depth, "attend_to": attend_to,
+        "model_size": model_size,
+        "commitment": commitment, "diversity": diversity, "decay": decay,
+    }
+
+
 def _sentence(batch=2, days=8, width=32, keys=3):
     """A sentence, straight from the cache — which is how the world model is fed."""
     return {
@@ -97,7 +110,7 @@ def test_a_company_that_did_not_trade_is_left_out_of_the_market():
 
 def test_the_encoders_are_frozen_and_stay_frozen():
     ts, cs = _pair()
-    tok = Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0)
+    tok = Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs())
 
     assert not any(p.requires_grad for p in tok.ts.parameters())
     assert not any(p.requires_grad for p in tok.cs.parameters())
@@ -112,10 +125,20 @@ def test_the_encoders_are_frozen_and_stay_frozen():
 
 def test_one_token_per_company_day():
     ts, cs = _pair()
-    tok = Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0)
+    tok = Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs())
     out = tok(torch.randn(9, 1, 4, FEATURES), torch.randn(9, COMPANIES, 3, FEATURES))
     assert out["token"].shape == (9,)
     assert out["token"].max() < 32
+
+
+def test_a_mismatched_model_size_is_rejected_with_a_useful_message():
+    """The fusion is built from the encoders' ACTUAL width; the fusion codebook is built
+    from `model_size`, a number typed in by hand. If they ever disagreed, the failure
+    used to be a bare tensor-shape error deep inside the cross-attention. Catch it at
+    the door instead, with a message that names the setting to fix."""
+    ts, cs = _pair(width=32)
+    with pytest.raises(ValueError, match="TS/CS encoders were built 32 wide"):
+        Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs(model_size=16))
 
 
 # ------------------------------------------------------------------ the predictor
@@ -132,7 +155,7 @@ def test_the_predictor_cannot_see_tomorrow():
     """
     torch.manual_seed(0)
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0).eval()
 
     vectors = torch.randn(2, 8, 32)
@@ -174,7 +197,7 @@ def test_swiglu_keeps_the_width():
 
 def test_the_world_model_turns_a_sentence_into_tokens_and_guesses_the_next():
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0)
     out = world(_sentence(batch=3, days=8))
 
@@ -189,7 +212,7 @@ def test_the_prediction_loss_reaches_back_into_the_fusion():
     """The whole reason fusion and predictor train together: the token must be shaped
     by whether it is PREDICTABLE, not by whether it can be redrawn."""
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0)
     out = world(_sentence())
     out["naming_loss"].backward()
@@ -203,7 +226,7 @@ def test_it_can_actually_learn_to_predict_the_next_token():
     # A sentence that repeats itself. The model must do better than chance (1/32).
     torch.manual_seed(0)
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=12, depth=2, heads=2, dropout=0.0).train()
 
     batch = _sentence(batch=4, days=12)
@@ -225,7 +248,7 @@ def test_it_can_actually_learn_to_predict_the_next_token():
 
 def test_the_model_is_asked_to_draw_tomorrows_candle():
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0)
     out = world(_sentence(batch=3, days=8))
 
@@ -241,7 +264,7 @@ def test_the_candle_loss_reaches_the_fusion_so_an_empty_token_is_punished():
     it cannot draw a candle -- but only if the drawing loss actually reaches back into
     the fusion that produced the token."""
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0)
     world(_sentence())["drawing_loss"].backward()
 
@@ -251,9 +274,9 @@ def test_the_candle_loss_reaches_the_fusion_so_an_empty_token_is_punished():
 
 def test_the_loss_weights_are_obeyed():
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0,
-                       naming_weight=0.1, candle_weight=1.0)
+                       naming=0.1, candle=1.0)
     out = world(_sentence())
     total = (0.1 * out["naming_loss"] + 1.0 * out["drawing_loss"]
              + out["commitment_loss"] + out["diversity_loss"])
@@ -263,7 +286,7 @@ def test_the_loss_weights_are_obeyed():
 def test_without_a_candle_the_model_still_runs_but_says_so():
     # No candle in the batch -> no drawing loss. The model must not silently invent one.
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0),
+    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
                        sentence=8, depth=2, heads=2, dropout=0.0)
     batch = _sentence()
     del batch["candle"]
@@ -275,8 +298,8 @@ def test_without_a_candle_the_model_still_runs_but_says_so():
 def test_the_fusion_codebook_carries_the_diversity_penalty():
     # The anti-collapse term must be on the FUSION's codebook, not just TS and CS.
     ts, cs = _pair()
-    tok = Tokenizer(ts, cs, vocabulary=32, depth=1, heads=2, dropout=0.0,
-                    commitment=1.0, diversity=0.5)
+    tok = Tokenizer(ts, cs, heads=2, dropout=0.0,
+                    **_fusion_kwargs(commitment=1.0, diversity=0.5))
     assert tok.codebook.commitment == 1.0
     assert tok.codebook.diversity == 0.5
 
@@ -287,3 +310,24 @@ def test_the_fusion_codebook_carries_the_diversity_penalty():
     out["diversity_loss"].backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0
                for p in tok.fusion.parameters())
+
+
+def test_the_fusion_codebook_gets_its_own_knobs():
+    """The fusion codebook is the one that COLLAPSES to ~12 words. It had been running on
+    class defaults, unexamined, because nothing passed it anything."""
+    from bubble_bi.models.world import Tokenizer
+    from bubble_bi.settings import DEFAULTS
+
+    settings = {
+        **{k: v for k, v in DEFAULTS.items() if k != "tickers"},
+        "tickers": ["AAA"],
+        "model_size": 16,       # must match the encoders' width below, or Tokenizer rejects it
+        "fusion": {**DEFAULTS["fusion"], "commitment": 0.8, "diversity": 0.6, "decay": 0.5},
+    }
+    ts = VQVAE(companies=1, days=4, features=6, width=16, heads=2)
+    cs = VQVAE(companies=3, days=4, features=6, width=16, heads=2)
+    tokenizer = Tokenizer(ts, cs, model_size=settings["model_size"], **settings["fusion"])
+
+    assert tokenizer.codebook.commitment == 0.8
+    assert tokenizer.codebook.diversity == 0.6
+    assert tokenizer.codebook.decay == 0.5
