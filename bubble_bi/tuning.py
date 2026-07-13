@@ -321,6 +321,18 @@ SPACE = {
 # `search()`'s docstring for the trap that happens when someone does).
 TOP_LEVEL = frozenset({"learning_rate", "model_size"})
 
+# TS and CS are searched SEPARATELY (see `search()`), so they can come back wanting a
+# DIFFERENT number for a TOP_LEVEL setting. `apply()` has to pick one and say why --
+# this is the "why", spelled out per key, so the warning it prints names the ACTUAL
+# reason instead of a generic shrug.
+_WHY_SHARED = {
+    "model_size": ("They MUST share it — the cross-attention needs both sides "
+                    "the same width."),
+    "learning_rate": ("They do not have to match architecturally, but only ONE "
+                       "training loop runs, so only one learning rate can actually "
+                       "be used."),
+}
+
 
 def _ask(trial, name, rule):
     kind = rule[0]
@@ -549,8 +561,10 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
 
     found = json.loads(path.read_text())
     merged = dict(typed)
-    for entry in ("ts", "cs"):
-        tuned_block = found.get(entry) or {}
+    ts_block = found.get("ts") or {}
+    cs_block = found.get("cs") or {}
+
+    for entry, tuned_block in (("ts", ts_block), ("cs", cs_block)):
         if not tuned_block:
             continue
         # `tuned.json` stores each entry's block FLAT — the way `search()` returns it — so
@@ -561,9 +575,41 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
         # it as an unknown setting and the notebook dies on its first cell.
         block = {k: v for k, v in tuned_block.items() if k not in TOP_LEVEL}
         merged[entry] = {**block, **typed.get(entry, {})}       # typed wins
-        for shared in TOP_LEVEL:
-            if shared in tuned_block and shared not in typed:
-                merged[shared] = tuned_block[shared]
+
+    # TS and CS are searched SEPARATELY, so a TOP_LEVEL setting they both propose can
+    # genuinely disagree. The old code here just looped ts-then-cs and let whichever ran
+    # LAST silently overwrite the other -- confirmed by a reviewer with `ts.learning_rate
+    # = 1e-4, cs.learning_rate = 9e-4`: `apply()` handed back `9e-4` with a cheerful "using
+    # tuned settings" note, and nothing anywhere said TS's answer had been thrown away.
+    #
+    # We resolve every such disagreement by trusting TS: TS trains on ~30x more grids than
+    # CS (roughly 78,000 vs 2,600), so its estimate of the right value is far better
+    # supported. But that does not make CS's OTHER tuned numbers (its `commitment`, its
+    # `vocabulary`) correct at TS's setting -- they were found at CS's OWN one, and forcing
+    # CS onto TS's width/rate makes them only approximately right. We say that too, instead
+    # of quietly discarding the disagreement. Typing the setting yourself in SETTINGS always
+    # overrules this (checked first, below, so a deliberate choice is never second-guessed).
+    conflicts = []
+    for shared in TOP_LEVEL:
+        if shared in typed:
+            continue   # you wrote it yourself: nothing left to settle
+        ts_value, cs_value = ts_block.get(shared), cs_block.get(shared)
+        if ts_value is not None and cs_value is not None and ts_value != cs_value:
+            conflicts.append(
+                f"⚠️  TS and CS disagree on `{shared}` (TS wants {ts_value}, CS wants "
+                f"{cs_value}).\n"
+                f"    {_WHY_SHARED.get(shared, 'They were tuned independently, and only one value can be used.')}\n"
+                f"    Using TS's {ts_value}: it has ~30x more grids to learn from, so its "
+                "answer is better\n"
+                f"    supported. But CS's other settings were found at {cs_value}, so they "
+                "are approximate.\n"
+                f"    Type `{shared}` in SETTINGS yourself to overrule this."
+            )
+            merged[shared] = ts_value
+        elif ts_value is not None:
+            merged[shared] = ts_value
+        elif cs_value is not None:
+            merged[shared] = cs_value
 
     was, now = found["fingerprint"], fingerprint({**typed, "search": {"steps": None}})
     drifted = [f"{k}: tuned on {was[k]}, running {now[k]}"
@@ -576,4 +622,7 @@ def apply(typed: dict, path: Path = TUNED) -> tuple[dict, str]:
     else:
         note = (f"✅  Using tuned settings — found {found['found_on']} over "
                 f"{found['trials']} trials, on this same data.")
+
+    if conflicts:
+        note = "\n".join(conflicts) + "\n" + note
     return merged, note

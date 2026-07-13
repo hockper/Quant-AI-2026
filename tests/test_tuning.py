@@ -136,12 +136,19 @@ def tiny_settings(tmp_path):
         "data_dir": str(tmp_path),
         "model_size": 16,
         "learning_rate": 1e-3,
-        "steps": 20,
+        # ⚠️ DELIBERATELY DIFFERENT from search["steps"] below. `confirm()`'s whole job is
+        # to retrain at THIS, the full budget -- never the search's short one. If the two
+        # numbers were equal (they used to be: both 20), a `confirm()` that used the wrong
+        # budget by accident would be numerically indistinguishable from a correct one, and
+        # every test in this file would still pass. See
+        # `test_confirm_trains_at_the_full_budget_not_the_search_sprint` for the test that
+        # this split makes possible.
+        "steps": 40,
         "ts": {**DEFAULTS["ts"], "days": 3, "batch": 8, "vocabulary": 16,
                "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
         "cs": {**DEFAULTS["cs"], "days": 3, "batch": 4, "vocabulary": 16,
                "encoder_depth": 1, "decoder_depth": 1, "heads": 2, "steps": 20},
-        "search": {"run": True, "trials": 2, "steps": 20},
+        "search": {"run": True, "trials": 2, "steps": 10},
     }
 
 
@@ -305,6 +312,75 @@ def test_precedence_defaults_then_tuned_then_what_you_typed(tmp_path):
     assert "✅" in note
 
 
+def test_a_typed_top_level_setting_beats_the_tuned_one(tmp_path):
+    """The entry-block precedence (typed beats tuned) is covered above, but
+    `learning_rate`/`model_size` take a DIFFERENT path through `apply()` -- they are lifted
+    out of the entry blocks and merged at the top of the settings dict, by separate code.
+    That path needs its own proof: typing `learning_rate` in the notebook must beat
+    whatever `tuned.json` says, exactly the same as it does inside `ts`/`cs`."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {}, "ts": {"learning_rate": 9e-4}, "cs": {},
+    }))
+
+    typed = {"tickers": ["AAA"], "learning_rate": 1e-4}
+    merged, note = tuning.apply(typed, path=path)
+
+    assert merged["learning_rate"] == 1e-4        # you typed it: you win, even at the top
+
+
+def test_a_disagreement_on_a_shared_setting_is_reported_not_swallowed(tmp_path):
+    """TS and CS are searched SEPARATELY (see `search()`), and can come back wanting
+    different values for a TOP_LEVEL setting. The reviewer's exact repro: TS wants
+    `learning_rate=1e-4`, CS wants `9e-4`. The old code let whichever entry ran LAST win in
+    total silence -- this test is the one that would have caught it: it demands the note
+    actually SAYS a disagreement happened, not just that some number came out."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {},
+        "ts": {"learning_rate": 1e-4, "vocabulary": 512},
+        "cs": {"learning_rate": 9e-4, "vocabulary": 128},
+    }))
+
+    merged, note = tuning.apply({"tickers": ["AAA"]}, path=path)
+
+    assert merged["learning_rate"] == 1e-4, "TS has ~30x more grids -- its answer must win"
+    assert "disagree" in note.lower()
+    assert "0.0001" in note                       # TS's value, named
+    assert "0.0009" in note                       # CS's DISCARDED value, named too
+
+
+def test_a_model_size_disagreement_names_the_cross_attention_reason(tmp_path):
+    """`model_size` is not merely a preference the way `learning_rate` is -- TS and CS meet
+    in a cross-attention layer that needs both sides the SAME width, and `Tokenizer` raises
+    if they are not. The warning for THIS key must say so, not give a generic shrug."""
+    import json
+
+    path = tmp_path / "tuned.json"
+    path.write_text(json.dumps({
+        "found_on": "2026-07-12", "trials": 12,
+        "fingerprint": {"tickers": 1, "features": 26, "start": None, "search_steps": 600},
+        "score": {},
+        "ts": {"model_size": 256, "vocabulary": 512},
+        "cs": {"model_size": 128, "vocabulary": 256},
+    }))
+
+    merged, note = tuning.apply({"tickers": ["AAA"]}, path=path)
+
+    assert merged["model_size"] == 256
+    assert "256" in note and "128" in note
+    assert "cross-attention" in note.lower()
+    assert "SETTINGS" in note                     # tells the user how to overrule it
+
+
 def test_a_stale_tuning_warns_and_does_not_pretend(tmp_path):
     """We have already changed the feature count twice (10 -> 22 -> 26). Silently reusing
     hyperparameters tuned on different data is the exact class of bug we keep catching."""
@@ -330,6 +406,32 @@ def test_no_tuning_file_says_so_plainly(tmp_path):
     assert merged == {"tickers": ["AAA"]}
 
 
+def test_save_round_trips_through_apply(tmp_path):
+    """`save()` writes exactly what `apply()` later reads back -- this is the round trip
+    that makes that promise a fact instead of an assumption. Nothing here touches the
+    real `tuned.json` at the repo root: `save()` is handed a `tmp_path` file, same as
+    every other test in this file."""
+    from bubble_bi.settings import check as bb_check
+
+    settings = {**DEFAULTS, "tickers": ["AAA", "BBB"]}
+    found = {
+        "ts": {"vocabulary": 256, "commitment": 0.3, "learning_rate": 5e-4,
+               "model_size": 128},
+        "cs": {"vocabulary": 128, "commitment": 0.4, "learning_rate": 5e-4,
+               "model_size": 128},
+    }
+
+    written = tuning.save(found, settings, path=tmp_path / "tuned.json")
+    merged, note = tuning.apply({"tickers": ["AAA", "BBB"]}, path=written)
+
+    assert merged["ts"]["vocabulary"] == 256
+    assert merged["cs"]["vocabulary"] == 128
+    assert merged["learning_rate"] == 5e-4         # lifted to the top, from both entries
+    assert merged["model_size"] == 128
+    assert "✅" in note                             # found on the SAME data: not stale
+    bb_check(merged)                               # what comes back is a valid settings dict
+
+
 def test_the_confirm_keeps_the_incumbent_when_the_winner_does_not_beat_it(
         tiny_batches, tiny_settings):
     """The transfer guard. A config that wins a 600-step sprint can lose the real run: CS
@@ -352,6 +454,46 @@ def test_the_confirm_keeps_the_incumbent_when_the_winner_does_not_beat_it(
     assert out["kept"] == "incumbent"
     assert out["winner"] == 0.1 and out["incumbent"] == 0.9
     assert out["settings"]["vocabulary"] == tiny_settings["ts"]["vocabulary"]
+
+
+def test_confirm_trains_at_the_full_budget_not_the_search_sprint(tiny_settings, monkeypatch):
+    """The transfer guard's OWN correctness -- the test that would have caught the bug
+    that once slipped past all 18 other tests in this file.
+
+    `confirm()` exists because a config that wins a short search sprint can lose the real
+    run (see `confirm`'s own docstring for the CS story: held-out error climbing 0.90 ->
+    1.03 over nine thousand steps while its codebook decayed 187 -> 141 words). It guards
+    against that by rebuilding `settings["search"]["steps"]` from the FULL, top-level
+    `steps` before handing anything to `_run_one` -- never the search's own short one.
+
+    A reviewer once replaced that rebuild with plain `full = settings`, silently reverting
+    to the short budget -- and every test in this file still passed, because `tiny_settings`
+    used to set the top-level `steps` and `search["steps"]` to the SAME number (both 20).
+    A correct run and a broken one were numerically identical, so nothing could tell them
+    apart. The fixture now gives them different numbers on purpose, and this test is the
+    one that actually looks: it spies on `_run_one` and inspects the settings dict that
+    reaches it, not the score that comes back out (a mock scorer can't tell a short run
+    from a long one -- see the test above, which never noticed either).
+    """
+    seen_budgets = []
+
+    def spy(entry, chosen, batches, settings, scorer, features, companies, trial=None):
+        seen_budgets.append(settings["search"]["steps"])
+        return {"score": 0.0, "direction": 0.0, "volatility": 0.0, "words_used": 9,
+                "before_quant": 0.0, "why": ""}
+
+    monkeypatch.setattr(tuning, "_run_one", spy)
+
+    tuning.confirm("ts", {**tiny_settings["ts"], "learning_rate": 1e-3, "model_size": 16},
+                   batches=None, settings=tiny_settings)
+
+    # Both the winner and the incumbent must be trained at the FULL budget -- never the
+    # search's short one.
+    assert seen_budgets == [tiny_settings["steps"]] * 2, (
+        f"confirm() handed _run_one a step budget of {seen_budgets}, not the full "
+        f"budget {tiny_settings['steps']!r} twice over -- the transfer guard is not "
+        "actually training at full budget, which is the entire point of confirm()."
+    )
 
 
 def test_the_probe_target_is_TODAY_and_never_tomorrow():
