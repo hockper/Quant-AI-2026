@@ -14,28 +14,6 @@ def _pair(width=32, heads=2):
     return ts, cs
 
 
-def _fusion_kwargs(vocabulary=32, depth=1, attend_to="days", model_size=32,
-                    commitment=0.25, diversity=0.1, decay=0.99):
-    """The keyword arguments `Tokenizer` takes for its own (fusion) knobs, so a test
-    can override just one and splat the rest -- `Tokenizer(ts, cs, **_fusion_kwargs())`,
-    the same convention as `VQVAE(**settings["ts"])`. `model_size` must match `_pair()`'s
-    `width`, since that is what the fused vector -- and so the codebook -- actually is."""
-    return {
-        "vocabulary": vocabulary, "depth": depth, "attend_to": attend_to,
-        "model_size": model_size,
-        "commitment": commitment, "diversity": diversity, "decay": decay,
-    }
-
-
-def _sentence(batch=2, days=8, width=32, keys=3):
-    """A sentence, straight from the cache — which is how the world model is fed."""
-    return {
-        "z_ts": torch.randn(batch, days, width),          # what the company was doing
-        "market": torch.randn(batch, days, keys, width),  # what the market was offering
-        "candle": torch.randn(batch, days, 4),            # the candle each day really was
-    }
-
-
 # ------------------------------------------------------------------ cross-attention
 
 def test_the_output_is_as_long_as_the_query_not_the_keys():
@@ -189,12 +167,14 @@ def test_the_predictor_cannot_see_tomorrow():
     nothing, and the model would look brilliant while knowing nothing.
 
     So: change the FUTURE of a sentence and check that what the model thought about the
-    PAST did not move.
+    PAST did not move. `understand()` works on plain [batch, T, width] token vectors --
+    it does not care whether that batch axis is companies, sentences, or both, so this
+    test needs nothing beyond a real `WorldModel` to call it on.
     """
     torch.manual_seed(0)
     ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0).eval()
+    tok = Tokenizer(ts, cs, model_size=32, attend_to="companies", heads=2, dropout=0.0)
+    world = WorldModel(tok, sentence=8, depth=2, heads=2, dropout=0.0).eval()
 
     vectors = torch.randn(2, 8, 32)
     with torch.no_grad():
@@ -232,105 +212,151 @@ def test_swiglu_keeps_the_width():
 
 
 # ------------------------------------------------------------------ the whole thing
+#
+# A batch is one time WINDOW across ALL companies at once, not one company's sentence.
+# The CS grid is identical for every company on a day, so `_tiny_world` gives it NO
+# company axis of its own outside the grid -- `cs_grid` is [B, T, companies, cs_days, F],
+# one copy per day, which every one of that day's companies then reads.
 
-def test_the_world_model_turns_a_sentence_into_tokens_and_guesses_the_next():
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0)
-    out = world(_sentence(batch=3, days=8))
+def _tiny_world(sentence: int = 6, companies: int = 4, batch: int = 2, **loss_weights):
+    """A whole joint model over a tiny synthetic sentence. CPU, milliseconds."""
+    from bubble_bi.models.world import Tokenizer, WorldModel
 
-    assert out["tokens"].shape == (3, 8)              # one token per day
-    assert out["attention"].shape == (3, 8, 3)        # ...and what each one read
-    assert out["drawn"].shape == (3, 7, 4)            # tomorrow's candle, for each day
+    torch.manual_seed(0)
+    ts = VQVAE(companies=1, days=2, features=26, width=32, heads=2, vocabulary=16)
+    cs = VQVAE(companies=companies, days=1, features=26, width=32, heads=2, vocabulary=16)
+    tok = Tokenizer(ts, cs, model_size=32, attend_to="companies")
+    world = WorldModel(tok, sentence=sentence, depth=1, heads=2, **loss_weights)
+
+    data = {
+        # TS: one grid per COMPANY per day.
+        "ts_grid": torch.randn(batch, sentence, companies, 1, 2, 26),
+        # CS: ONE grid per day -- no separate axis per company, the `companies` dimension
+        # here is INSIDE the market grid itself (it is what CS was built to read).
+        "cs_grid": torch.randn(batch, sentence, companies, 1, 26),
+        "cs_present": torch.ones(batch, sentence, companies, dtype=torch.bool),
+        "candle": torch.randn(batch, sentence, companies, 4),
+    }
+    return world, data
+
+
+def test_the_naming_loss_CANNOT_touch_the_vocabulary():
+    """⚠️ THE TEST THIS WHOLE DESIGN EXISTS FOR.
+
+    The model invents its own words and is then graded on guessing them:
+
+        naming = CrossEntropy( GPT(z1..zt),  id(z_{t+1}) )
+                               └ the model's ┘ └ ALSO the model's ┘
+
+    Two ways to drive that to zero: learn real dynamics (hard), or make every day the
+    same word (trivial). Gradient descent takes the second, and it is a STABLE fixed
+    point -- once the vocabulary is dead nothing pulls it back. We measured it: 92%
+    accuracy at perplexity 2.2.
+
+    So the naming head reads a DETACHED copy of the token vectors. It can make the GPT
+    better at predicting the language; it can never make the language easier. This test
+    asserts the gradient path is severed -- if it ever reconnects, the codebook dies and
+    the loss curve will look FINE while it happens.
+    """
+    world, batch = _tiny_world()
+    world.zero_grad()
+    world(batch)["naming_loss"].backward()
+
+    guilty = [name for name, p in world.tokenizer.named_parameters()
+              if p.grad is not None and p.grad.abs().sum() > 0]
+    assert not guilty, (
+        f"the naming loss reached the tokenizer through {guilty[:3]} — it can now buy a "
+        "cheap win by collapsing the vocabulary, and it will"
+    )
+
+
+def test_the_anchor_DOES_reach_the_vocabulary():
+    """The counterpart. Reconstruction must reach the encoders and codebooks -- it is the
+    only thing holding the words apart. A severed naming channel is worthless if the anchor
+    is severed too."""
+    world, batch = _tiny_world()
+    world.zero_grad()
+    world(batch)["recon_loss"].backward()
+
+    reached = [name for name, p in world.tokenizer.named_parameters()
+               if p.grad is not None and p.grad.abs().sum() > 0]
+    assert reached, "reconstruction reaches nothing — the codebooks have no anchor at all"
+
+
+def test_the_candle_loss_DOES_reach_the_vocabulary():
+    """This is the whole point of joint training: the FORECAST shapes the token. If the
+    prediction loss cannot reach the tokenizer, we have simply rebuilt the two-stage model
+    with extra steps."""
+    world, batch = _tiny_world()
+    world.zero_grad()
+    world(batch)["drawing_loss"].backward()
+
+    reached = [n for n, p in world.tokenizer.named_parameters()
+               if p.grad is not None and p.grad.abs().sum() > 0]
+    assert reached, "the forecast cannot shape the token — joint training is doing nothing"
+
+
+def test_it_reports_persistence_and_shrugging_beside_its_own_scores():
+    """A number without its floor gets quoted. Persistence is 'tomorrow's word is today's
+    word'; shrugging is 'draw the average candle'."""
+    world, batch = _tiny_world()
+    out = world(batch)
+    assert torch.isfinite(out["persistence"])
+    assert torch.isfinite(out["shrugging"])
+
+
+def test_the_world_model_runs_over_every_company_at_once():
+    """The shape contract the whole design rests on: ONE window, ALL companies. Each
+    company must get its OWN sentence (and so its own accuracy/candle contribution), not
+    be pooled into a single anonymous sequence."""
+    companies, sentence, batch = 5, 6, 3
+    world, data = _tiny_world(sentence=sentence, companies=companies, batch=batch)
+    out = world(data)
+
     assert torch.isfinite(out["loss"])
     assert 0.0 <= float(out["accuracy"]) <= 1.0
+    assert 0.0 <= float(out["persistence"]) <= 1.0
+    assert out["ts_perplexity"] > 0 and out["cs_perplexity"] > 0
+    # One attention weight per (batch, day, company, market-key).
+    assert out["attention"].shape == (batch, sentence, companies, companies)
 
 
-def test_the_prediction_loss_reaches_back_into_the_fusion():
-    """The whole reason fusion and predictor train together: the token must be shaped
-    by whether it is PREDICTABLE, not by whether it can be redrawn."""
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0)
-    out = world(_sentence())
-    out["naming_loss"].backward()
+def test_the_market_is_encoded_once_per_day_not_once_per_company_day():
+    """⚠️ THE SAVING THE WHOLE TWO-TOKEN DESIGN RESTS ON.
 
-    reached = [p.grad is not None and p.grad.abs().sum() > 0
-               for p in world.tokenizer.fusion.parameters() if p.requires_grad]
-    assert any(reached), "the predictor's loss never reached the cross-attention"
+    The CS grid is identical for every company on a day. If `WorldModel.forward` ever
+    starts encoding it once per COMPANY-day instead of once per day, training gets ~N
+    times slower and nothing about the loss curve would say so -- the model would just
+    quietly get much harder to afford. So we count: the CS encoder must be called on
+    exactly `B*T` rows, never `B*T*N`.
+    """
+    companies, sentence, batch = 4, 6, 2
+    world, data = _tiny_world(sentence=sentence, companies=companies, batch=batch)
 
+    seen_batches = []
+    real_read_grid = world.tokenizer.cs.read_grid.__func__
 
-def test_it_can_actually_learn_to_predict_the_next_token():
-    # A sentence that repeats itself. The model must do better than chance (1/32).
-    torch.manual_seed(0)
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=12, depth=2, heads=2, dropout=0.0).train()
+    def counting_read_grid(self, grid, present=None):
+        seen_batches.append(grid.shape[0])
+        return real_read_grid(self, grid, present)
 
-    batch = _sentence(batch=4, days=12)
-    opt = torch.optim.AdamW(
-        [p for p in world.parameters() if p.requires_grad], lr=3e-3)
+    world.tokenizer.cs.read_grid = counting_read_grid.__get__(world.tokenizer.cs)
+    world(data)
 
-    first = float(world(batch)["naming_loss"])
-    for _ in range(200):
-        out = world(batch)
-        opt.zero_grad()
-        out["loss"].backward()
-        opt.step()
-    last = float(world(batch)["naming_loss"])
-
-    assert last < first * 0.7, f"barely learned: {first:.2f} -> {last:.2f}"
-
-
-# ------------------------------------------------- the candle head, and the cheat
-
-def test_the_model_is_asked_to_draw_tomorrows_candle():
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0)
-    out = world(_sentence(batch=3, days=8))
-
-    assert out["drawn"].shape == (3, 7, 4)          # gap, body, and the two wicks
-    assert "drawing_loss" in out and "shrugging" in out
-    # `shrugging` is what you score by drawing the AVERAGE candle. It is what makes
-    # `drawing_loss` mean something on its own.
-    assert float(out["shrugging"]) > 0
-
-
-def test_the_candle_loss_reaches_the_fusion_so_an_empty_token_is_punished():
-    """The whole point of the candle head. A collapsed token carries no information, so
-    it cannot draw a candle -- but only if the drawing loss actually reaches back into
-    the fusion that produced the token."""
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0)
-    world(_sentence())["drawing_loss"].backward()
-
-    assert any(p.grad is not None and p.grad.abs().sum() > 0
-               for p in world.tokenizer.fusion.parameters())
+    assert seen_batches == [batch * sentence], (
+        f"the CS encoder saw batches of {seen_batches}, not a single call of "
+        f"{batch * sentence} (= B*T) rows -- it is re-encoding the market per company, "
+        "which is the ~30x slowdown this whole design exists to avoid"
+    )
 
 
 def test_the_loss_weights_are_obeyed():
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0,
-                       naming=0.1, candle=1.0)
-    out = world(_sentence())
-    total = (0.1 * out["naming_loss"] + 1.0 * out["drawing_loss"]
-             + out["commitment_loss"] + out["diversity_loss"])
-    assert torch.allclose(out["loss"], total)
-
-
-def test_without_a_candle_the_model_still_runs_but_says_so():
-    # No candle in the batch -> no drawing loss. The model must not silently invent one.
-    ts, cs = _pair()
-    world = WorldModel(Tokenizer(ts, cs, heads=2, dropout=0.0, **_fusion_kwargs()),
-                       sentence=8, depth=2, heads=2, dropout=0.0)
-    batch = _sentence()
-    del batch["candle"]
+    """`predict`/`naming`/`recon` must actually reach the total, not just be accepted."""
+    world, batch = _tiny_world(predict=2.0, naming=0.3, recon=0.5)
     out = world(batch)
-    assert "drawing_loss" not in out
-    assert torch.isfinite(out["loss"])
+    total = (2.0 * out["drawing_loss"] + 0.3 * out["naming_loss"]
+             + 0.5 * out["recon_loss"] + out["commitment_loss"] + out["diversity_loss"])
+    assert torch.allclose(out["loss"], total)
 
 
 # The two tests that used to live here (`test_the_fusion_codebook_carries_the_diversity_
@@ -339,3 +365,16 @@ def test_without_a_candle_the_model_still_runs_but_says_so():
 # any more (see `test_the_tokenizer_has_no_codebook_of_its_own` above): TS and CS carry
 # their OWN commitment/diversity/decay knobs, already covered by
 # `test_the_codebook_knobs_actually_reach_the_codebook` in tests/test_settings.py.
+#
+# Also gone: `test_the_prediction_loss_reaches_back_into_the_fusion` and
+# `test_the_candle_loss_reaches_the_fusion_so_an_empty_token_is_punished`. The first
+# asserted that NAMING reaches the fusion -- exactly the collapse channel this file now
+# severs on purpose (see `test_the_naming_loss_CANNOT_touch_the_vocabulary` above). The
+# second is superseded by `test_the_candle_loss_DOES_reach_the_vocabulary`, which checks
+# the same thing against the tokenizer as a whole rather than the fusion alone.
+# `test_it_can_actually_learn_to_predict_the_next_token`,
+# `test_the_model_is_asked_to_draw_tomorrows_candle` and
+# `test_without_a_candle_the_model_still_runs_but_says_so` all built batches out of
+# cached `z_ts`/`market` tensors and read `out["tokens"]`/`out["drawn"]` -- a single
+# fused token stream that no longer exists. `candle` is no longer optional either: it is
+# what every sentence carries now, not an extra a caller could omit.

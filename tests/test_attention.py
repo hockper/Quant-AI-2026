@@ -103,53 +103,55 @@ def test_the_cells_map_folds_150_keys_into_two_readable_halves():
 # ------------------------------------------- the bug that made the map a lie
 
 def test_every_company_is_measured_not_just_the_first_few():
-    """A real bug, caught by looking at the output.
+    """A real bug, caught by looking at the output -- and no longer possible to build.
 
-    The sentences are ordered BY COMPANY. Sampling the first N batches therefore only
-    ever reaches the first few companies, and every company after them comes back blank
-    — while the summary numbers quietly get computed on that biased sample. A diagnostic
-    that measures the wrong thing is worse than no diagnostic.
+    Under the old cached-latent design, sentences were served one COMPANY at a time,
+    ordered by company, so sampling only the first few batches reached only the first
+    few tickers. Under joint training a batch is one time WINDOW across ALL companies
+    at once (see `WorldModel.forward`), so that ordering bug cannot happen any more —
+    every batch structurally carries every company as its own axis.
+
+    What replaces it: `gather()` must actually READ that axis correctly, rather than
+    silently mislabelling it. This builds a tiny multi-company sentence loader (raw
+    grids, the new batch shape) and checks every company comes back finite.
     """
     import torch
     from torch.utils.data import DataLoader, Dataset
 
     import bubble_bi as bb
     from bubble_bi.attention import gather
-    from bubble_bi.settings import DEFAULTS
 
-    companies, width, keys, days = 5, 16, 4, 6
+    companies, width, ts_days, cs_days, features, sentence = 5, 16, 2, 3, 6, 4
 
-    class _Ordered(Dataset):
-        """Sentences laid out company by company — exactly like the real ones."""
-        def __init__(self, per_company=20):
-            self.who = np.repeat(np.arange(companies), per_company)
+    class _Sentences(Dataset):
+        """One item = one window of `sentence` days, every company at once — exactly
+        how `bubble_bi.data.make_sentences` will serve them."""
+        def __init__(self, n=8):
+            self.n = n
 
         def __len__(self):
-            return len(self.who)
+            return self.n
 
         def __getitem__(self, i):
             return {
-                "z_ts": torch.randn(days, width),
-                "market": torch.randn(days, keys, width),
-                "candle": torch.randn(days, 4),
-                "company": torch.tensor(int(self.who[i])),
-                "last_day": torch.tensor(days - 1),
+                "ts_grid": torch.randn(sentence, companies, 1, ts_days, features),
+                "cs_grid": torch.randn(sentence, companies, cs_days, features),
+                "cs_present": torch.ones(sentence, companies, dtype=torch.bool),
+                "candle": torch.randn(sentence, companies, 4),
             }
 
-    ts = bb.models.VQVAE(companies=1, days=4, features=6, vocabulary=16,
+    ts = bb.models.VQVAE(companies=1, days=ts_days, features=features, vocabulary=16,
                          width=width, heads=2)
-    cs = bb.models.VQVAE(companies=companies, days=keys, features=6, vocabulary=16,
-                         width=width, heads=2)
-    fusion = {**DEFAULTS["fusion"], "vocabulary": 16, "depth": 1}
-    world = bb.models.WorldModel(
-        bb.models.Tokenizer(ts, cs, model_size=width, heads=2, **fusion),
-        sentence=days, depth=1, heads=2,
-    )
+    cs = bb.models.VQVAE(companies=companies, days=cs_days, features=features,
+                         vocabulary=16, width=width, heads=2)
+    tokenizer = bb.models.Tokenizer(ts, cs, model_size=width, heads=2,
+                                    attend_to="companies")
+    world = bb.models.WorldModel(tokenizer, sentence=sentence, depth=1, heads=2)
 
-    book = {"loaders": {"test": DataLoader(_Ordered(), batch_size=4, shuffle=False)}}
-    settings = bb.check({"tickers": ["A", "B", "C", "D", "E"]})
+    book = {"loaders": {"test": DataLoader(_Sentences(), batch_size=3, shuffle=False)}}
+    settings = bb.check({"tickers": [f"T{i}" for i in range(companies)]})
 
     read = gather(world, book, None, settings)
-    assert read["attention"].shape == (companies, keys)
-    # THE assertion: the LAST company must have been measured too.
+    assert read["attention"].shape == (companies, companies)     # attend_to="companies"
+    # THE assertion: every company must have been measured, not just the first few.
     assert np.isfinite(read["attention"]).all(), "a company was never reached"
