@@ -49,12 +49,16 @@ def gather(world, book, batches: int | None, settings: dict, period: str = "test
     that cost: how many batches of the loader to read before stopping. `None` reads the
     whole period.
 
-    ⚠️ `book` is whatever `bubble_bi.data.make_sentences()` returns TODAY: a plain
-    {"learn": ..., "tune": ..., "test": ...} of DataLoaders, not nested under a
-    "loaders" key. That nesting belonged to the old cached-latent `make_sentences()`
-    (which also returned a "memory" of frozen encoder output) and this function was
-    never updated when that was rewritten for raw-grid, jointly-trained sentences --
-    nothing caught it because the test below builds its own `book` by hand.
+    ⚠️ `book` is a plain {"learn": ..., "tune": ..., "test": ...} of DataLoaders --
+    NOT nested under a "loaders" key. That nesting belonged to the old cached-latent
+    `make_sentences()` (which also returned a "memory" of frozen encoder output), and
+    for a while after `make_sentences()` was rewritten for raw-grid, jointly-trained
+    sentences, this function still assumed the OLD shape and nothing caught the
+    mismatch — the test covering it built its own `book` by hand, already in the new
+    shape, rather than exercising the real round trip through `make_sentences()`.
+    Fixed now, and reads the current shape correctly; the lesson worth keeping is that
+    a shape drift like this is silent unless a test exercises the real producer, not a
+    hand-built stand-in for it.
     """
     from bubble_bi.training import _to, pick_device
 

@@ -3,8 +3,8 @@
 TS and CS look like different problems. They are not — they are the same problem
 at two sizes:
 
-    TS   1 company  × 4 days × 22 features  →  one word   "what THIS stock is doing"
-    CS  30 companies × 5 days × 22 features →  one word   "what the MARKET is doing"
+    TS   1 company  × 4 days × 26 features  →  one word   "what THIS stock is doing"
+    CS  30 companies × 5 days × 26 features →  one word   "what the MARKET is doing"
 
 TS is simply CS watching a single company. So there is one class, configured two
 ways, rather than two classes that quietly drift apart.
@@ -212,7 +212,14 @@ class VQVAE(nn.Module):
         attention is not weak; it does not exist. That is why our attention map was flat for
         weeks while we blamed the training. Use "companies".
 
-        Companies that did not trade are left out of the averages, not counted as zeros.
+        ⚠️ "Left out of the averages, not counted as zeros" is only true for `"days"`
+        (and the day-marginal half of `"cells"`): that branch averages OVER companies,
+        weighted by `present`, so an absent company cannot drag the average down. At
+        the DEFAULT, `"companies"`, there is no averaging across companies at all --
+        each company IS its own key (`keys_from_cells` averages over days, per
+        company), so an absent company still supplies its own key, built from
+        whatever the encoder did with a masked-out grid. It is simply never combined
+        with anyone else's.
 
         See `keys_from_cells` if you have the cells already.
         """
@@ -230,11 +237,6 @@ class VQVAE(nn.Module):
         cells = self.decoder(cells.reshape(b, self.companies * self.days, -1))
         cells = cells.reshape(b, self.companies, self.days, -1)
         return self.write(cells)
-
-    def tokenize(self, grid: torch.Tensor, present: torch.Tensor | None = None) -> torch.Tensor:
-        """The word for each grid: [B]. This is what the whole model exists to produce."""
-        with torch.no_grad():
-            return self.codebook(self.summarise(grid, present))["ids"]
 
     # ----------------------------------------------------------------- forward
     def forward(self, batch: dict) -> dict:
