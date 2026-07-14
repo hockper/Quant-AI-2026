@@ -396,6 +396,13 @@ def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
 
     So we clamp `revive_every` down to at most `check_every`: at least one revival is
     guaranteed before the first check, always.
+
+    A live bar (`_JointProgress`) ticks on EVERY step, not just at `check_every` -- a
+    multi-hour Colab run used to print only the ~10 checkpoint lines below and go
+    silent in between, indistinguishable from a hung notebook. `_Progress` (used by
+    `train()`) is not reused here: its `tick`/`checkpoint` are shaped for a single
+    VQ-VAE's numbers (rebuild/guessing/perplexity/words_used), and this run has an
+    entirely different set (candle/shrugging/accuracy/persistence/two perplexities).
     """
     steps = steps or settings["steps"]
     check_every = check_every or max(1, steps // 10)
@@ -414,6 +421,8 @@ def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
     best, best_at, best_weights, stale = float("inf"), 0, None, 0
     revived = 0
 
+    progress = _JointProgress(steps, describe_device(where), enabled=not quiet)
+
     for step in range(1, steps + 1):
         out = world(_to(next(feed), where))
         optimiser.zero_grad()
@@ -429,10 +438,14 @@ def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
             revived += world.tokenizer.cs.codebook.revive_dead_words(
                 out["cs_summary"].detach())
 
+        progress.tick(step, float(out["drawing_loss"].detach()),
+                     float(out["ts_perplexity"].detach()), float(out["cs_perplexity"].detach()))
+
         if step % check_every == 0 or step == steps:
             scored = score_joint(world, loaders["tune"], where)
             history.add(step=step, revived=revived, **scored)
             if not quiet:
+                progress.checkpoint()
                 print(f"  {step:>6}  candle {scored['drawing']:.3f} "
                       f"(shrug {scored['shrugging']:.3f})   "
                       f"words {scored['accuracy']:.1%} "
@@ -458,7 +471,65 @@ def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
     history.best_step = best_at
     if best_weights is not None:
         world.load_state_dict(best_weights)
+    progress.done(history.seconds)
     return history
+
+
+class _JointProgress:
+    """A live bar for `train_joint`, so a multi-hour run does not look like a hung
+    notebook. See `_Progress` for the same idea, built for `train()`'s own numbers --
+    this one exists because `train_joint`'s checks carry a different set entirely
+    (candle/shrugging/accuracy/persistence/two perplexities), not the single
+    rebuild/perplexity/words_used triple `_Progress` was built to show.
+    """
+
+    REDRAW_EVERY = 0.15          # seconds — smooth to the eye, cheap on the notebook
+
+    def __init__(self, steps: int, where: str, enabled: bool):
+        self.steps, self.enabled = steps, enabled
+        self.started = time.time()
+        self.last_drawn = 0.0
+        self.line = ""
+        if enabled:
+            print(f"Training jointly on {where} for {steps:,} steps")
+
+    def tick(self, step: int, drawing: float, ts_perplexity: float, cs_perplexity: float) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self.last_drawn < self.REDRAW_EVERY and step != self.steps:
+            return
+        self.last_drawn = now
+
+        done = step / self.steps
+        filled = int(done * 28)
+        gone = now - self.started
+        left = gone / max(done, 1e-9) - gone
+        bar = "█" * filled + "░" * (28 - filled)
+        self._draw(
+            f"  {bar} {done:>4.0%}  step {step:,}/{self.steps:,}  "
+            f"candle {drawing:.3f}  perplexity TS {ts_perplexity:>5.1f} "
+            f"CS {cs_perplexity:>5.1f}  ~{left:>3.0f}s left"
+        )
+
+    def checkpoint(self) -> None:
+        """Wipe the bar so the checkpoint row underneath it is not smeared together."""
+        if self.enabled:
+            self._draw("")
+
+    def done(self, seconds: float) -> None:
+        if not self.enabled:
+            return
+        self._draw("")
+        print(f"\n  {seconds:.0f}s")
+
+    def _draw(self, text: str) -> None:
+        import sys
+
+        pad = " " * max(0, len(self.line) - len(text))
+        sys.stdout.write("\r" + text + pad + ("\r" if not text else ""))
+        sys.stdout.flush()
+        self.line = text
 
 
 def baseline_rebuild(loader, limit: int = 40) -> float:

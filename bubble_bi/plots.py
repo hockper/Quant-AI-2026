@@ -20,6 +20,36 @@ from bubble_bi.data.features.candle import rebuild_candles
 SHAPE = ["gap", "body", "upper_wick", "lower_wick"]
 
 
+def _market_grid_for_day(batches, cs, day: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The CS grid + presence mask for one calendar day, built directly from the
+    feature arrays and scaler -- the same way `CSGrids.__getitem__` does.
+
+    Why this exists at all: a TS example names a DAY, and drawing what the trained
+    model actually said for it requires running that day's market through the SAME
+    cross-attention the real model uses (see the module docstring on `remembered`
+    below) -- which needs the market's own grid for that day, not just the TS one.
+    This builds it on demand, for any day a TS example names, without that day needing
+    to already be its own batch inside `batches.cs`.
+    """
+    from bubble_bi.data.tensors import _complete_windows
+
+    arrays, scaler = batches.arrays, batches.scaler
+    scaled = scaler.apply(arrays.x)
+    whole = _complete_windows(arrays.ok, cs.days)          # [T, N]
+    if day < cs.days - 1 or not whole[day].any():
+        raise ValueError(
+            f"No usable {cs.days}-day market window ending on day {day} -- either too "
+            "early in history, or nobody traded through it."
+        )
+    window = scaled[day - cs.days + 1: day + 1]             # [days, N, F]
+    present = whole[day]                                    # [N]
+    grid = np.where(present[None, :, None], window, 0.0).transpose(1, 0, 2)
+    return (
+        torch.from_numpy(np.ascontiguousarray(grid)).unsqueeze(0),   # [1, N, days, F]
+        torch.from_numpy(present.copy()).unsqueeze(0),                 # [1, N]
+    )
+
+
 def _draw_candles(ax, candles: pd.DataFrame, title: str) -> None:
     up, down = "#26a69a", "#ef5350"
     for i, (_, day) in enumerate(candles.iterrows()):
@@ -43,7 +73,7 @@ def _draw_candles(ax, candles: pd.DataFrame, title: str) -> None:
         ax.spines[side].set_visible(False)
 
 
-def remembered(model, batches, prices: pd.DataFrame, settings: dict,
+def remembered(tokenizer, batches, prices: pd.DataFrame, settings: dict,
                company: str | None = None, when: int | None = None):
     """Draw the real candles beside the ones a single token remembered.
 
@@ -51,9 +81,17 @@ def remembered(model, batches, prices: pd.DataFrame, settings: dict,
     which is scale-free. So we take the shape it reconstructed, invert it back into
     open/high/low/close, and draw it. Given the previous close, that inversion is
     exact: what you see is precisely what the word remembered, not an impression.
+
+    ⚠️ Takes the TOKENIZER, not a bare TS `VQVAE` -- and routes through `tokenizer(...)`,
+    not `VQVAE.forward`. `VQVAE.forward` alone would quantise the TS summary BEFORE the
+    cross-attention against the market ever runs (`world.py`'s `fused` is what the real
+    model quantises, AFTER fusion) -- a different vector. Measured: the two disagree on
+    the chosen word 64% of the time. Drawing from the wrong one would show the reader a
+    candle the trained model never actually said for this day.
     """
     import matplotlib.pyplot as plt
 
+    model = tokenizer.ts
     arrays, scaler = batches.arrays, batches.scaler
     grids = batches.ts["test"].dataset          # days it was never trained on
     if len(grids) == 0:
@@ -75,18 +113,17 @@ def remembered(model, batches, prices: pd.DataFrame, settings: dict,
     ticker = arrays.tickers[who]
     window = model.days
 
-    # What the token remembered.
-    model.eval()
-    where = next(model.parameters()).device
+    # What the token remembered -- through the REAL chain: encode, cross-attend
+    # against THAT day's market, then quantise. See the docstring above.
+    tokenizer.eval()
+    where = next(tokenizer.parameters()).device
+    market_grid, market_present = _market_grid_for_day(batches, tokenizer.cs, day)
     with torch.no_grad():
-        batch = {"grid": item["grid"].unsqueeze(0).to(where)}
-        out = model(batch)
-    word = int(out["ids"][0])
-    rebuilt = out["rebuilt"][0, 0].cpu().numpy() if "rebuilt" in out else None
-    if rebuilt is None:
-        with torch.no_grad():
-            rebuilt = model.rebuild(model.codebook(model.summarise(batch["grid"]))
-                                    ["snapped"])[0, 0].cpu().numpy()
+        out = tokenizer(item["grid"].unsqueeze(0).to(where),
+                        market_grid.to(where), market_present.to(where))
+        rebuilt = model.rebuild(out["ts_vector"])[0, 0].cpu().numpy()
+    word = int(out["ts_token"][0])
+    tokenizer.train()
 
     # Undo the normalisation, so we are back in the units the candle lives in.
     shape_cols = [arrays.names.index(c) for c in SHAPE]
@@ -116,34 +153,41 @@ def remembered(model, batches, prices: pd.DataFrame, settings: dict,
         fontsize=12, y=1.02,
     )
     fig.tight_layout()
-    model.train()
     return fig
 
 
-def kept_and_lost(model, batches, settings: dict, examples: int = 400):
+def kept_and_lost(tokenizer, batches, settings: dict, examples: int = 400):
     """Which of the 26 features survived the squeeze, and which were thrown away.
 
     A single word cannot carry everything. This says, feature by feature, how much
     of it came back — and being clear about what was DISCARDED is as informative as
     what was kept.
+
+    ⚠️ Same routing as `remembered()`: through `tokenizer(...)`, so the word being
+    scored here is the one the trained model actually assigns each day (encode ->
+    cross-attend against that day's market -> quantise), not the pre-fusion word a
+    bare `VQVAE.forward` would have picked.
     """
     import matplotlib.pyplot as plt
 
+    model = tokenizer.ts
     grids = batches.ts["test"].dataset
     names = batches.arrays.names
-    where = next(model.parameters()).device
+    where = next(tokenizer.parameters()).device
 
     real, said = [], []
-    model.eval()
+    tokenizer.eval()
     with torch.no_grad():
         for i in range(0, min(examples, len(grids))):
             item = grids[i]
+            day = int(item["day"])
             grid = item["grid"].unsqueeze(0).to(where)
-            out = model({"grid": grid})
-            back = model.rebuild(model.codebook(model.summarise(grid))["snapped"])
+            market_grid, market_present = _market_grid_for_day(batches, tokenizer.cs, day)
+            out = tokenizer(grid, market_grid.to(where), market_present.to(where))
+            back = model.rebuild(out["ts_vector"])
             real.append(grid[0, 0].cpu().numpy())
             said.append(back[0, 0].cpu().numpy())
-    model.train()
+    tokenizer.train()
 
     real = np.stack(real)                       # [n, days, features]
     said = np.stack(said)
@@ -162,6 +206,92 @@ def kept_and_lost(model, batches, settings: dict, examples: int = 400):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
     ax.grid(axis="x", alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    return fig
+
+
+def predicted_candles(world, book, batches, prices: pd.DataFrame, settings: dict,
+                      company: str | None = None, show: int = 8):
+    """What the model thinks tomorrow looks like, beside what tomorrow actually was.
+
+    The most directly readable thing the whole model produces. It never sees a candle
+    directly -- it reads a sentence of words and, for each day, draws the SHAPE of the
+    NEXT one (`gap`, `body`, the two wicks). Those four numbers are exactly invertible,
+    so given the previous close we can rebuild the whole candle and put the two side by
+    side, in real dollars.
+
+    `book` is one WINDOW of `predictor['sentence_length']` days, every company at once
+    (see `bubble_bi.data.sentences.Sentences`) -- so `world(...)` is run ONCE, over
+    every company in that window, and this simply picks which company's row to draw.
+    `world.forward`'s own `wanted = candle[:, 1:]` is what "one day ahead" means here:
+    `out["drawn"][company, k]` is the model's guess at `candle[k + 1]`, so its LAST
+    `show` rows line up exactly with the LAST `show` real candles.
+
+    ⚠️ Read this honestly. A model that has learned nothing draws a row of small,
+    near-identical candles — the average of everything, which is the safest guess when
+    you know nothing. Wide, varied predicted candles mean it is COMMITTING to
+    something. Whether it commits *correctly* is a separate question, and only the
+    numbers (section 8's own checks, `verify.joint`) answer it -- not this picture.
+    """
+    import matplotlib.pyplot as plt
+
+    from bubble_bi.models.world import CANDLE
+    from bubble_bi.training import _to, pick_device
+
+    where = pick_device(settings)
+    world.to(where).eval()
+
+    arrays = batches.arrays
+    dataset = book["test"].dataset               # the raw Sentences, not the loader
+    if len(dataset) == 0:
+        raise ValueError("No test sentences to show.")
+    item = dataset[len(dataset) // 2]             # a window from the middle of the test period
+    sentence_length = len(item["days"])
+    if show >= sentence_length:
+        raise ValueError(
+            f"`show` ({show}) must be smaller than the sentence length "
+            f"({sentence_length}) -- one day of history is needed BEFORE the first "
+            "candle shown, to invert its shape back into a price."
+        )
+
+    with torch.no_grad():
+        batch = _to({k: v.unsqueeze(0) for k, v in item.items()}, where)
+        out = world(batch)
+    world.train()
+
+    # Which company: the one asked for, or the one with the biggest real move over the
+    # shown window -- a flat week teaches the reader nothing.
+    if company:
+        who = arrays.tickers.index(company)
+    else:
+        moved = item["candle"][-show:, :, CANDLE.index("body")].abs().sum(dim=0)
+        who = int(moved.argmax())
+    ticker = arrays.tickers[who]
+
+    columns = [arrays.names.index(c) for c in CANDLE]
+    spread = batches.scaler.spread[who, columns]
+    middle = batches.scaler.middle[who, columns]
+
+    drawn = out["drawn"][who, -show:].cpu().numpy() * spread + middle
+    real = item["candle"][-show:, who, :].numpy() * spread + middle
+
+    days = item["days"].numpy()
+    shown_days = arrays.dates[days[-show:]]
+    before = prices.loc[(arrays.dates[days[-show - 1]], ticker), "close"]
+
+    truth = rebuild_candles(pd.DataFrame(real, columns=CANDLE, index=shown_days), before)
+    guess = rebuild_candles(pd.DataFrame(drawn, columns=CANDLE, index=shown_days), before)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+    _draw_candles(axes[0], truth, f"What actually happened — {ticker}")
+    _draw_candles(axes[1], guess, "What the model predicted, one day ahead")
+
+    span = pd.concat([truth, guess])
+    pad = (span["high"].max() - span["low"].min()) * 0.12
+    axes[0].set_ylim(span["low"].min() - pad, span["high"].max() + pad)
+    axes[0].set_ylabel("price ($)")
+    fig.suptitle("Each predicted candle was drawn knowing only the days BEFORE it",
+                 fontsize=11, y=1.02)
     fig.tight_layout()
     return fig
 
@@ -223,7 +353,60 @@ def progress(history, title: str = "TS"):
     return fig
 
 
-def kept_by_family(model, batches, settings: dict, examples: int = 600):
+def joint_progress(history, title: str = "Joint"):
+    """The joint run's own trajectory -- perplexity, and the forecast against its floor.
+
+    `progress()` above draws a single VQ-VAE's `History` (`rebuild`/`guessing`/
+    `words_used` columns, from `train()`). `train_joint`'s `History` rows carry a
+    completely different set (`drawing`/`shrugging`/`accuracy`/`persistence`/
+    `ts_perplexity`/`cs_perplexity` -- see `training.py`), and handing one to the other
+    would simply `KeyError`. This is that chart, for the joint run.
+
+    ⚠️ "Perplexity is the number to watch, from the first line" is this project's own
+    headline instruction for section 8 -- and until this function existed, there was no
+    chart of it at all: `world_history` was computed, returned, and thrown away. TWO
+    dictionaries are watched here, side by side, because either one collapsing (the
+    naming loss finding its way back into the vocabulary) is invisible in the loss curve
+    but never invisible here.
+
+    Returns None if there is no history — which happens when the model was LOADED from
+    disk rather than trained in this session.
+    """
+    import matplotlib.pyplot as plt
+
+    if history is None or not history.rows:
+        print(f"({title} was loaded from disk — no training history to plot.)")
+        return None
+
+    frame = history.frame()
+    fig, (ppl, draw) = plt.subplots(1, 2, figsize=(11, 3.8))
+
+    ppl.plot(frame.index, frame["ts_perplexity"], color="#1e88e5", marker="o", markersize=3,
+             label="TS")
+    ppl.plot(frame.index, frame["cs_perplexity"], color="#7e57c2", marker="o", markersize=3,
+             label="CS")
+    ppl.axhline(1, color="#ef5350", linestyle="--", linewidth=1, label="collapsed to one word")
+    ppl.set_title(f"{title} — words in use (perplexity)", loc="left", fontsize=11)
+    ppl.set_xlabel("step")
+    ppl.legend(fontsize=8, frameon=False)
+
+    draw.plot(frame.index, frame["drawing"], color="#26a69a", marker="o", markersize=3,
+              label="draws tomorrow's candle")
+    draw.plot(frame.index, frame["shrugging"], color="#ef5350", linestyle="--", linewidth=1,
+              label="shrugging (the average candle)")
+    draw.set_title(f"{title} — the forecast vs its floor", loc="left", fontsize=11)
+    draw.set_xlabel("step")
+    draw.legend(fontsize=8, frameon=False)
+
+    for ax in (ppl, draw):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.grid(alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    return fig
+
+
+def kept_by_family(tokenizer, batches, settings: dict, examples: int = 600):
     """How much of each FAMILY of features survived — the honest headline.
 
     "The token explains 44% of a held-out day" is an average over 26 features, and it is
@@ -235,22 +418,31 @@ def kept_by_family(model, batches, settings: dict, examples: int = 600):
     SMOOTH CURVE — a few numbers describe it. Fifteen days of candle bodies are fifteen
     INDEPENDENT RANDOM NUMBERS — incompressible. The token spends its 9 bits on what can
     actually be compressed, and there is no way for it not to.
+
+    ⚠️ Same routing as `remembered()`: through `tokenizer(...)`, not `VQVAE.forward` --
+    see that function's docstring for why the two disagree on the chosen word 64% of
+    the time, and how misleading it would be to draw this chart against the wrong one.
     """
     import matplotlib.pyplot as plt
 
+    model = tokenizer.ts
     grids = batches.ts["test"].dataset
     names = batches.arrays.names
-    where = next(model.parameters()).device
+    where = next(tokenizer.parameters()).device
 
     real, said = [], []
-    model.eval()
+    tokenizer.eval()
     with torch.no_grad():
         for i in range(min(examples, len(grids))):
-            grid = grids[i]["grid"].unsqueeze(0).to(where)
-            back = model.rebuild(model.codebook(model.summarise(grid))["snapped"])
+            item = grids[i]
+            day = int(item["day"])
+            grid = item["grid"].unsqueeze(0).to(where)
+            market_grid, market_present = _market_grid_for_day(batches, tokenizer.cs, day)
+            out = tokenizer(grid, market_grid.to(where), market_present.to(where))
+            back = model.rebuild(out["ts_vector"])
             real.append(grid[0, 0].cpu().numpy())
             said.append(back[0, 0].cpu().numpy())
-    model.train()
+    tokenizer.train()
 
     real, said = np.stack(real), np.stack(said)
     kept = 1 - ((real - said) ** 2).mean(axis=(0, 1)) / np.maximum(

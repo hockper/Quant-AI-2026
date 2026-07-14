@@ -344,6 +344,7 @@ class WorldModel(nn.Module):
 
         return {
             "loss": loss,
+            "drawn": drawn,                   # the model's OWN predicted candle -- see plots.predicted_candles
             "drawing_loss": drawing,
             "naming_loss": naming,
             "recon_loss": recon_loss,

@@ -380,6 +380,12 @@ def joint(world, history, book: dict, settings: dict) -> None:
     its own vocabulary and is then graded on predicting it, so "make every day the same
     word" scores perfectly — we measured exactly that once, 92% accuracy at perplexity
     2.2. If perplexity is healthy here, the naming loss's detached copy is doing its job.
+
+    `history` is `train_joint`'s own record of every check made DURING training --
+    where perplexity started, not just where it ended up. A dictionary that opens early
+    and then quietly narrows back down would still pass the checks below (they only
+    read the FINAL state), so the trajectory is worth a line of its own -- and worth
+    plotting: see `bb.plots.joint_progress`.
     """
     from bubble_bi.training import pick_device, score_joint
 
@@ -387,6 +393,12 @@ def joint(world, history, book: dict, settings: dict) -> None:
     alive = min(scored["ts_perplexity"], scored["cs_perplexity"])
     beats_shrug = scored["drawing"] < scored["shrugging"]
     beats_persist = scored["accuracy"] > scored["persistence"]
+
+    rows = history.rows if history is not None else []
+    trajectory = (
+        f"TS {rows[0]['ts_perplexity']:.0f} → {rows[-1]['ts_perplexity']:.0f}, "
+        f"CS {rows[0]['cs_perplexity']:.0f} → {rows[-1]['cs_perplexity']:.0f} over the run"
+    ) if rows else "loaded from disk — no training history this session"
 
     report(
         "8. Everything, at once",
@@ -402,6 +414,9 @@ def joint(world, history, book: dict, settings: dict) -> None:
         One model. The encoders, both codebooks, the fusion and the GPT were all
         shaped by the same thing: tomorrow.
         Each day is two words — this stock, and the market.
+        Perplexity over the run: {trajectory}.
+        See it drawn: bb.plots.joint_progress(world_history) -- perplexity is the
+        number to watch, from the first line.
         """,
         known_problem=(
             None if (alive > 20 and beats_shrug) else

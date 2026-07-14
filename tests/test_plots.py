@@ -45,25 +45,72 @@ def world():
     return model, batches, prices, settings, history
 
 
-def test_the_candle_plot_draws_the_real_days_and_the_remembered_ones(world):
-    model, batches, prices, settings, _ = world
-    fig = bb.plots.remembered(model, batches, prices, settings)
+@pytest.fixture
+def joint():
+    """A tiny but complete JOINT world: prices, features, grids, sentences, and a
+    briefly-trained `WorldModel` -- everything `remembered`/`kept_and_lost`/
+    `kept_by_family`/`predicted_candles` now need to route through the REAL chain
+    (encode -> cross-attend against that day's market -> quantise), not a bare `VQVAE`
+    with no fusion at all.
+    """
+    rng = np.random.default_rng(0)
+    days = pd.date_range("2015-01-01", periods=800, freq="B", name="date")
+    frames = []
+    for ticker, level in (("AAA", 20.0), ("BBB", 300.0), ("CCC", 60.0)):
+        close = level * np.exp(np.cumsum(rng.normal(0, 0.02, len(days))))
+        open_ = close * (1 + rng.normal(0, 0.008, len(days)))
+        top, bottom = np.maximum(open_, close), np.minimum(open_, close)
+        one = pd.DataFrame(
+            {"open": open_, "high": top * (1 + rng.uniform(0, 0.02, len(days))),
+             "low": bottom * (1 - rng.uniform(0, 0.02, len(days))), "close": close,
+             "volume": rng.uniform(1e6, 5e6, len(days))},
+            index=days,
+        )
+        one["target"] = one["close"].shift(-1) / one["close"] - 1.0
+        one["ticker"] = ticker
+        frames.append(one.reset_index())
+    prices = pd.concat(frames).set_index(["date", "ticker"]).sort_index()
+
+    settings = bb.check({
+        "tickers": ["AAA", "BBB", "CCC"], "learning_rate": 3e-3, "model_size": 32,
+        "ts": {"batch": 32, "heads": 2, "vocabulary": 16},
+        "cs": {"batch": 16, "heads": 2, "vocabulary": 16},
+        "fusion": {"attend_to": "companies", "batch": 8},
+        "predictor": {"sentence_length": 6, "depth": 1},
+    })
+    data = bb.data.add_features(prices, settings)
+    batches = bb.data.make_tensors(data, settings)
+    book = bb.data.make_sentences(batches, settings)
+
+    torch.manual_seed(0)
+    n_features = len(bb.data.names())
+    ts = VQVAE(companies=1, features=n_features, width=32, **settings["ts"])
+    cs = VQVAE(companies=3, features=n_features, width=32, **settings["cs"])
+    tokenizer = bb.models.Tokenizer(ts, cs, model_size=32, **settings["fusion"])
+    model = bb.models.WorldModel(tokenizer, sentence=6, depth=1, heads=2, **settings["loss"])
+    history = bb.train_joint(model, book, settings, steps=20, quiet=True)
+    return tokenizer, model, book, batches, prices, settings, history
+
+
+def test_the_candle_plot_draws_the_real_days_and_the_remembered_ones(joint):
+    tokenizer, _, _, batches, prices, settings, _ = joint
+    fig = bb.plots.remembered(tokenizer, batches, prices, settings)
     left, right = fig.axes
     assert "actually happened" in left.get_title(loc="left")
     assert "remembered" in right.get_title(loc="left")
     # one wick line + one body rectangle per day, on each side
-    assert len(left.lines) == model.days
-    assert len(right.lines) == model.days
+    assert len(left.lines) == tokenizer.ts.days
+    assert len(right.lines) == tokenizer.ts.days
 
 
-def test_the_remembered_candles_are_a_real_inversion_not_a_redraw(world):
+def test_the_remembered_candles_are_a_real_inversion_not_a_redraw(joint):
     """The plot must show what the MODEL said, not quietly redraw the truth.
 
     If the two panels were identical, the demo would be a lie. They must differ --
     the whole point is that a single word cannot carry everything.
     """
-    model, batches, prices, settings, _ = world
-    fig = bb.plots.remembered(model, batches, prices, settings)
+    tokenizer, _, _, batches, prices, settings, _ = joint
+    fig = bb.plots.remembered(tokenizer, batches, prices, settings)
     left, right = fig.axes
 
     real = np.array([line.get_ydata() for line in left.lines])
@@ -88,9 +135,9 @@ def test_the_candle_inversion_is_exact_when_given_the_true_shape():
     assert np.isclose(back["open"].iloc[0], 100.0 * np.exp(0.01))
 
 
-def test_the_kept_and_lost_chart_names_every_feature(world):
-    model, batches, _, settings, _ = world
-    fig = bb.plots.kept_and_lost(model, batches, settings, examples=32)
+def test_the_kept_and_lost_chart_names_every_feature(joint):
+    tokenizer, _, _, batches, _, settings, _ = joint
+    fig = bb.plots.kept_and_lost(tokenizer, batches, settings, examples=32)
     labels = [t.get_text() for t in fig.axes[0].get_yticklabels()]
     assert sorted(labels) == sorted(bb.data.names())
 
@@ -117,16 +164,52 @@ def test_progress_survives_a_model_that_was_loaded_rather_than_trained():
     assert bb.plots.progress(None, "TS") is None
 
 
-def test_the_family_breakdown_shows_what_the_headline_average_is_hiding(world):
+def test_the_family_breakdown_shows_what_the_headline_average_is_hiding(joint):
     """'explains 44%' is an average over 26 features, carried by the easy ones. Broken
     apart it says something quite different — and that is the number worth reporting."""
-    model, batches, _, settings, _ = world
-    fig, frame = bb.plots.kept_by_family(model, batches, settings, examples=48)
+    tokenizer, _, _, batches, _, settings, _ = joint
+    fig, frame = bb.plots.kept_by_family(tokenizer, batches, settings, examples=48)
 
     assert sorted(frame.index) == sorted(bb.data.FAMILIES)
     assert "average" in fig.axes[0].get_title(loc="left")
     # every family gets a number, and they are not all the same
     assert frame.notna().all()
+
+
+def test_the_predicted_candles_chart_draws_real_and_predicted_side_by_side(joint):
+    """The most directly readable output the project produces -- restored after Task 7
+    deleted it because `WorldModel.forward` did not yet return `drawn`."""
+    _, model, book, batches, prices, settings, _ = joint
+    fig = bb.plots.predicted_candles(model, book, batches, prices, settings, show=4)
+    left, right = fig.axes
+    assert "actually happened" in left.get_title(loc="left")
+    assert "predicted" in right.get_title(loc="left")
+    assert len(left.lines) == len(right.lines) > 0
+
+
+def test_the_predicted_candles_are_a_real_forecast_not_a_redraw(joint):
+    _, model, book, batches, prices, settings, _ = joint
+    fig = bb.plots.predicted_candles(model, book, batches, prices, settings, show=4)
+    left, right = fig.axes
+    real = np.array([line.get_ydata() for line in left.lines])
+    said = np.array([line.get_ydata() for line in right.lines])
+    assert real.shape == said.shape
+    assert not np.allclose(real, said)
+
+
+def test_joint_progress_shows_perplexity_and_the_forecast_vs_its_floor(joint):
+    *_, history = joint
+    fig = bb.plots.joint_progress(history, "Joint")
+    ppl, draw = fig.axes
+    assert "perplexity" in ppl.get_title(loc="left")
+    assert "floor" in draw.get_title(loc="left")
+    labels = [line.get_label() for line in ppl.lines]
+    assert any("TS" == l for l in labels)
+    assert any("CS" == l for l in labels)
+
+
+def test_joint_progress_survives_a_model_that_was_loaded_rather_than_trained():
+    assert bb.plots.joint_progress(None, "Joint") is None
 
 
 def test_tuning_importance_ranks_the_knob_that_actually_moved_the_score():
