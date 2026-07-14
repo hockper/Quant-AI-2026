@@ -335,53 +335,6 @@ class _Progress:
 
 
 @torch.no_grad()
-def score_predictions(world, loader, where: torch.device, limit: int = 30) -> dict:
-    """How often does the GPT name the next day's word correctly?
-
-    Scored against two floors, because "58% correct" means nothing on its own:
-
-      chance      1 / vocabulary. What you would get by guessing at random.
-      persistence just say TOMORROW LOOKS LIKE TODAY. This is the honest floor, and it
-                  is a HIGH one -- market regimes are sticky, so yesterday's word is
-                  usually still right today. A predictor that cannot beat persistence
-                  has learned nothing worth having, however good its accuracy looks.
-    """
-    world.to(where).eval()
-    right = sticky = seen = 0
-    perplexity, drawing, shrugging, batches = 0.0, 0.0, 0.0, 0
-
-    for i, batch in enumerate(loader):
-        if i >= limit:
-            break
-        out = world(_to(batch, where))
-        tokens = out["tokens"]                       # [B, T]
-        said = out["said"].argmax(-1)                # [B, T-1]
-        answer = tokens[:, 1:]
-
-        right += int((said == answer).sum())
-        sticky += int((tokens[:, :-1] == answer).sum())     # "same as yesterday"
-        seen += answer.numel()
-        perplexity += float(out["perplexity"])
-        drawing += float(out.get("drawing_loss", float("nan")))
-        shrugging += float(out.get("shrugging", float("nan")))
-        batches += 1
-
-    world.train()
-    if not seen:
-        return {"accuracy": float("nan"), "persistence": float("nan"),
-                "chance": float("nan"), "perplexity": 0.0,
-                "candle": float("nan"), "shrugging": float("nan")}
-    return {
-        "accuracy": right / seen,
-        "persistence": sticky / seen,
-        "chance": 1 / world.words,
-        "perplexity": perplexity / max(batches, 1),
-        "candle": drawing / max(batches, 1),        # how well it DRAWS tomorrow
-        "shrugging": shrugging / max(batches, 1),   # ...vs drawing the average candle
-    }
-
-
-@torch.no_grad()
 def score_joint(world, loader, where: torch.device, limit: int = 30) -> dict:
     """How the joint model is doing, against its two HONEST floors.
 
@@ -424,9 +377,32 @@ def train_joint(world, loaders: dict, settings: dict, steps: int | None = None,
     `cs_perplexity` from step one -- they are printed every check, from the very first
     one. If they never open, the cold start has dead-locked -- and the fix is a 300-step
     reconstruction-only warm-up, added WITH EVIDENCE rather than on principle.
+
+    ⚠️ MEASURED, not assumed: a cold start's codebook does NOT climb out of that opening
+    collapse on its own. Not via the reconstruction anchor, not via the diversity loss,
+    however high it is turned up. Perplexity sat at EXACTLY 1.0 -- one word for
+    everything -- at every single check before the first dead-word revival, in every
+    run tried. The ONLY thing that opens the dictionary is `revive_dead_words()`:
+    dropping the words nobody is choosing onto real encoder output, so they have
+    somewhere realistic to compete from.
+
+    That makes `revive_every` load-bearing, not a tuning detail -- and it sets a trap.
+    `check_every` defaults to `steps // 10`. On any run shorter than about 500 steps,
+    that is SMALLER than `revive_every`'s default of 50 -- so the first time this
+    function judges the model (and, with `patience` checks of no improvement, decides
+    whether to throw it away) can land BEFORE the codebook has ever had one revival.
+    A run would then be scored, and possibly killed, on a dictionary that never had a
+    chance to open -- while the loss curve looks perfectly reasonable the whole time.
+
+    So we clamp `revive_every` down to at most `check_every`: at least one revival is
+    guaranteed before the first check, always.
     """
     steps = steps or settings["steps"]
     check_every = check_every or max(1, steps // 10)
+    # See the docstring above: a revival must land before the first judgement of the
+    # model, or the very first check (and possibly the whole run, via early stopping)
+    # can be decided on a codebook that has never once been given the chance to open.
+    revive_every = min(revive_every, max(1, check_every))
     where = pick_device(settings)
     world.to(where).train()
 

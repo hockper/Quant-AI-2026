@@ -389,17 +389,51 @@ def test_a_joint_run_keeps_BOTH_dictionaries_alive():
     """
     from bubble_bi.training import train_joint
 
-    # ⚠️ `_tiny_joint()` seeds itself (see its own docstring): this run's cold start is
-    # genuinely bimodal (dead lock vs. escape) on a 60-step budget with only one
-    # dead-word revival in it, so the fixture pins `torch.manual_seed` to a value
-    # measured to escape with a comfortable margin, rather than leaving that to
-    # whatever the global RNG happens to be here.
+    # ⚠️ `_tiny_joint()` seeds itself (see its own docstring) -- but NOT to dodge a coin
+    # flip. This run's cold start on a 60-step budget used to be genuinely bimodal (dead
+    # lock vs. escape, ~45% of seeds surviving); it is now reliable because
+    # `train_joint`'s own `revive_every <= check_every` clamp guarantees a revival lands
+    # before the first check, and the fixture's vocabulary/batch were widened for
+    # margin. Proven, not assumed: this test passes on at least ten different seeds, not
+    # just the one pinned below -- see `_tiny_joint`'s own docstring for the sweep.
     world, loaders, settings = _tiny_joint()
     history = train_joint(world, loaders, settings, steps=60, quiet=True)
     last = history.last()
 
     assert last["ts_perplexity"] > 2.0, f"the TS dictionary collapsed: {last}"
     assert last["cs_perplexity"] > 2.0, f"the CS dictionary collapsed: {last}"
+
+
+def test_train_joint_revives_before_the_first_check_even_on_a_short_run():
+    """⚠️ THE GUARD THAT KEEPS THE COLD START FROM BEING JUDGED BEFORE IT HAS A CHANCE.
+
+    Measured directly: the codebook starts FULLY COLLAPSED (perplexity exactly 1.0) and
+    does NOT climb out on its own -- not via the reconstruction anchor, not via the
+    diversity loss however high it is turned up. Only `revive_dead_words()` opens it.
+
+    `check_every` defaults to `steps // 10`. For this fixture's 60-step run that is 6 --
+    smaller than `revive_every`'s default of 50. Without a guard, the very first check
+    (and, with bad luck, early stopping ending the whole run) would judge a codebook
+    that has never once been revived. `train_joint` must clamp `revive_every` down to
+    at most `check_every` so a revival always lands at or before the first check.
+
+    Delete that clamp and this fails: the first check (step 6) would land 44 steps
+    before the first scheduled revival (step 50), so `revived` would still be 0 at the
+    first row.
+    """
+    from bubble_bi.training import train_joint
+
+    world, loaders, settings = _tiny_joint()
+    # revive_every is left at its default (50) on purpose -- check_every (steps // 10 =
+    # 6, for steps=60) is smaller, which is exactly the trap the clamp exists to close.
+    # patience=99 so early stopping cannot cut the run short before we get to look.
+    history = train_joint(world, loaders, settings, steps=60, patience=99, quiet=True)
+
+    first = history.rows[0]
+    assert first["revived"] > 0, (
+        "the first check happened before any dead-word revival ever fired -- "
+        "train_joint's revive_every <= check_every clamp is missing or broken"
+    )
 
 
 def test_a_joint_run_reports_both_honest_floors():

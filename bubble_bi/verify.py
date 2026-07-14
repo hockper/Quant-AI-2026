@@ -371,69 +371,6 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         print("     Train for longer on a GPU before reading anything into these numbers.")
 
 
-def predictor(world, history, loaders, settings: dict) -> None:
-    """Section 10: the world model, scored against the floors that actually matter."""
-    from bubble_bi.training import pick_device, score_predictions
-
-    scored = score_predictions(world, loaders["test"], pick_device(settings))
-    words = world.words
-
-    named = scored["accuracy"]
-    sticky = scored["persistence"]
-    drew = scored["candle"]
-    shrug = scored["shrugging"]
-    perplexity = scored["perplexity"]
-
-    # The only floor worth measuring against. Regimes are sticky, so "tomorrow's word is
-    # the same as today's" is right most of the time -- and any accuracy below it means
-    # the model has learned nothing worth having, however impressive the number looks.
-    beats_persistence = named > sticky
-    beats_shrugging = drew < shrug
-    alive = perplexity > words * 0.05
-
-    report(
-        "The predictor",
-        [
-            ("Names tomorrow's regime", True,
-             f"{named:.1%} — vs {sticky:.1%} for just saying 'same as today'"),
-            ("...and beats that floor", beats_persistence,
-             "the honest bar" if beats_persistence
-             else "NO — it is worse than doing nothing"),
-            ("Draws tomorrow's candle", beats_shrugging,
-             f"{drew:.3f} — vs {shrug:.3f} for drawing the average candle"),
-            ("Dictionary still alive", alive,
-             f"perplexity {perplexity:.0f} of {words}"),
-            ("Scored on unseen days", True, "the test period, never trained on"),
-        ],
-        have=f"""
-        A model that reads a company's last {world.sentence} days as a sentence of words
-        and answers two questions about tomorrow: which word comes next, and what candle
-        comes with it. Both are scored against a floor, not against zero.
-        """,
-        # These two failures are UNDERSTOOD and written down. The ❌ stays -- we do not
-        # dress up a bad result -- but they do not stop the notebook, because they are an
-        # open research question, not broken code.
-        known_problem=(
-            "The codebook collapses and the model loses to persistence. This is "
-            "diagnosed, not fixed:\n     docs/OPEN-QUESTION-codebook-collapse.md"
-        ) if not (beats_persistence and alive) else None,
-    )
-
-    if not beats_persistence:
-        print("\n  ⚠️  IT DOES NOT BEAT PERSISTENCE, and that is the number that matters.")
-        print("     Regimes are sticky, so 'same as yesterday' is a high bar. Until the")
-        print("     model clears it, its accuracy means nothing at all.")
-        print("\n     For the paper: the previous version of this project reported")
-        print("     '58.6% next-token accuracy' against a much weaker baseline.")
-        print("     Against THIS floor it would not have cleared it either.")
-    if not alive:
-        print(f"\n  ⚠️  The codebook has collapsed to ~{perplexity:.0f} words of {words}.")
-        print("     The model found the shortcut: make every day the same word, and the")
-        print("     next word becomes trivially easy to predict. The candle head is meant")
-        print("     to punish that — but drawing tomorrow is so hard that it barely")
-        print("     produces a gradient, so an empty token is never punished enough.")
-
-
 def market_moods(evidence: dict) -> None:
     """Section 9b: do the CS tokens actually know what the market did?
 
