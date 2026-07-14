@@ -77,6 +77,17 @@ def test_the_notebook_never_invents_a_setting_that_does_not_exist(block):
     assert not unknown, f"SETTINGS[{block!r}] invents settings the project has never heard of: {sorted(unknown)}"
 
 
+def test_the_notebook_has_no_two_stage_training_left():
+    """Sections 8 and 10 trained TS and CS separately, then froze them. That IS the design
+    this rewrite replaces -- leaving them would train the tokenizer for the wrong objective
+    and then quietly overwrite it."""
+    source = "\n".join("".join(c["source"]) for c in _cells())
+    assert "bb.train(ts" not in source, "TS is still being trained on its own"
+    assert "bb.train(cs" not in source, "CS is still being trained on its own"
+    assert "bb.keep.load(ts" not in source, "a separately-trained TS is still being loaded"
+    assert "train_joint" in source, "the joint trainer is not in the notebook"
+
+
 def test_the_notebook_is_committed_unrun():
     """Stored outputs would carry stale numbers — and, once, a pasted token. It is run on
     Colab, never here."""

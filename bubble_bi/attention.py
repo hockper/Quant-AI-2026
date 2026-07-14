@@ -48,6 +48,13 @@ def gather(world, book, batches: int | None, settings: dict, period: str = "test
     every batch it reads, which is materially more expensive. `batches` is the knob for
     that cost: how many batches of the loader to read before stopping. `None` reads the
     whole period.
+
+    ⚠️ `book` is whatever `bubble_bi.data.make_sentences()` returns TODAY: a plain
+    {"learn": ..., "tune": ..., "test": ...} of DataLoaders, not nested under a
+    "loaders" key. That nesting belonged to the old cached-latent `make_sentences()`
+    (which also returned a "memory" of frozen encoder output) and this function was
+    never updated when that was rewritten for raw-grid, jointly-trained sentences --
+    nothing caught it because the test below builds its own `book` by hand.
     """
     from bubble_bi.training import _to, pick_device
 
@@ -58,7 +65,7 @@ def gather(world, book, batches: int | None, settings: dict, period: str = "test
     total = None
     seen = 0
 
-    for i, batch in enumerate(book["loaders"][period]):
+    for i, batch in enumerate(book[period]):
         if batches is not None and i >= batches:
             break
         out = world(_to(batch, where))

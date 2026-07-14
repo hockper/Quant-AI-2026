@@ -371,6 +371,47 @@ def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
         print("     Train for longer on a GPU before reading anything into these numbers.")
 
 
+def joint(world, history, book: dict, settings: dict) -> None:
+    """Section 8: everything trained at once — and did the language survive?
+
+    Judged against its FLOORS, never against zero: persistence ("tomorrow's word is
+    today's word") and shrugging ("draw the average candle"). And against the one
+    number that must never be allowed to drift quietly: perplexity. This model invents
+    its own vocabulary and is then graded on predicting it, so "make every day the same
+    word" scores perfectly — we measured exactly that once, 92% accuracy at perplexity
+    2.2. If perplexity is healthy here, the naming loss's detached copy is doing its job.
+    """
+    from bubble_bi.training import pick_device, score_joint
+
+    scored = score_joint(world, book["tune"], pick_device(settings))
+    alive = min(scored["ts_perplexity"], scored["cs_perplexity"])
+    beats_shrug = scored["drawing"] < scored["shrugging"]
+    beats_persist = scored["accuracy"] > scored["persistence"]
+
+    report(
+        "8. Everything, at once",
+        [
+            ("Both dictionaries alive", alive > 20,
+             f"TS {scored['ts_perplexity']:.0f}, CS {scored['cs_perplexity']:.0f} words in use"),
+            ("Draws tomorrow better than shrugging", beats_shrug,
+             f"{scored['drawing']:.3f} vs {scored['shrugging']:.3f}"),
+            ("Names tomorrow better than persistence", beats_persist,
+             f"{scored['accuracy']:.1%} vs {scored['persistence']:.1%}"),
+        ],
+        have=f"""
+        One model. The encoders, both codebooks, the fusion and the GPT were all
+        shaped by the same thing: tomorrow.
+        Each day is two words — this stock, and the market.
+        """,
+        known_problem=(
+            None if (alive > 20 and beats_shrug) else
+            "The dictionary collapsed, or the model cannot beat shrugging. Perplexity is the "
+            "one to read first: if it is near 1, the naming loss found its way back into the "
+            "vocabulary and everything else is meaningless."
+        ),
+    )
+
+
 def market_moods(evidence: dict) -> None:
     """Section 9b: do the CS tokens actually know what the market did?
 

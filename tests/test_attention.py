@@ -165,7 +165,10 @@ def test_every_company_is_measured_not_just_the_first_few():
                                     attend_to="cells")
     world = bb.models.WorldModel(tokenizer, sentence=sentence, depth=1, heads=2)
 
-    book = {"loaders": {"test": DataLoader(_Sentences(), batch_size=3, shuffle=False)}}
+    # `make_sentences()` returns a plain {period: DataLoader} dict, not nested under a
+    # "loaders" key -- see the note on `gather()` about why that nesting used to exist
+    # and why it was wrong to keep expecting it.
+    book = {"test": DataLoader(_Sentences(), batch_size=3, shuffle=False)}
     settings = bb.check({"tickers": [f"T{i}" for i in range(companies)]})
 
     read = gather(world, book, None, settings)
