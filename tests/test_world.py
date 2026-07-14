@@ -387,6 +387,61 @@ def test_world_model_delegates_to_tokenizer_forward_not_a_parallel_copy():
     )
 
 
+def test_the_forecast_target_is_TOMORROWS_candle_not_todays():
+    """⚠️ THE GUARD FOR THE WORST MISTAKE THIS FILE COULD MAKE.
+
+    `world.py` builds the forecast target as `candle[:, 1:]` -- TOMORROW's candle.
+    Change one character (`candle[:, :-1]`, TODAY's candle instead) and every other
+    test in this file keeps passing, because `ts_grid` for day `d` ENDS on day `d`:
+    the candle features (`gap`, `body`, `upper_wick`, `lower_wick`) are columns of
+    that very same window. Today's candle is the last row of the model's own input.
+    With the mutation, the model would simply be COPYING what it was just handed --
+    `drawing_loss` would collapse toward zero, every "beats shrugging" check would
+    light up green, and the notebook would report a triumph over having learned
+    nothing at all.
+
+    Catch it by perturbing ONE day of `candle` at a time and watching which day's
+    perturbation moves `drawing_loss`:
+
+      the LAST day of the sentence   is "tomorrow" for the position just before it,
+                                      so it MUST be part of the target.
+      the FIRST day of the sentence  is nobody's "tomorrow" -- nothing comes before
+                                      it -- so it must NOT be part of the target.
+
+    Under the `candle[:, :-1]` mutation both flip: the last day drops out of the
+    target entirely (nothing predicts it any more) and the first day (today, for
+    the very first position) enters it -- which is exactly the lookahead.
+    """
+    world, batch = _tiny_world()
+    world.eval()
+
+    def drawing_loss(perturb_day: int) -> float:
+        altered = batch["candle"].clone()
+        altered[:, perturb_day] += 100.0
+        with torch.no_grad():
+            out = world({**batch, "candle": altered})
+        return float(out["drawing_loss"])
+
+    with torch.no_grad():
+        baseline = float(world(batch)["drawing_loss"])
+
+    last_day_moved = drawing_loss(-1) != baseline
+    first_day_moved = drawing_loss(0) != baseline
+
+    assert last_day_moved, (
+        "perturbing the LAST day of the sentence did not move `drawing_loss` -- the "
+        "target does not reach as far as tomorrow. If `wanted = candle[:, 1:]` has "
+        "been changed to `candle[:, :-1]`, this is exactly what happens: the last day "
+        "never gets predicted at all."
+    )
+    assert not first_day_moved, (
+        "perturbing the FIRST day of the sentence moved `drawing_loss` -- TODAY's "
+        "candle is part of the forecast target. `ts_grid` for a day ENDS on that day, "
+        "so today's candle is the last row of the model's own input: the model would "
+        "be scored on copying what it was just handed, not on predicting tomorrow."
+    )
+
+
 def test_the_loss_weights_are_obeyed():
     """`predict`/`naming`/`recon` must actually reach the total, not just be accepted."""
     world, batch = _tiny_world(predict=2.0, naming=0.3, recon=0.5)
