@@ -176,28 +176,3 @@ def moods_plot(evidence: dict, top: int = 14):
     )
     fig.tight_layout()
     return fig
-
-
-def timeline_plot(evidence: dict):
-    """The market's moves, coloured by the word the model gave each day.
-
-    If the colours cluster — one set of words during calm stretches, another during
-    turmoil — the tokenizer found the regimes on its own.
-    """
-    import matplotlib.pyplot as plt
-
-    dates = evidence["dates"]
-    moved = evidence["truth"].get("how far it moved")
-    tokens = evidence["tokens"]
-
-    fig, ax = plt.subplots(figsize=(11, 3.6))
-    ax.scatter(dates, moved * 100, c=tokens % 20, cmap="tab20", s=9, alpha=0.85)
-    ax.axhline(0, color="#444", linewidth=0.8)
-    ax.set_ylabel("market move (%)")
-    ax.set_title("Every day of the test period, coloured by its word",
-                 loc="left", fontsize=11)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    ax.grid(alpha=0.25, linewidth=0.5)
-    fig.tight_layout()
-    return fig

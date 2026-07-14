@@ -57,18 +57,29 @@ DEFAULTS: dict = {
         "diversity": 0.1,
         "decay": 0.99,
     },
-    # Where the two entries merge into the single token we keep.
-    #   "days"       one vector per market day   (5 keys)  -- what the paper does
-    #   "companies"  one vector per company      (30 keys)
-    #   "cells"      every (company, day)        (150 keys)
+    # Where the market reaches each company — BEFORE its codebook quantises it. After a
+    # 9-bit quantisation the fine detail the attention needs is already destroyed, so this
+    # is the only place it can happen.
+    #
+    # `attend_to` decides the menu the market offers:
+    #   "companies"  one vector per company  (30 keys) -- a bank can attend to banks
+    #   "cells"      every (company, day)             -- richest; identical to "companies"
+    #                                                    when cs["days"] == 1
+    #   "days"       one vector per market day        -- ⚠️ ONE KEY at cs["days"] == 1,
+    #                                                    which makes the attention a no-op
+    #                                                    (see `check()` below)
+    #
+    # TS and CS still keep their OWN codebooks, each anchored by rebuilding its own grid
+    # (see `loss['recon']`) -- their `commitment`/`diversity`/`decay` live in the `ts`/`cs`
+    # blocks above. There is no THIRD, fused codebook any more: that was the one the
+    # predictor ever saw, and the one we watched collapse to 10 words of 512. `Tokenizer`
+    # therefore has no codebook knobs of its own to configure -- putting `commitment`/
+    # `diversity`/`decay` here would be exactly the decorative setting this project keeps
+    # tripping over: accepted, validated, and handed to nothing.
     "fusion": {
-        "vocabulary": 512,
         "depth": 2,
-        "attend_to": "days",
+        "attend_to": "companies",
         "batch": 32,
-        "commitment": 0.25,
-        "diversity": 0.1,
-        "decay": 0.99,
     },
     # The GPT that reads sentences of tokens.
     "predictor": {
@@ -76,17 +87,28 @@ DEFAULTS: dict = {
         "depth": 4,
     },
 
-    # The PREDICTOR's two heads. (commitment and diversity used to live here, which was
-    # the bug: they belong to a codebook, and there are three codebooks.)
+    # THE JOINT OBJECTIVE. Everything -- both encoders, both codebooks, the fusion, the
+    # predictor -- trains at once, against these three.
     #
-    #   naming   predict tomorrow's WORD. ⚠️ This one rewards CHEATING: make every day the
-    #            same word and it is trivially satisfied. We watched "accuracy" hit 87%
-    #            on a 3-word codebook. The paper keeps it small (0.1); so do we.
-    #   candle   draw tomorrow's CANDLE. The anchor: a collapsed token carries no
-    #            information, so it cannot draw a candle, which makes the cheat expensive.
+    #   predict   tomorrow's CANDLE. The real objective -- the only target the model
+    #             cannot manufacture for itself.
+    #   naming    tomorrow's WORD. ⚠️ Historically the loss that ATE THE VOCABULARY: the
+    #             model invents its own words and is then graded on guessing them, so
+    #             making every day the same word scores perfectly. Measured: 92% accuracy
+    #             at perplexity 2.2. It is safe now only because `WorldModel` computes it
+    #             from a DETACHED copy of the tokens -- see `world.py`. Keep it small: the
+    #             candle carries the objective, naming only rides along.
+    #   recon     rebuild today's TS grid and today's CS grid. THE ANCHOR. Every codebook
+    #             in this project that had one stayed healthy (TS perplexity 157); the one
+    #             that did not, collapsed (fusion, 10 of 512).
+    #             ⚠️ STORM reports 1e-3 here. DO NOT COPY IT. Their reconstruction is a
+    #             Frobenius norm -- a SUM over millions of elements -- and ours is a
+    #             `.mean()`. 1e-3 on a sum of 4M terms is an enormous weight on the mean;
+    #             copying the number would silently DELETE the anchor.
     "loss": {
+        "predict": 1.0,
         "naming": 0.1,
-        "candle": 1.0,
+        "recon": 1.0,
     },
 
     # Finding the settings above, by measuring instead of guessing. OFF by default:
@@ -131,7 +153,7 @@ _POSITIVE = {
     ("model_size",), ("steps",),
 }
 # Settings that must be a vocabulary of at least two words.
-_VOCAB = {("ts", "vocabulary"), ("cs", "vocabulary"), ("fusion", "vocabulary")}
+_VOCAB = {("ts", "vocabulary"), ("cs", "vocabulary")}
 
 
 def _where(path: tuple[str, ...]) -> str:
@@ -193,9 +215,25 @@ def check(settings: dict) -> dict:
     attend = out["fusion"]["attend_to"]
     if attend not in ("days", "companies", "cells"):
         raise ValueError(
-            f"`fusion['attend_to']` must be 'days', 'companies' or 'cells' — "
-            f"got {attend!r}. It decides how fine-grained a menu the market offers "
-            "each company's token to read."
+            f"`fusion['attend_to']` must be 'days', 'companies' or 'cells' — got {attend!r}."
+        )
+
+    # ⚠️ How many keys does the market actually offer? If the answer is ONE, the
+    # cross-attention is a NO-OP: softmax over a single key is identically 1.0, every
+    # company receives the same market vector, and no gradient can ever change that. This
+    # is not a weak attention. It is an absent one, and it is exactly what made our
+    # attention map flat while we blamed the training.
+    keys = {"days": out["cs"]["days"],
+            "companies": len(out["tickers"]),
+            "cells": out["cs"]["days"] * len(out["tickers"])}[attend]
+    if keys < 2:
+        raise ValueError(
+            f"`fusion['attend_to'] = {attend!r}` with `cs['days'] = {out['cs']['days']}` and "
+            f"{len(out['tickers'])} companies offers the attention exactly one key.\n"
+            "     Softmax over ONE key is identically 1.0 — every company would receive the "
+            "identical market vector and the cross-attention would be a NO-OP.\n"
+            "     Use `attend_to = 'companies'` (one key per company: a bank can attend to "
+            "banks)."
         )
 
     for name, weight in out["loss"].items():
@@ -204,7 +242,7 @@ def check(settings: dict) -> dict:
                 f"`loss['{name}']` must be a number of 0 or more, got {weight!r}."
             )
 
-    for entry in ("ts", "cs", "fusion"):
+    for entry in ("ts", "cs"):          # `fusion` has no codebook of its own to tune
         for knob in ("commitment", "diversity", "decay"):
             value = out[entry][knob]
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
@@ -381,7 +419,7 @@ def summary(settings: dict) -> str:
         "The tokenizer reads each day through two windows:",
         f"{ts_line}→ {ts['vocabulary']} words, depth {ts['encoder_depth']}",
         f"{cs_line}→ {cs['vocabulary']} words, depth {cs['encoder_depth']}",
-        f"     ⤷ merged into ONE token out of {settings['fusion']['vocabulary']}",
+        f"     ⤷ merged into ONE token, attending to {settings['fusion']['attend_to']}",
         "",
         f"Predictor reads sentences of {settings['predictor']['sentence_length']} tokens "
         f"(depth {settings['predictor']['depth']})",

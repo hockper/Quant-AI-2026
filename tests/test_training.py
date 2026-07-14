@@ -7,6 +7,7 @@ import bubble_bi as bb
 from bubble_bi.models import VQVAE
 from bubble_bi.training import (baseline_rebuild, evaluate, pick_device, train,
                                 word_usage)
+from conftest import _tiny_joint
 
 
 class _Grids(Dataset):
@@ -40,7 +41,11 @@ def _loaders(**kw):
 
 
 def _settings():
-    return bb.check({"tickers": ["AAA"], "learning_rate": 3e-3})
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it. This helper
+    # only feeds `train()` a learning rate/step budget -- the models built in these
+    # tests set their own `companies=` directly, so this does not change any shape.
+    return bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3})
 
 
 def _where():
@@ -307,7 +312,9 @@ def test_it_gives_up_when_the_held_out_error_stops_improving():
 
 def test_each_entry_can_have_its_own_step_budget():
     # CS needs far fewer steps than TS, because it has far less data.
-    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
                          "steps": 500, "cs": {"steps": 40}})
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
@@ -357,7 +364,9 @@ def test_it_gives_up_when_the_held_out_error_stops_improving():
 
 def test_each_entry_can_have_its_own_step_budget():
     # CS needs far fewer steps than TS, because it has far less data to learn from.
-    settings = bb.check({"tickers": ["AAA"], "learning_rate": 3e-3,
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    settings = bb.check({"tickers": ["AAA", "BBB"], "learning_rate": 3e-3,
                          "steps": 500, "cs": {"steps": 40}})
     torch.manual_seed(0)
     model = VQVAE(companies=1, days=4, features=6, vocabulary=16, width=32, heads=2)
@@ -365,3 +374,75 @@ def test_each_entry_can_have_its_own_step_budget():
     history = train(model, _loaders(), settings, entry="cs", check_every=10,
                     patience=99, quiet=True)
     assert history.rows[-1]["step"] == 40         # CS's own budget, not the shared 500
+
+
+# ------------------------------------------------------------- joint training
+
+def test_a_joint_run_keeps_BOTH_dictionaries_alive():
+    """⚠️ THE TEST THAT WOULD HAVE CAUGHT THE FUSION COLLAPSE.
+
+    Perplexity genuinely STARTS at 1.0 -- one word for everything -- and only climbs out via
+    the reconstruction anchor, the diversity loss and dead-word revival. Under joint training
+    the naming loss used to be free to push it straight back down. If either dictionary ends
+    a run near 1, the anchor or the severed naming channel has failed, and the loss curve
+    will look perfectly healthy while it happens.
+    """
+    from bubble_bi.training import train_joint
+
+    # ⚠️ `_tiny_joint()` seeds itself (see its own docstring) -- but NOT to dodge a coin
+    # flip. This run's cold start on a 60-step budget used to be genuinely bimodal (dead
+    # lock vs. escape, ~45% of seeds surviving); it is now reliable because
+    # `train_joint`'s own `revive_every <= check_every` clamp guarantees a revival lands
+    # before the first check, and the fixture's vocabulary/batch were widened for
+    # margin. Proven, not assumed: this test passes on at least ten different seeds, not
+    # just the one pinned below -- see `_tiny_joint`'s own docstring for the sweep.
+    world, loaders, settings = _tiny_joint()
+    history = train_joint(world, loaders, settings, steps=60, quiet=True)
+    last = history.last()
+
+    assert last["ts_perplexity"] > 2.0, f"the TS dictionary collapsed: {last}"
+    assert last["cs_perplexity"] > 2.0, f"the CS dictionary collapsed: {last}"
+
+
+def test_train_joint_revives_before_the_first_check_even_on_a_short_run():
+    """⚠️ THE GUARD THAT KEEPS THE COLD START FROM BEING JUDGED BEFORE IT HAS A CHANCE.
+
+    Measured directly: the codebook starts FULLY COLLAPSED (perplexity exactly 1.0) and
+    does NOT climb out on its own -- not via the reconstruction anchor, not via the
+    diversity loss however high it is turned up. Only `revive_dead_words()` opens it.
+
+    `check_every` defaults to `steps // 10`. For this fixture's 60-step run that is 6 --
+    smaller than `revive_every`'s default of 50. Without a guard, the very first check
+    (and, with bad luck, early stopping ending the whole run) would judge a codebook
+    that has never once been revived. `train_joint` must clamp `revive_every` down to
+    at most `check_every` so a revival always lands at or before the first check.
+
+    Delete that clamp and this fails: the first check (step 6) would land 44 steps
+    before the first scheduled revival (step 50), so `revived` would still be 0 at the
+    first row.
+    """
+    from bubble_bi.training import train_joint
+
+    world, loaders, settings = _tiny_joint()
+    # revive_every is left at its default (50) on purpose -- check_every (steps // 10 =
+    # 6, for steps=60) is smaller, which is exactly the trap the clamp exists to close.
+    # patience=99 so early stopping cannot cut the run short before we get to look.
+    history = train_joint(world, loaders, settings, steps=60, patience=99, quiet=True)
+
+    first = history.rows[0]
+    assert first["revived"] > 0, (
+        "the first check happened before any dead-word revival ever fired -- "
+        "train_joint's revive_every <= check_every clamp is missing or broken"
+    )
+
+
+def test_a_joint_run_reports_both_honest_floors():
+    """Persistence for the word, shrugging for the candle. A number without its floor gets
+    quoted, and this project has had to walk back two such numbers already."""
+    from bubble_bi.training import train_joint
+
+    world, loaders, settings = _tiny_joint()
+    last = train_joint(world, loaders, settings, steps=20, quiet=True).last()
+
+    for name in ("drawing", "shrugging", "accuracy", "persistence"):
+        assert name in last, f"{name} is not reported"

@@ -2,8 +2,8 @@
 
 Both entries want the same shape of thing — a grid of [companies × days × features]:
 
-    TS   1 company  × 4 days × 22    one sample per company per day
-    CS  30 companies × 5 days × 22   one sample per day
+    TS   1 company  × 4 days × 26    one sample per company per day
+    CS  30 companies × 5 days × 26   one sample per day
 
 This module cuts those grids out of the feature table and hands them to the models
 in batches, divided into three periods of history.

@@ -1,37 +1,47 @@
-"""Why is the token empty?
+"""A linear-probe culprit test -- and the piece of it that outlived the bug it was built for.
 
-The fusion codebook collapses to ~12 words of 512 and the predictor loses to
-persistence. We know *that*. This module exists to find out *why*, because the fix
-depends entirely on the answer, and there are three quite different culprits:
+This module used to answer "why is the FUSED token empty?": under the old two-stage
+design, TS and CS were frozen and their outputs quantised into a THIRD codebook, trained
+only against "can this be predicted?" with no reconstruction anchor of its own. That
+codebook collapsed to ~12 words of 512, and `gather()` (removed) plus `plot()` (removed)
+existed to tell apart three culprits -- the fusion, the codebook, or the loss -- for
+exactly that one collapsing vector.
 
-    1. THE FUSION is producing nothing.      The continuous vector it hands to the
-                                             codebook is already uninformative.
-    2. THE CODEBOOK is destroying it.        The continuous vector IS informative, but
-                                             quantising it throws that away.
-    3. THE ANCHOR is too weak.               Both are informative enough, but nothing in
-                                             the loss punishes an empty token hard enough
-                                             to stop the model collapsing it anyway.
+⚠️ There is no fused codebook any more (see `bubble_bi.models.tokenizer`). TS and CS each
+keep their OWN codebook, each anchored by rebuilding its own grid -- the fix the third
+branch below (`report`/`verdict`'s "CULPRIT: THE LOSS") would have recommended, now built
+into the design instead of diagnosed after the fact. So the question `gather()` was
+written to answer no longer arises, and it could not have kept working regardless: it
+called `tokenizer.codebook(...)` (deleted) and read cached-latent batch keys (`z_ts`,
+`market`, `company`, `last_day`) that the current sentence format
+(`bubble_bi.data.sentences.Sentences`) does not produce. `tests/test_autopsy.py` only
+ever imported `_probe`, `report` and `verdict` -- never `gather` -- so nothing caught it
+being broken. Rather than resurrect a diagnostic for a bug that has been designed out (or
+leave a function that would raise the moment anyone called it), `gather()` and `plot()`
+are deleted along with the notebook section that called them.
 
-These are distinguishable, and this tells them apart:
+What is left, and why it stays:
 
-    • Fit a probe from the CONTINUOUS fused vector to today's candle.
-      Poor  -> culprit 1: the fusion is not producing anything worth quantising.
-      Good  -> the fusion is fine, keep looking.
-
-    • Fit the same probe from the QUANTISED token instead.
-      Much worse than the continuous one -> culprit 2: quantisation is the bottleneck.
-      About the same, and both good        -> culprit 3: it is the loss, not the model.
-
-Run it on Colab after a real training run and bring the numbers back.
+    `_probe`    a plain ridge-regression R² helper -- how much of `y` can a LINEAR probe
+                recover from `x`, on held-out rows. `bubble_bi.tuning` imports this
+                directly for its own "did today survive the bottleneck?" search (see its
+                module docstring), so this file is not just diagnostic history.
+    `report`    `verdict`   generic culprit-naming logic over an `evidence` dict of
+                {fused vector, quantised token, candle, target}. Still exercised by their
+                own tests with hand-built evidence. Nothing in the current pipeline builds
+                that dict any more -- a future two-token autopsy could, by encoding a real
+                sentence batch and pulling `ts_summary`/`ts_token` (or `cs_summary`/
+                `cs_token`) out of `Tokenizer.forward` before it is thrown away -- but that
+                is new work, not a rewrite of what was here, and nothing in this project
+                currently needs it: `verify.joint`'s perplexity check already watches both
+                anchored codebooks for the collapse this module used to have to go
+                hunting for after the fact.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import torch
-
-from bubble_bi.models.world import CANDLE
 
 
 def _probe(x: np.ndarray, y: np.ndarray, train: float = 0.7) -> float:
@@ -60,69 +70,6 @@ def _probe(x: np.ndarray, y: np.ndarray, train: float = 0.7) -> float:
     left = ((y_test - x_test @ w) ** 2).sum()
     total = ((y_test - y_fit.mean(axis=0)) ** 2).sum()
     return float(1 - left / max(total, 1e-12))
-
-
-@torch.no_grad()
-def gather(world, book, batches, settings: dict, period: str = "test",
-           every: int = 4) -> dict:
-    """Collect everything needed to tell the three culprits apart.
-
-    ⚠️ Takes every Nth batch across the WHOLE period, never the first N. The sentences
-    are ordered by company, so stopping early would sample only the first few companies
-    and quietly answer a different question than the one asked.
-    """
-    from bubble_bi.training import _to, pick_device
-
-    where = pick_device(settings)
-    world.to(where).eval()
-    tokenizer = world.tokenizer
-
-    fused, tokens, candles, attention, targets = [], [], [], [], []
-    arrays = batches.arrays
-    y = arrays.y                                        # tomorrow's return
-
-    for i, batch in enumerate(book["loaders"][period]):
-        if i % every:                                   # thin it out, but evenly
-            continue
-        batch = _to(batch, where)
-        b, t, width = batch["z_ts"].shape
-
-        vector, weights = tokenizer.fusion(
-            batch["z_ts"].reshape(b * t, width),
-            batch["market"].reshape(b * t, *batch["market"].shape[2:]),
-        )
-        chosen = tokenizer.codebook(vector)
-
-        fused.append(vector.cpu().numpy())                          # BEFORE quantising
-        tokens.append(chosen["ids"].cpu().numpy())                  # AFTER quantising
-        candles.append(batch["candle"].reshape(b * t, -1).cpu().numpy())
-        attention.append(weights.cpu().numpy())
-
-        # tomorrow's actual return, for each (company, day) in the sentence
-        last = batch["last_day"].cpu().numpy()
-        who = batch["company"].cpu().numpy()
-        for row in range(b):
-            days = np.arange(last[row] - t + 1, last[row] + 1)
-            targets.append(y[days, who[row]])
-
-    world.train()
-
-    fused = np.concatenate(fused)
-    tokens = np.concatenate(tokens)
-    candles = np.concatenate(candles)
-    attention = np.concatenate(attention)
-    targets = np.concatenate(targets).reshape(-1, 1)
-
-    # The quantised token, as a vector: its one-hot, which is all a codebook lookup is.
-    words = tokenizer.codebook.words
-    onehot = np.zeros((len(tokens), words), dtype=np.float32)
-    onehot[np.arange(len(tokens)), tokens] = 1.0
-
-    return {
-        "fused": fused, "tokens": tokens, "candle": candles,
-        "attention": attention, "target": targets, "onehot": onehot,
-        "words": words,
-    }
 
 
 def report(evidence: dict) -> pd.DataFrame:
@@ -185,37 +132,3 @@ def verdict(evidence: dict) -> str:
             "candle. See docs/OPEN-QUESTION-codebook-collapse.md.",
         ]
     return "\n".join(lines)
-
-
-def plot(evidence: dict):
-    """How the words are spread, and whether the attention is choosing anything."""
-    import matplotlib.pyplot as plt
-
-    tokens, attention = evidence["tokens"], evidence["attention"]
-    words = evidence["words"]
-
-    fig, (left, right) = plt.subplots(1, 2, figsize=(11.5, 3.8))
-
-    counts = np.bincount(tokens, minlength=words)
-    order = np.argsort(-counts)
-    live = int((counts > 0).sum())
-    left.bar(range(min(60, words)), counts[order][:60], color="#5c6bc0")
-    left.set_xlabel(f"the 60 busiest words (of {words}; only {live} are used at all)")
-    left.set_ylabel("days")
-    left.set_title("How the vocabulary is spread", loc="left", fontsize=11)
-
-    mean = attention.mean(axis=0)
-    right.bar(range(len(mean)), mean, color="#26a69a")
-    right.axhline(1 / len(mean), color="#ef5350", linestyle="--", linewidth=1,
-                  label="flat = not choosing")
-    right.set_xlabel("which part of the market it read")
-    right.set_ylabel("average attention")
-    right.set_title("Is the cross-attention choosing?", loc="left", fontsize=11)
-    right.legend(fontsize=8, frameon=False)
-
-    for ax in (left, right):
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        ax.grid(axis="y", alpha=0.25, linewidth=0.5)
-    fig.tight_layout()
-    return fig

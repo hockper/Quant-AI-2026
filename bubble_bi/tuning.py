@@ -1,7 +1,31 @@
 """Find the settings that make TS and CS work — by measuring, not by guessing.
 
-WHAT THIS OPTIMISES, AND WHY IT IS NEITHER OF THE OBVIOUS THINGS
-----------------------------------------------------------------
+⚠️⚠️⚠️ THIS OBJECTIVE WAS REPUDIATED BY MEASUREMENT. DO NOT TURN THIS SEARCH ON. ⚠️⚠️⚠️
+------------------------------------------------------------------------------------
+"Does the present day survive the bottleneck?" (below) turned out to be GAMEABLE, and
+section 8 (`train_joint`) is where we found out: the search would trivially maximise
+this score by shrinking `days` to the floor. A shorter window makes "today" a bigger
+share of what the token is even being asked to describe, so the probe score climbs
+for a reason that has nothing to do with whether the token is any good — it is the
+same trap as the reconstruction objective one paragraph down, wearing a different
+hat: what the score asks the token to preserve is already sitting in its own input.
+
+It also scores the WRONG MODEL. Under joint training the tokenizer is never trained
+alone any more — `train_joint` trains the encoders, both codebooks, the fusion and
+the GPT together, against tomorrow's candle (see `bubble_bi/models/world.py`). Every
+function below (`search`, `score_tokenizer`, `confirm`) still builds and scores a
+STANDALONE, reconstruction-only, no-fusion `VQVAE` — a model this project no longer
+runs in production. Its winner would be handed straight to the joint model by
+`apply()`, tuned for a sentence the real model never reads.
+
+Do NOT set `search['run'] = True` until this is retargeted at the JOINT objective
+(perplexity and drawing-vs-shrugging under `train_joint`, not a standalone
+reconstruction probe). The machinery below — the two-stage search, the transfer
+guard (`confirm`), the boundary check (`boundaries`) — is sound and will be reused
+once that retargeting happens. It is the OBJECTIVE that is broken, not the search.
+
+WHAT THIS OPTIMISES TODAY, AND WHY IT IS NEITHER OF THE OTHER OBVIOUS THINGS
+-----------------------------------------------------------------------------
 NOT reconstruction loss. We already proved it misleads us: handed the candle explicitly,
 the best compressor THREW IT AWAY (docs/DECISION-let-the-model-choose.md). Reconstruction
 is an equally-weighted MSE over all 26 features, so it is carried by the easy, smooth ones.
@@ -13,8 +37,8 @@ never asked to predict. Score them on tomorrow's return and every configuration 
 would rank pure noise and hand back whichever trial got lucky.
 
 So: does the PRESENT DAY survive the bottleneck? The token is 9 bits of a window; the only
-honest question is what it chose to keep. And it is the question that matters, because
-information destroyed at the tokenizer can NEVER be recovered by any predictor downstream.
+honest question seemed to be what it chose to keep. It turned out not to be honest enough
+— see the warning above.
 """
 
 from __future__ import annotations
@@ -605,6 +629,15 @@ def _run_one(entry, chosen, batches, settings, scorer, features, companies, tria
 
 def search(entry: str, batches, settings: dict, scorer=score_tokenizer):
     """Find good settings for one entry. Returns (best, trials_table).
+
+    ⚠️ DO NOT RUN THIS. The default `scorer` (`score_tokenizer`) optimises an objective
+    this project has since REPUDIATED BY MEASUREMENT -- see the module docstring at the
+    top of this file. Short version: "does today survive the bottleneck?" is gameable
+    (it trivially rewards shrinking `days`, because what it asks the token to keep is
+    already sitting in its own input window), and it scores a STANDALONE,
+    reconstruction-only tokenizer that `train_joint` no longer trains at all. Calling
+    `search()` today tunes a model that does not exist, for a question with a
+    loophole. Wait until it is retargeted at the JOINT objective.
 
     Two stages: the BALANCE first (learning rate, commitment, diversity, with the sizes
     held at their defaults), then the SIZES with the winning balance held fixed.

@@ -174,7 +174,9 @@ def test_the_setup_check_does_not_run_the_test_suite(monkeypatch):
         "cuda available": True, "gpu": "Tesla T4", "gpu present": True, "why": None,
     })
 
-    verify.setup(bb.check({"tickers": ["AAPL"], "data_dir": "artifacts"}))   # must not raise
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    verify.setup(bb.check({"tickers": ["AAPL", "MSFT"], "data_dir": "artifacts"}))   # must not raise
 
 
 def test_the_setup_check_still_says_HOW_to_check_the_code(capsys):
@@ -183,6 +185,8 @@ def test_the_setup_check_still_says_HOW_to_check_the_code(capsys):
     So the check has to TELL them, or we have simply hidden the question."""
     from bubble_bi import verify
 
-    verify.setup(bb.check({"tickers": ["AAPL"], "data_dir": "artifacts"}))
+    # Two tickers, not one: with a single company the cross-attention has one key,
+    # and softmax over one key is a no-op. `check()` now refuses it.
+    verify.setup(bb.check({"tickers": ["AAPL", "MSFT"], "data_dir": "artifacts"}))
     said = capsys.readouterr().out
     assert "run_tests" in said, "never told the reader how to check the code"

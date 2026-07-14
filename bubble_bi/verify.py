@@ -71,7 +71,8 @@ def setup(settings: dict) -> None:
         have=f"""
         A checked configuration — and nothing else yet.
         The tokenizer will read {ts['days']} days of each stock and {cs['days']} days of the
-        whole market, then merge them into 1 token out of {settings['fusion']['vocabulary']}.
+        whole market, then merge them into ONE token, attending to
+        {settings['fusion']['attend_to']}.
         No prices downloaded, no model trained.
 
         This checked your ENVIRONMENT, not the code. To check the code itself — all of it,
@@ -301,136 +302,60 @@ def tensors(batches, ts, cs, settings: dict) -> None:
     print(sizes.to_string())
 
 
-def trained(model, history, loaders, settings: dict, name: str = "TS") -> None:
-    """Section 7/9: the model learned something — measured against a bar that HURTS."""
-    from bubble_bi.training import evaluate, pick_device
+def joint(world, history, book: dict, settings: dict) -> None:
+    """Section 8: everything trained at once — and did the language survive?
 
-    scored = evaluate(model, loaders["test"], pick_device(settings))     # never seen
-    words = model.codebook.words
+    Judged against its FLOORS, never against zero: persistence ("tomorrow's word is
+    today's word") and shrugging ("draw the average candle"). And against the one
+    number that must never be allowed to drift quietly: perplexity. This model invents
+    its own vocabulary and is then graded on predicting it, so "make every day the same
+    word" scores perfectly — we measured exactly that once, 92% accuracy at perplexity
+    2.2. If perplexity is healthy here, the naming loss's detached copy is doing its job.
 
-    token = scored["rebuild"]
-    flat = scored["guessing"]           # predict zero. A WEAK bar.
-    level = scored["window_mean"]       # predict this window's own average. THE bar.
-    last = scored["last_day"]           # repeat the final day. Flatters us — measured.
+    `history` is `train_joint`'s own record of every check made DURING training --
+    where perplexity started, not just where it ended up. A dictionary that opens early
+    and then quietly narrows back down would still pass the checks below (they only
+    read the FINAL state), so the trajectory is worth a line of its own -- and worth
+    plotting: see `bb.plots.joint_progress`.
+    """
+    from bubble_bi.training import pick_device, score_joint
 
-    perplexity = scored["perplexity"]
+    scored = score_joint(world, book["tune"], pick_device(settings))
+    alive = min(scored["ts_perplexity"], scored["cs_perplexity"])
+    beats_shrug = scored["drawing"] < scored["shrugging"]
+    beats_persist = scored["accuracy"] > scored["persistence"]
+
     rows = history.rows if history is not None else []
-    start_ppl = rows[0]["perplexity"] if rows else float("nan")
-    squeeze = model.companies * model.days * model.features
-
-    # Against the weak bar the token looks fine. Against the bar that matters it may not.
-    # Report both, and FAIL on the one that matters -- otherwise the notebook is simply
-    # flattering itself, which is the whole thing we are trying not to do.
-    beats_level = token < level
-    alive = perplexity > 2
-
-    health = (
-        "healthy" if perplexity > words * 0.3
-        else "thin — a longer run should widen it" if perplexity > words * 0.05
-        else "very thin — the vocabulary is barely spreading"
-    )
+    trajectory = (
+        f"TS {rows[0]['ts_perplexity']:.0f} → {rows[-1]['ts_perplexity']:.0f}, "
+        f"CS {rows[0]['cs_perplexity']:.0f} → {rows[-1]['cs_perplexity']:.0f} over the run"
+    ) if rows else "loaded from disk — no training history this session"
 
     report(
-        f"{name} trained",
+        "8. Everything, at once",
         [
-            ("Dictionary did not collapse", alive,
-             f"perplexity {perplexity:.0f} of {words} — {health}"),
-            ("Vocabulary in use", True, f"{scored['words_used']} of {words} words"),
-            ("Beats the long-run average", token < flat,
-             f"{token:.2f} vs {flat:.2f}  → explains {1 - token / max(flat, 1e-9):.0%}"
-             "   ⚠️ a WEAK bar"),
-            ("Beats THIS WINDOW's own average", beats_level,
-             f"{token:.2f} vs {level:.2f}  → "
-             f"{'explains ' + format(1 - token / max(level, 1e-9), '.0%') if beats_level else 'LOSES. This is the bar that matters.'}"),
-            ("(repeating the last day scores)", True,
-             f"{last:.2f} — worse than predicting zero, so it FLATTERS us. Ignore it."),
+            ("Both dictionaries alive", alive > 20,
+             f"TS {scored['ts_perplexity']:.0f}, CS {scored['cs_perplexity']:.0f} words in use"),
+            ("Draws tomorrow better than shrugging", beats_shrug,
+             f"{scored['drawing']:.3f} vs {scored['shrugging']:.3f}"),
+            ("Names tomorrow better than persistence", beats_persist,
+             f"{scored['accuracy']:.1%} vs {scored['persistence']:.1%}"),
         ],
         have=f"""
-        A tokenizer that squeezes {squeeze:,} numbers into ONE word out of {words}.
-        {f"Perplexity went {start_ppl:.0f} → {perplexity:.0f} during training." if rows else ""}
-        Judge it on the window-mean bar, never on the long-run one.
-        Run bb.plots.kept_by_family() to see WHAT it kept — the headline is an average,
-        and it is carried by the easy features.
+        One model. The encoders, both codebooks, the fusion and the GPT were all
+        shaped by the same thing: tomorrow.
+        Each day is two words — this stock, and the market.
+        Perplexity over the run: {trajectory}.
+        See it drawn: bb.plots.joint_progress(world_history) -- perplexity is the
+        number to watch, from the first line.
         """,
         known_problem=(
-            "The token LOSES to simply predicting the average of the window it is "
-            "describing. The reconstruction objective is not producing a token worth "
-            "having.\n     See docs/DECISION-let-the-model-choose.md."
-        ) if not beats_level else None,
+            None if (alive > 20 and beats_shrug) else
+            "The dictionary collapsed, or the model cannot beat shrugging. Perplexity is the "
+            "one to read first: if it is near 1, the naming loss found its way back into the "
+            "vocabulary and everything else is meaningless."
+        ),
     )
-
-    if not beats_level:
-        print(f"\n  ⚠️  A baseline that knows NOTHING except the average of these "
-              f"{model.days} days")
-        print(f"     scores {level:.2f}. The token scores {token:.2f}. It is worse.")
-        print("     Every '% explained' figure against the long-run average was measured")
-        print("     against a bar so low that knowing one number per feature would clear it.")
-    if perplexity < words * 0.3 and rows:
-        print(f"\n  ⏱️  Short run: {rows[-1]['step']:,} steps in {history.seconds:.0f}s.")
-        print("     Train for longer on a GPU before reading anything into these numbers.")
-
-
-def predictor(world, history, loaders, settings: dict) -> None:
-    """Section 10: the world model, scored against the floors that actually matter."""
-    from bubble_bi.training import pick_device, score_predictions
-
-    scored = score_predictions(world, loaders["test"], pick_device(settings))
-    words = world.words
-
-    named = scored["accuracy"]
-    sticky = scored["persistence"]
-    drew = scored["candle"]
-    shrug = scored["shrugging"]
-    perplexity = scored["perplexity"]
-
-    # The only floor worth measuring against. Regimes are sticky, so "tomorrow's word is
-    # the same as today's" is right most of the time -- and any accuracy below it means
-    # the model has learned nothing worth having, however impressive the number looks.
-    beats_persistence = named > sticky
-    beats_shrugging = drew < shrug
-    alive = perplexity > words * 0.05
-
-    report(
-        "The predictor",
-        [
-            ("Names tomorrow's regime", True,
-             f"{named:.1%} — vs {sticky:.1%} for just saying 'same as today'"),
-            ("...and beats that floor", beats_persistence,
-             "the honest bar" if beats_persistence
-             else "NO — it is worse than doing nothing"),
-            ("Draws tomorrow's candle", beats_shrugging,
-             f"{drew:.3f} — vs {shrug:.3f} for drawing the average candle"),
-            ("Dictionary still alive", alive,
-             f"perplexity {perplexity:.0f} of {words}"),
-            ("Scored on unseen days", True, "the test period, never trained on"),
-        ],
-        have=f"""
-        A model that reads a company's last {world.sentence} days as a sentence of words
-        and answers two questions about tomorrow: which word comes next, and what candle
-        comes with it. Both are scored against a floor, not against zero.
-        """,
-        # These two failures are UNDERSTOOD and written down. The ❌ stays -- we do not
-        # dress up a bad result -- but they do not stop the notebook, because they are an
-        # open research question, not broken code.
-        known_problem=(
-            "The codebook collapses and the model loses to persistence. This is "
-            "diagnosed, not fixed:\n     docs/OPEN-QUESTION-codebook-collapse.md"
-        ) if not (beats_persistence and alive) else None,
-    )
-
-    if not beats_persistence:
-        print("\n  ⚠️  IT DOES NOT BEAT PERSISTENCE, and that is the number that matters.")
-        print("     Regimes are sticky, so 'same as yesterday' is a high bar. Until the")
-        print("     model clears it, its accuracy means nothing at all.")
-        print("\n     For the paper: the previous version of this project reported")
-        print("     '58.6% next-token accuracy' against a much weaker baseline.")
-        print("     Against THIS floor it would not have cleared it either.")
-    if not alive:
-        print(f"\n  ⚠️  The codebook has collapsed to ~{perplexity:.0f} words of {words}.")
-        print("     The model found the shortcut: make every day the same word, and the")
-        print("     next word becomes trivially easy to predict. The candle head is meant")
-        print("     to punish that — but drawing tomorrow is so hard that it barely")
-        print("     produces a gradient, so an empty token is never punished enough.")
 
 
 def market_moods(evidence: dict) -> None:

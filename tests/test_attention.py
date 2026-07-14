@@ -103,53 +103,83 @@ def test_the_cells_map_folds_150_keys_into_two_readable_halves():
 # ------------------------------------------- the bug that made the map a lie
 
 def test_every_company_is_measured_not_just_the_first_few():
-    """A real bug, caught by looking at the output.
+    """A real bug, caught by looking at the output -- and no longer possible to build.
 
-    The sentences are ordered BY COMPANY. Sampling the first N batches therefore only
-    ever reaches the first few companies, and every company after them comes back blank
-    — while the summary numbers quietly get computed on that biased sample. A diagnostic
-    that measures the wrong thing is worse than no diagnostic.
+    Under the old cached-latent design, sentences were served one COMPANY at a time,
+    ordered by company, so sampling only the first few batches reached only the first
+    few tickers. Under joint training a batch is one time WINDOW across ALL companies
+    at once (see `WorldModel.forward`), so that ordering bug cannot happen any more —
+    every batch structurally carries every company as its own axis.
+
+    What replaces it: `gather()` must actually READ that axis correctly, rather than
+    silently mislabelling it. This builds a tiny multi-company sentence loader (raw
+    grids, the new batch shape) and checks every company comes back finite.
+
+    ⚠️ Two things this test used to miss entirely, both now closed:
+
+    1. `isfinite` alone can basically never fail any more -- the NaN-for-unmeasured-
+       company path this test was ORIGINALLY written to catch is gone. It stayed green
+       out of habit, not because it was still checking anything.
+    2. The old fixture used `attend_to="companies"`, where `keys == companies` by
+       construction -- so the attention map came back perfectly SQUARE. A `gather()`
+       that silently swapped the company and key axes (mislabelling "who reads whom",
+       the one thing this diagnostic exists to produce) would have passed unchanged:
+       same shape, still finite.
+
+    So this uses `attend_to="cells"` (`keys = companies * cs_days`, deliberately NOT
+    equal to `companies`) and checks that every company's row of the map sums to 1
+    across the KEY axis -- true of a real softmax output, and false of one whose axes
+    have been swapped. With `companies != keys`, a literal axis transpose is not even
+    shape-compatible any more: it fails loudly instead of quietly mislabelling.
     """
     import torch
     from torch.utils.data import DataLoader, Dataset
 
     import bubble_bi as bb
     from bubble_bi.attention import gather
-    from bubble_bi.settings import DEFAULTS
 
-    companies, width, keys, days = 5, 16, 4, 6
+    companies, width, ts_days, cs_days, features, sentence = 5, 16, 2, 3, 6, 4
 
-    class _Ordered(Dataset):
-        """Sentences laid out company by company — exactly like the real ones."""
-        def __init__(self, per_company=20):
-            self.who = np.repeat(np.arange(companies), per_company)
+    class _Sentences(Dataset):
+        """One item = one window of `sentence` days, every company at once — exactly
+        how `bubble_bi.data.make_sentences` will serve them."""
+        def __init__(self, n=8):
+            self.n = n
 
         def __len__(self):
-            return len(self.who)
+            return self.n
 
         def __getitem__(self, i):
             return {
-                "z_ts": torch.randn(days, width),
-                "market": torch.randn(days, keys, width),
-                "candle": torch.randn(days, 4),
-                "company": torch.tensor(int(self.who[i])),
-                "last_day": torch.tensor(days - 1),
+                "ts_grid": torch.randn(sentence, companies, 1, ts_days, features),
+                "cs_grid": torch.randn(sentence, companies, cs_days, features),
+                "cs_present": torch.ones(sentence, companies, dtype=torch.bool),
+                "candle": torch.randn(sentence, companies, 4),
             }
 
-    ts = bb.models.VQVAE(companies=1, days=4, features=6, vocabulary=16,
+    ts = bb.models.VQVAE(companies=1, days=ts_days, features=features, vocabulary=16,
                          width=width, heads=2)
-    cs = bb.models.VQVAE(companies=companies, days=keys, features=6, vocabulary=16,
-                         width=width, heads=2)
-    fusion = {**DEFAULTS["fusion"], "vocabulary": 16, "depth": 1}
-    world = bb.models.WorldModel(
-        bb.models.Tokenizer(ts, cs, model_size=width, heads=2, **fusion),
-        sentence=days, depth=1, heads=2,
-    )
+    cs = bb.models.VQVAE(companies=companies, days=cs_days, features=features,
+                         vocabulary=16, width=width, heads=2)
+    tokenizer = bb.models.Tokenizer(ts, cs, model_size=width, heads=2,
+                                    attend_to="cells")
+    world = bb.models.WorldModel(tokenizer, sentence=sentence, depth=1, heads=2)
 
-    book = {"loaders": {"test": DataLoader(_Ordered(), batch_size=4, shuffle=False)}}
-    settings = bb.check({"tickers": ["A", "B", "C", "D", "E"]})
+    # `make_sentences()` returns a plain {period: DataLoader} dict, not nested under a
+    # "loaders" key -- see the note on `gather()` about why that nesting used to exist
+    # and why it was wrong to keep expecting it.
+    book = {"test": DataLoader(_Sentences(), batch_size=3, shuffle=False)}
+    settings = bb.check({"tickers": [f"T{i}" for i in range(companies)]})
 
     read = gather(world, book, None, settings)
+    keys = companies * cs_days                       # attend_to="cells", deliberately != companies
     assert read["attention"].shape == (companies, keys)
-    # THE assertion: the LAST company must have been measured too.
+    # THE assertion: every company must have been measured, not just the first few.
     assert np.isfinite(read["attention"]).all(), "a company was never reached"
+    # Each row is an average of softmax shares, which sum to 1 across the keys THAT
+    # company read. A company/key axis swap would still be finite, but would no longer
+    # sum to 1 here (a random map is essentially never doubly-stochastic).
+    assert np.allclose(read["attention"].sum(axis=1), 1.0, atol=1e-4), (
+        "a company's row does not sum to 1 across the keys it read -- the company and "
+        "key axes may have been swapped"
+    )

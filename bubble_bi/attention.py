@@ -32,53 +32,66 @@ import torch
 
 
 @torch.no_grad()
-def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
+def gather(world, book, batches: int | None, settings: dict, period: str = "test") -> dict:
     """Average attention, per company, over days the model never trained on.
 
-    ⚠️ Reads the WHOLE period, deliberately. The sentences are ordered by company, so
-    stopping after the first N batches would only ever see the first few companies and
-    silently report nothing for the rest — which is exactly the bug this comment exists
-    to stop someone reintroducing. It is cheap: no encoders run here, only the fusion,
-    on latents that were cached long ago.
+    ⚠️ Under joint training a batch is one time WINDOW across ALL companies at once
+    (see `WorldModel.forward`) -- not one sentence per company. So the bug this
+    function used to guard against (sentences ordered BY company, so sampling the
+    first few batches only ever reached the first few tickers) cannot happen any
+    more: every batch already carries every company as its own axis. What CAN still
+    go wrong is `gather` reading that axis incorrectly, which is what the shape
+    check below exists to catch loudly instead of silently.
+
+    Under the old cached-latent design this ran only the fusion, over latents already
+    sitting in memory. Now it runs the WHOLE model -- both encoders included -- over
+    every batch it reads, which is materially more expensive. `batches` is the knob for
+    that cost: how many batches of the loader to read before stopping. `None` reads the
+    whole period.
+
+    ⚠️ `book` is a plain {"learn": ..., "tune": ..., "test": ...} of DataLoaders --
+    NOT nested under a "loaders" key. That nesting belonged to the old cached-latent
+    `make_sentences()` (which also returned a "memory" of frozen encoder output), and
+    for a while after `make_sentences()` was rewritten for raw-grid, jointly-trained
+    sentences, this function still assumed the OLD shape and nothing caught the
+    mismatch — the test covering it built its own `book` by hand, already in the new
+    shape, rather than exercising the real round trip through `make_sentences()`.
+    Fixed now, and reads the current shape correctly; the lesson worth keeping is that
+    a shape drift like this is silent unless a test exercises the real producer, not a
+    hand-built stand-in for it.
     """
     from bubble_bi.training import _to, pick_device
 
     where = pick_device(settings)
     world.to(where).eval()
-    tokenizer = world.tokenizer
 
     companies = len(settings["tickers"])
     total = None
-    counts = np.zeros(companies)
+    seen = 0
 
-    for batch in book["loaders"][period]:
-        batch = _to(batch, where)
-        b, t, width = batch["z_ts"].shape
-
-        _, weights = tokenizer.fusion(
-            batch["z_ts"].reshape(b * t, width),
-            batch["market"].reshape(b * t, *batch["market"].shape[2:]),
-        )
-        weights = weights.reshape(b, t, -1).mean(dim=1).cpu().numpy()   # [b, keys]
-        who = batch["company"].cpu().numpy()
+    for i, batch in enumerate(book[period]):
+        if batches is not None and i >= batches:
+            break
+        out = world(_to(batch, where))
+        attention = out["attention"]                       # [B, T, N, keys]
+        b, t, n, keys = attention.shape
+        if n != companies:
+            raise ValueError(
+                f"a batch carries {n} companies but `settings['tickers']` lists "
+                f"{companies} — they must line up one to one, or the attention map "
+                "would be silently mislabelled."
+            )
 
         if total is None:
-            total = np.zeros((companies, weights.shape[1]))
-        for row, company in enumerate(who):
-            total[company] += weights[row]
-            counts[company] += 1
+            total = np.zeros((companies, keys))
+        total += attention.sum(dim=(0, 1)).cpu().numpy()    # sum over batch & days
+        seen += b * t
 
     world.train()
     if total is None:
         raise ValueError("No attention to gather — the loaders are empty.")
 
-    silent = [t for t, n in zip(settings["tickers"], counts) if n == 0]
-    if silent:
-        print(f"ℹ️  no test sentences for {', '.join(silent)} — shown blank, not guessed.")
-
-    seen = counts > 0
-    attention = np.full_like(total, np.nan)
-    attention[seen] = total[seen] / counts[seen, None]
+    attention = total / max(seen, 1)
 
     keys = attention.shape[1]
     flat = 1.0 / keys
@@ -88,7 +101,7 @@ def gather(world, book, batches, settings: dict, period: str = "test") -> dict:
     return {
         "attention": attention,                 # [companies, keys]
         "tickers": list(settings["tickers"]),
-        "attend_to": tokenizer.attend_to,
+        "attend_to": world.tokenizer.attend_to,
         "keys": keys,
         "flat": flat,
         "sharpness": sharpness,
